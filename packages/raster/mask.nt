@@ -1,0 +1,304 @@
+# mask — a byte a pixel: selections joined by modes, turned with the
+# picture, and their outline for the marching ants.
+
+from raster import Mask, Rect, SelectMode
+
+extend Mask:
+    init(width = 0, height = 0, value = 0):
+        self.width = max(width, 0)
+        self.height = max(height, 0)
+        v = u8(clamp(value, 0, 255))
+        d = self.data
+        for _ in range(self.width * self.height):
+            d.push(v)
+
+    copy() -> Mask:
+        out = Mask()
+        out.take(self.width, self.height, self.data.copy())
+        return out
+
+    take(width = 0, height = 0, data = [u8]):
+        self.width = width
+        self.height = height
+        self.data = data
+
+    get(x = 0, y = 0) -> int:
+        return int(self.data[y * self.width + x])
+
+    at(x = 0, y = 0) -> int:
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return 0
+        return int(self.data[y * self.width + x])
+
+    set(x = 0, y = 0, v = 0):
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return
+        d = self.data
+        d[y * self.width + x] = u8(clamp(v, 0, 255))
+
+    lift(x = 0, y = 0, v = 0):
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return
+        d = self.data
+        i = y * self.width + x
+        if int(d[i]) < v:
+            d[i] = u8(min(v, 255))
+
+    clear():
+        self.fill(0)
+
+    fill(v = 255):
+        d = self.data
+        b = u8(clamp(v, 0, 255))
+        for i in range(len(d)):
+            d[i] = b
+
+    fill_rect(r = Rect(), v = 255):
+        c = r.clip(self.width, self.height)
+        d = self.data
+        b = u8(clamp(v, 0, 255))
+        for y in range(c.h):
+            i = (c.y + y) * self.width + c.x
+            for _ in range(c.w):
+                d[i] = b
+                i += 1
+
+    invert():
+        d = self.data
+        for i in range(len(d)):
+            d[i] = u8(255) - d[i]
+
+    bounds() -> Rect:
+        x0 = self.width
+        y0 = self.height
+        x1 = -1
+        y1 = -1
+        d = self.data
+        for y in range(self.height):
+            row = y * self.width
+            first = -1
+            last = -1
+            for x in range(self.width):
+                if d[row + x] != u8(0):
+                    if first < 0:
+                        first = x
+                    last = x
+            if first >= 0:
+                x0 = min(x0, first)
+                x1 = max(x1, last)
+                y0 = min(y0, y)
+                y1 = y
+        if x1 < 0:
+            return Rect()
+        return Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+
+    is_empty() -> bool:
+        for v in self.data:
+            if v != u8(0):
+                return false
+        return true
+
+    is_full() -> bool:
+        for v in self.data:
+            if v != u8(255):
+                return false
+        return len(self.data) > 0
+
+    combine(other = Mask(), mode = SelectMode.replace):
+        if other.width != self.width or other.height != self.height:
+            return
+        d = self.data
+        o = other.data
+        match mode:
+            case SelectMode.replace:
+                for i in range(len(d)):
+                    d[i] = o[i]
+            case SelectMode.union:
+                for i in range(len(d)):
+                    if o[i] > d[i]:
+                        d[i] = o[i]
+            case SelectMode.exclude:
+                for i in range(len(d)):
+                    d[i] = u8(int(d[i]) * (255 - int(o[i])) / 255)
+            case SelectMode.intersect:
+                for i in range(len(d)):
+                    d[i] = u8(int(d[i]) * int(o[i]) / 255)
+            case SelectMode.xor:
+                for i in range(len(d)):
+                    a = int(d[i])
+                    b = int(o[i])
+                    d[i] = u8(max(a, b) - min(a, b))
+            case _:
+                pass
+
+    outline() -> [int]:
+        out = [int]
+        w = self.width
+        h = self.height
+        d = self.data
+        # horizontal edges: between row y - 1 and row y
+        for y in range(h + 1):
+            start = -1
+            for x in range(w + 1):
+                edge = false
+                if x < w:
+                    above = y > 0 and d[(y - 1) * w + x] >= u8(128)
+                    below = y < h and d[y * w + x] >= u8(128)
+                    edge = above != below
+                if edge and start < 0:
+                    start = x
+                elif not edge and start >= 0:
+                    out.push(start)
+                    out.push(y)
+                    out.push(x)
+                    out.push(y)
+                    start = -1
+        # vertical edges: between column x - 1 and column x
+        for x in range(w + 1):
+            start = -1
+            for y in range(h + 1):
+                edge = false
+                if y < h:
+                    left = x > 0 and d[y * w + x - 1] >= u8(128)
+                    right = x < w and d[y * w + x] >= u8(128)
+                    edge = left != right
+                if edge and start < 0:
+                    start = y
+                elif not edge and start >= 0:
+                    out.push(x)
+                    out.push(start)
+                    out.push(x)
+                    out.push(y)
+                    start = -1
+        return out
+
+    shifted(dx = 0, dy = 0) -> Mask:
+        out = Mask(self.width, self.height)
+        s = self.data
+        o = out.data
+        w = self.width
+        for y in range(self.height):
+            ty = y + dy
+            if ty < 0 or ty >= self.height:
+                continue
+            for x in range(w):
+                tx = x + dx
+                if tx >= 0 and tx < w:
+                    o[ty * w + tx] = s[y * w + x]
+        return out
+
+    flipped_h() -> Mask:
+        out = Mask(self.width, self.height)
+        s = self.data
+        o = out.data
+        w = self.width
+        for y in range(self.height):
+            for x in range(w):
+                o[y * w + (w - 1 - x)] = s[y * w + x]
+        return out
+
+    flipped_v() -> Mask:
+        out = Mask(self.width, self.height)
+        s = self.data
+        o = out.data
+        w = self.width
+        for y in range(self.height):
+            for x in range(w):
+                o[(self.height - 1 - y) * w + x] = s[y * w + x]
+        return out
+
+    rotated_cw() -> Mask:
+        w = self.width
+        h = self.height
+        out = Mask(h, w)
+        s = self.data
+        o = out.data
+        for y in range(h):
+            for x in range(w):
+                o[x * h + (h - 1 - y)] = s[y * w + x]
+        return out
+
+    rotated_ccw() -> Mask:
+        w = self.width
+        h = self.height
+        out = Mask(h, w)
+        s = self.data
+        o = out.data
+        for y in range(h):
+            for x in range(w):
+                o[(w - 1 - x) * h + y] = s[y * w + x]
+        return out
+
+    rotated_180() -> Mask:
+        out = Mask(self.width, self.height)
+        s = self.data
+        o = out.data
+        n = len(s)
+        for i in range(n):
+            o[n - 1 - i] = s[i]
+        return out
+
+    canvas(w = 0, h = 0, ox = 0, oy = 0) -> Mask:
+        out = Mask(w, h)
+        o = out.data
+        s = self.data
+        left = max(0, -ox)
+        right = min(self.width, w - ox)
+        if right <= left:
+            return out
+        for y in range(max(0, -oy), min(self.height, h - oy)):
+            for x in range(left, right):
+                o[(y + oy) * w + x + ox] = s[y * self.width + x]
+        return out
+
+    resized(w = 0, h = 0) -> Mask:
+        out = Mask(w, h)
+        if self.width <= 0 or self.height <= 0:
+            return out
+        o = out.data
+        s = self.data
+        for y in range(h):
+            sy = min(self.height - 1, y * self.height / max(h, 1))
+            for x in range(w):
+                sx = min(self.width - 1, x * self.width / max(w, 1))
+                o[y * w + x] = s[sy * self.width + sx]
+        return out
+
+    sample_region(area = Rect(), w = 0, h = 0) -> Mask:
+        out = Mask(w, h)
+        if area.empty() or w <= 0 or h <= 0:
+            return out
+        columns = [int]
+        for x in range(w):
+            columns.push(area.x + (2 * x + 1) * area.w / (2 * w))
+        dst = out.data
+        for y in range(h):
+            sy = area.y + (2 * y + 1) * area.h / (2 * h)
+            for x in range(w):
+                dst[y * w + x] = u8(self.at(columns[x], sy))
+        return out
+
+    transformed(cx = 0.0, cy = 0.0, dx = 0.0, dy = 0.0, sx = 1.0, sy = 1.0, angle = 0.0, target = Rect()) -> Mask:
+        r = Rect(0, 0, self.width, self.height) if target.empty() else target
+        if angle == 0.0 and sx == 1.0 and sy == 1.0:
+            return self.canvas(r.w, r.h, int(floor(dx + 0.5)) - r.x, int(floor(dy + 0.5)) - r.y)
+        out = Mask(r.w, r.h)
+        a = angle * 3.141592653589793 / 180.0
+        ca = cos(a)
+        sa = sin(a)
+        isx = 1.0 / (sx if sx != 0.0 else 1.0)
+        isy = 1.0 / (sy if sy != 0.0 else 1.0)
+        o = out.data
+        s = self.data
+        w = self.width
+        for y in range(r.h):
+            for x in range(r.w):
+                qx = float(x + r.x) + 0.5 - cx - dx
+                qy = float(y + r.y) + 0.5 - cy - dy
+                rx = (qx * ca + qy * sa) * isx
+                ry = (-qx * sa + qy * ca) * isy
+                fx = int(floor(cx + rx))
+                fy = int(floor(cy + ry))
+                if fx >= 0 and fy >= 0 and fx < w and fy < self.height:
+                    o[y * r.w + x] = s[fy * w + fx]
+        return out

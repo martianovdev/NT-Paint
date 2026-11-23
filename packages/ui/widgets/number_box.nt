@@ -1,0 +1,180 @@
+# widgets/number_box — a number in a field: a press types it (Enter keeps,
+# Escape lets go), the arrow at its right opens the common values, a minus
+# and a plus beside it step by one (paint.net's brush width).
+
+from ui import Icon, LineEdit, NumberBox, Picker
+from graphics import Align
+from window import Button, Cursor, Key
+from view import Layout
+
+extend NumberBox:
+    line = &LineEdit
+    picker = &Picker
+    presets = [float]
+    editing = false
+    buttons = true
+    button = 16.0
+
+    init(ui = &Ui, parent = &View, value = 0.0, min = 0.0, max = 100.0, presets = [float], width = 90.0, buttons = true):
+        self.ui = ui
+        self.value = value
+        self.min = min
+        self.max = max
+        self.presets = presets
+        self.buttons = buttons
+        self.line = &LineEdit(ui)
+        self.picker = &Picker(ui)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_min_size(width, 22.0)
+        self.view.set_max_size(width, 22.0)
+        self.view.set_focusable(true)
+        on self.view.draw():
+            self.draw()
+        on self.picker.chosen(index = 0):
+            self.set(self.presets[index])
+
+    set_value(value = 0.0):
+        next = clamp(value, self.min, self.max)
+        if next != self.value:
+            self.value = next
+            self.view.render_once()
+
+    get_editing() -> bool:
+        return self.editing
+
+    update():
+        ui = self.ui
+        win = ui.window
+        self.picker.update()
+        if self.picker.get_open():
+            return
+        fl, fw = self.field()
+        arrow = self.arrow_width()
+        if self.view.get_hovered():
+            px, _ = self.view.get_pointer()
+            ui.want_cursor(Cursor.text if px >= fl and px < fl + fw - arrow else Cursor.hand)
+            wheel = ui.wheel_steps()
+            if wheel != 0:
+                self.step(wheel)
+                return
+        first = false
+        if win.input_get_mouse_button_pressed(Button.left) and self.view.get_hovered():
+            px, _ = self.view.get_pointer()
+            x, y, w, h = ui.rect(self.view)
+            if self.buttons and px < self.button:
+                self.finish(true)
+                self.set(self.value - 1.0)
+                return
+            elif self.buttons and px >= w - self.button:
+                self.finish(true)
+                self.set(self.value + 1.0)
+                return
+            elif arrow > 0.0 and px >= fl + fw - arrow and px < fl + fw:
+                self.finish(true)
+                labels = [str]
+                current = 0
+                for i, v in self.presets.enumerate():
+                    labels.push(NumberBox.show(v))
+                    if v == self.value:
+                        current = i
+                self.picker.open_list(x + fl, y + h, labels, current, fw)
+                return
+            elif not self.editing:
+                ui.views.set_focus(self.view)
+                self.editing = true
+                self.view.render_once()
+                self.line.begin(NumberBox.show(self.value))
+                first = true
+        if not self.editing:
+            return
+        ui.hold_keys()
+        if not self.view.get_focused() or (win.input_get_mouse_button_pressed(Button.left) and not self.view.get_hovered()):
+            self.finish(true)
+            return
+        if win.input_get_key_pressed(Key.tab):
+            self.finish(true)
+            return
+        if win.input_get_key_repeated(Key.up) or win.input_get_key_repeated(Key.down):
+            self.step(1 if win.input_get_key_repeated(Key.up) else -1)
+            return
+        self.line.pointer(self.view, fl + 1.0, fw - arrow - 2.0, first)
+        result = self.line.update()
+        self.line.tick_caret(self.view)
+        match result:
+            case 1:
+                self.finish(true)
+            case 2:
+                self.finish(false)
+            case _:
+                pass
+
+    # ─── Inside ───
+
+    show(v = 0.0) -> str:
+        if v == floor(v):
+            return str(int(v))
+        return str(floor(v * 100.0 + 0.5) / 100.0)
+
+    field() -> (float, float):
+        _, _, w, _ = self.ui.rect(self.view)
+        if self.buttons:
+            return self.button + 2.0, w - self.button * 2.0 - 4.0
+        return 0.0, w
+
+    arrow_width() -> float:
+        return 16.0 if len(self.presets) > 0 else 0.0
+
+    set(v = 0.0):
+        nv = clamp(v, self.min, self.max)
+        if nv != self.value:
+            self.set_value(nv)
+            emit changed(nv)
+
+    typed_value() -> float:
+        typed = self.line.get_text().strip()
+        typed.replace(",", ".")
+        if v := typed.to_float():
+            if v == v:
+                return clamp(v, self.min, self.max)
+        return self.value
+
+    step(by = 0):
+        base = self.typed_value() if self.editing else self.value
+        self.set(base + float(by))
+        if self.editing:
+            self.line.begin(NumberBox.show(self.value))
+
+    finish(keep = true):
+        if not self.editing:
+            return
+        self.editing = false
+        self.view.render_once()
+        self.line.close()
+        if self.view.get_focused():
+            self.ui.views.set_focus(none)
+        if keep:
+            self.set(self.typed_value())
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        fl, fw = self.field()
+        if self.buttons:
+            for k in range(2):
+                bx = x if k == 0 else x + w - self.button
+                by = y + (h - 12.0) * 0.5
+                ui.fill_round(bx + 1.0, by - 1.0, 14.0, 14.0, 3.0, t.button)
+                ui.line(bx + 5.0, by + 6.0, bx + 11.0, by + 6.0, t.ink_soft, 1.5)
+                if k == 1:
+                    ui.line(bx + 8.0, by + 3.0, bx + 8.0, by + 9.0, t.ink_soft, 1.5)
+        hot = self.view.get_hovered()
+        arrow = self.arrow_width()
+        ui.fill_round(x + fl, y, fw, h, t.radius, t.field)
+        ui.outline_round(x + fl, y, fw, h, t.radius, t.ink_muted if self.editing or hot else t.field_edge)
+        if self.editing:
+            self.line.draw(x + fl + 1.0, y + 1.0, fw - arrow - 2.0, h - 2.0, t.size)
+        else:
+            ui.text(x + fl + 4.0, y, fw - arrow - 8.0, h, NumberBox.show(self.value), t.ink, Align.left + Align.middle, t.size)
+        if len(self.presets) > 0:
+            ui.icon(Icon.twisty_open, x + fl + fw - 16.0, y + (h - 14.0) * 0.5, 14.0, t.ink_muted)

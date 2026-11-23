@@ -1,0 +1,1203 @@
+# ui — the widgets of the IDE, over the package view, drawn as natiny's
+# old editor drew them: its palette and its measures (Theme), panels as
+# tabs over a body on the backdrop, rows with icons.  A widget is an
+# object holding its views; it hangs them under a parent view given to it
+# and keeps them alive - a view nobody holds leaves the tree.  What a
+# widget tells its owner it tells by events; it never knows its owner.
+#
+#   ui = &Ui(graphics, font, mono)
+#   split = &Split(ui, ui.content, size = 280.0)
+#   tree = &TreeList(ui, split.first)
+#   on tree.selected(key = 0): ...
+#
+#   frame(dt):
+#       ui.frame(dt, w, h)          # input of the frame, layout
+#       split.update()              # drags, wheels: before drawing
+#       graphics.window_bind(window)
+#       ui.render(w, h)
+#       graphics.window_unbind()
+#
+# Commands are what a menu, a shortcut or a button runs: one &Command per
+# action, its title, its shortcut and whether it can run now; whoever
+# owns the action listens to its run.
+#
+# Inside: core/ (the context and its drawing, icons, commands), widgets/
+# (one module a widget).
+
+package ui "0.1.0"
+
+requires graphics "0.1"
+requires view "0.1"
+requires window "0.1"
+requires text "0.1"
+
+from graphics import Color, Font, Graphics
+from window import Cursor, Key, Window
+from view import Layout, View, Views
+from text import TextEditor, TokenKind
+
+# The palette (0xRRGGBB) and the measures of natiny's editor
+Theme:
+    # the window and the gaps between panels; a panel and the open tab;
+    # behind code
+    backdrop = 0x18181B
+    chrome = 0x202024
+    editor = 0x2A2A2E
+    hover = 0x34343A
+    # a shut tab under the pointer; a row under the pointer; the selected
+    # row
+    tab_hot = 0x2A2A2E
+    row_hot = 0x303036
+    row_on = 0x404048
+    line = 0x38383E
+    ink = 0xE6E6E9
+    ink_muted = 0x9A9AA2
+    ink_soft = 0xC6C6CB
+    ink_faint = 0x64646B
+    accent = 0x74747F
+    accent_ink = 0xFFFFFF
+    folder = 0xD8B35A
+    # a Pack Folder's: violet, apart from the plain folders' gold
+    pack_folder = 0xA58CF0
+    file = 0x8E959E
+    # each kind of file its colour, and a scene node the colour of the file
+    # closest to it
+    kind_scene = 0xC98AE8
+    kind_material = 0xEE9460
+    kind_shader = 0x4EC9B0
+    kind_texture = 0x7FC86E
+    kind_mesh = 0x5BAEF0
+    kind_sound = 0xEE7BA6
+    kind_font = 0xB8BFCC
+    kind_script = 0x8C88F5
+    kind_pivot = 0xE0B85C
+    kind_camera = 0xEE7BA6
+    kind_view = 0x7FC86E
+    kind_body = 0x5CC8D8
+    kind_particles = 0xF0C75E
+    kind_listener = 0xEE7BA6
+    kind_c = 0x5C9FE0
+    kind_render = 0xE36D6D
+    menu_panel = 0x242428
+    field = 0x1C1C1F
+    field_hot = 0x222226
+    field_edge = 0x4A4A52
+    button = 0x323238
+    button_hot = 0x3E3E46
+    error = 0xE07A6E
+    warning = 0xD8B35A
+    axis_x = 0xD9675F
+    axis_y = 0x9CC04A
+    axis_z = 0x5F93D9
+    # code: selected text (the accent, far down), the caret, the line the
+    # caret is on; a token by what it is
+    selection = 0x4A4A56
+    caret = 0xE8E8E8
+    current_line = 0x252525
+    code_keyword = 0xC98AE8
+    code_type = 0x4EC9B0
+    code_function = 0xDCDCAA
+    code_number = 0xB5CEA8
+    code_string = 0xCE9178
+    code_comment = 0x6A9955
+    code_directive = 0x6C8EBF
+    code_punctuation = 0xBDBDBD
+    code_property = 0x9CDCFE
+    code_invalid = 0xE07A6E
+    code_variable = 0x9CDCFE
+    code_parameter = 0x8FB8DE
+    code_method = 0xDCDCAA
+    code_member = 0x4FC1FF
+    code_module = 0x4EC9B0
+    code_constant = 0x4FC1FF
+    code_interface = 0xB8D7A3
+    code_enum = 0x4EC9B0
+    # the boxes over code: completion, hover, the call's parameters
+    popup = 0x2A2A2F
+    popup_edge = 0x45454D
+    popup_on = 0x404048
+    # a menu's lit row and its edge, a floating window's body and edge,
+    # the close cross, a slider's track
+    menu_hot = 0x38383F
+    menu_edge = 0x3A3A41
+    panel = 0x26262A
+    panel_edge = 0x37373D
+    window_inset = 2.0
+    dialog_inset = 10.0
+    close = 0x9A9AA2
+    track = 0x37373D
+    # measures
+    edge = 4.0
+    divider = 4.0
+    radius = 4.0
+    panel_pad = 6.0
+    size = 13.0
+    small = 12.0
+    header = 26.0
+    tab = 30.0
+    tab_pad = 12.0
+    tab_close = 16.0
+    # how fast a tab moved along its strip eases into its place
+    tab_slide = 18.0
+    # how far a press moves before it is a drag
+    drag_start = 4.0
+    row = 22.0
+    indent = 14.0
+    row_radius = 4.0
+    menu_bar = 30.0
+    menu_bar_pad = 4.0
+    menu_pad = 8.0
+    menu_item = 24.0
+    menu_separator = 9.0
+    menu_min_width = 200.0
+    menu_gap = 32.0
+    field_height = 24.0
+    button_height = 26.0
+    button_width = 86.0
+    gap = 8.0
+    check = 16.0
+    value_label = 14.0
+    wheel_lines = 3.0
+    code_size = 17.0
+    # what Zoom In and Out keep the code's size within, a step apart
+    code_min = 9.0
+    code_max = 40.0
+    code_step = 1.0
+    # a code line's height, in code sizes
+    code_line = 1.35
+    gutter_pad = 12.0
+    text_pad = 8.0
+    caret_width = 2.0
+    # seconds the caret is on, then off
+    blink = 0.53
+
+    # the code's size, held to code_min…code_max
+    set_code_size(size = 0.0):
+        self.code_size = min(max(size, self.code_min), self.code_max)
+
+# The pictures rows and tabs carry, drawn as lines and shapes
+# the icons of files, scene nodes and actions: the SVG pictures of
+# natiny's editor (core/icons), drawn in one ink
+enum Icon:
+    none
+    folder
+    folder_open
+    file
+    scene
+    script
+    material
+    shader
+    texture
+    mesh
+    font
+    sound
+    c_source
+    c_header
+    render
+    pivot
+    model
+    camera
+    view
+    body
+    particles
+    listener
+    other
+    plus
+    copy
+    cross
+    frame
+    grid
+    twisty_shut
+    twisty_open
+    chevron
+    check
+    search
+    box
+    window
+    select
+    move
+    snap
+    open
+    restart
+    stop
+    settings
+    globe
+    surface
+    signal
+    # what a scene may be shown by (Icons.scene_icons): a library of its own
+    light
+    sun
+    spot
+    flame
+    star
+    heart
+    coin
+    key
+    flag
+    pin
+    door
+    chest
+    tree
+    rock
+    gear
+    person
+    enemy
+    eye
+    cloud
+    water
+    bomb
+    gem
+    shield
+    sword
+    trigger
+    target
+    arrow
+    music
+    # a folder packed of its own (a Pack Folder): shut, open
+    pack_folder
+    pack_folder_open
+    # a check of a list row: on, off
+    checked
+    unchecked
+    # a slot of a nested scene: where its instance takes nodes from above
+    slot
+    # a physics joint
+    joint
+    # paint.net's pictures, in their own colours (drawn untinted): tools,
+    # actions, layers, windows, options
+    tool_rect_select
+    tool_move_pixels
+    tool_lasso
+    tool_move_selection
+    tool_ellipse_select
+    tool_zoom
+    tool_magic_wand
+    tool_pan
+    tool_bucket
+    tool_gradient
+    tool_brush
+    tool_eraser
+    tool_pencil
+    tool_picker
+    tool_clone
+    tool_recolor
+    tool_text
+    tool_line
+    tool_shapes
+    act_new
+    act_open
+    act_save
+    act_save_as
+    act_save_all
+    act_cut
+    act_copy
+    act_copy_merged
+    act_paste
+    act_paste_layer
+    act_paste_image
+    act_crop
+    act_deselect
+    act_select_all
+    act_invert_selection
+    act_erase_selection
+    act_fill_selection
+    act_undo
+    act_redo
+    act_grid
+    act_ruler
+    act_close
+    act_exit
+    act_recent
+    act_language
+    layer_add
+    layer_delete
+    layer_duplicate
+    layer_merge
+    layer_up
+    layer_down
+    layer_top
+    layer_bottom
+    layer_go_up
+    layer_go_down
+    layer_properties
+    layer_import
+    layer_visibility
+    layer_rotate_zoom
+    img_flip_h
+    img_flip_v
+    img_rotate_cw
+    img_rotate_ccw
+    img_rotate_180
+    img_resize
+    img_canvas
+    img_flatten
+    img_profile
+    win_tools
+    win_history
+    win_layers
+    win_colors
+    win_settings
+    win_help
+    zoom_in
+    zoom_out
+    zoom_fit
+    zoom_actual
+    zoom_selection
+    aa_on
+    aa_off
+    blend_normal
+    blend_overwrite
+    sel_replace
+    sel_union
+    sel_exclude
+    sel_intersect
+    sel_xor
+    flood_contiguous
+    flood_global
+    shape_outline
+    shape_fill
+    shape_both
+    shape_rect
+    shape_rounded
+    shape_ellipse
+    shape_star
+    shape_triangle
+    shape_diamond
+    shape_hexagon
+    shape_arrow
+    grad_linear
+    grad_reflected
+    grad_diamond
+    grad_radial
+    grad_conical
+    grad_color
+    grad_alpha
+    swap_colors
+    reset_colors
+    add_palette
+    palette_menu
+    history_item
+    adjust_item
+    effect_item
+    image_item
+    font_bold
+    font_italic
+    font_underline
+    align_left
+    align_center
+    align_right
+    close_x
+    sampling_layer
+    sampling_image
+    unit_ruler
+    image_size
+    cursor_pos
+    selection_size
+
+# What every widget shares: graphics, the window (its input, cursor and
+# clipboard) and views, the fonts (the interface's and code's,
+# monospaced), the theme, the
+# frame's time, and the root of the window - content, which the program
+# lays out, under layer, where menus open over everything
+Ui in core.context, core.icons:
+    graphics = &Graphics
+    window = &Window
+    views = &Views
+    font = &Font
+    mono = &Font
+    theme = Theme()
+    root = &View
+    content = &View
+    layer = &View
+    time = 0.0
+    # the pointer's picture asked for this frame: arrow unless something
+    # under it or held by it asks (want_cursor); the window is told after
+    # drawing
+    cursor = Cursor.arrow
+    init(graphics = &Graphics, window = &Window, font = &Font, mono = &Font)
+
+    # a view of layout, hung under parent when given
+    create(layout = Layout.free, parent = none(&View)) -> &View
+    cache(view = &View)
+    # the input of the frame laid out over a window w × h: run before the
+    # widgets' update and before drawing
+    frame(dt = 0.0, w = 0.0, h = 0.0)
+    # everything drawn, a window bound; then the cursor asked for
+    render(w = 0.0, h = 0.0)
+    # a held drag takes precedence over a cursor requested on hover
+    want_cursor(cursor = Cursor.arrow, held = false)
+    take_wheel() -> float
+    wheel_steps() -> int
+    # the hint of what is under the pointer, asked for while drawing it:
+    # shown in a small box by the pointer once it has rested there a moment
+    tip(text = "")
+    # the code's size (CodeView), held to the theme's code_min…code_max
+    set_code_size(size = 0.0)
+    # a field is being typed into: shortcuts are not for this frame and
+    # the next (asked every frame it types)
+    hold_keys()
+    get_keys_held() -> bool
+    # x, y, w, h of a view as laid out
+    rect(view = &View) -> (float, float, float, float)
+    # the pointer in the window
+    pointer() -> (float, float)
+    # the pointer within the view's rectangle (whoever holds the press,
+    # whatever covers it)
+    over(view = &View) -> bool
+
+    # Drawing, in the theme's colours (0xRRGGBB, alpha 0…1); size 0 is the
+    # theme's
+    color(rgb = 0, a = 1.0) -> Color
+    fill(x = 0.0, y = 0.0, w = 0.0, h = 0.0, rgb = 0, a = 1.0)
+    fill_round(x = 0.0, y = 0.0, w = 0.0, h = 0.0, radius = 4.0, rgb = 0, a = 1.0)
+    # rounded at the top only, as a tab
+    fill_top_round(x = 0.0, y = 0.0, w = 0.0, h = 0.0, radius = 4.0, rgb = 0)
+    outline(x = 0.0, y = 0.0, w = 0.0, h = 0.0, rgb = 0, thickness = 1.0, a = 1.0)
+    outline_round(x = 0.0, y = 0.0, w = 0.0, h = 0.0, radius = 4.0, rgb = 0, thickness = 1.0)
+    line(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, rgb = 0, thickness = 1.0, a = 1.0)
+    circle(cx = 0.0, cy = 0.0, radius = 1.0, rgb = 0, a = 1.0)
+    # one line of text in a box, aligned by Align (graphics): never
+    # wrapped, cut off where it would pass the box's right edge
+    text(x = 0.0, y = 0.0, w = 0.0, h = 0.0, text = "", rgb = 0, align = 0, size = 0.0)
+    # text wrapped to the box's width, its lines aligned by Align: for a
+    # message, not a name or a value
+    text_wrapped(x = 0.0, y = 0.0, w = 0.0, h = 0.0, text = "", rgb = 0, align = 0, size = 0.0)
+    measure(text = "", size = 0.0) -> float
+    # an icon in the box of size × size at x, y, on whole pixels; rgb -1
+    # its own colour
+    icon(icon = Icon.none, x = 0.0, y = 0.0, size = 16.0, rgb = -1)
+    # the colour an icon is drawn in by itself
+    icon_color(icon = Icon.none) -> int
+    # the icons a scene may be shown by, by the names its file keeps
+    # ("icon": "light"), in the order a picker lists them
+    scene_icons() -> [(str, Icon)]
+    # the icon a scene names; Icon.scene for a name of none
+    scene_icon(name = "") -> Icon
+    # natiny's colour gradients over x, y, w, h (rounded by radius): 0 the
+    # saturation and value square at hue, 1 the hues, 2 the checker into
+    # tint, 3 tint over the checker, 4 the colour wheel (hue around,
+    # saturation out) at value hue
+    gradient(mode = 0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, hue = 0.0, tint = Color(), radius = 0.0)
+
+# Something the program can do: run by a menu, a button or its shortcut
+# (key with ctrl and shift), when enabled
+Command in core.command:
+    event run()
+    revision = 0
+    title = ""
+    key = Key.unknown
+    ctrl = false
+    shift = false
+    enabled = true
+    icon = Icon.none
+    # what a toolbar says of it while the pointer is over it; "" for its
+    # title and shortcut
+    hint = ""
+    alt = false
+    # shown with a check (a mode that is on); a menu draws it
+    checked = false
+    # the shortcut as a menu shows it, when the key's own name will not do
+    # ("Ctrl++"); "" for the key's
+    shortcut_text = ""
+    init(title = "", key = Key.unknown, ctrl = false, shift = false, icon = Icon.none, alt = false)
+    set_checked(checked = true)
+    set_shortcut_text(text = "")
+    set_enabled(enabled = true)
+    set_title(title = "")
+    set_icon(icon = Icon.none)
+    set_hint(hint = "")
+    # the hint, or the title with the shortcut: "Duplicate (Ctrl+D)"
+    get_hint() -> str
+    # the shortcut as a menu shows it, "Ctrl+Shift+Z"; "" for none
+    get_shortcut() -> str
+    # run, when enabled
+    trigger()
+    # run when its shortcut went down this frame; whether it did
+    poll(ui = &Ui) -> bool
+
+# A line of text
+Label in widgets.label:
+    ui = &Ui
+    view = &View
+    text = ""
+    rgb = 0
+    size = 0.0
+    align = 0
+    init(ui = &Ui, parent = &View, text = "", rgb = -1, size = 0.0, align = 0)
+    set_text(text = "")
+    set_color(rgb = 0)
+
+# A button: a plate with a title, or the accent's for the one that is
+# the point of a screen
+Button in widgets.button:
+    event pressed()
+    ui = &Ui
+    view = &View
+    text = ""
+    accent = false
+    enabled = true
+    init(ui = &Ui, parent = &View, text = "", accent = false)
+    set_text(text = "")
+    set_enabled(enabled = true)
+
+# A square button of an icon or a glyph drawn by its owner's command: a
+# toolbar's.  On is drawn held (a mode that is on)
+ToolButton in widgets.tool_button:
+    ui = &Ui
+    view = &View
+    command = &Command
+    on = false
+    init(ui = &Ui, parent = &View, command = &Command)
+    set_on(on = true)
+    feedback()
+
+# A scene editor's strip of tools, as natiny's editor drew it: commands
+# in groups a line apart, each its icon and title (icons alone when the
+# titles do not fit), the ones on held in the accent, some groups on a
+# darker plate, one command pinned at the right end.  Over a command its
+# hint shows before the end; else the note.  A click runs the command.
+ToolStrip in widgets.tool_strip:
+    ui = &Ui
+    view = &View
+    init(ui = &Ui, parent = &View)
+    # a command at the end of the left ones; group: after a gap and a line
+    add(command = &Command, group = false)
+    # the command at the right end
+    add_end(command = &Command)
+    # a plate behind the commands from first to last (their indices)
+    add_plate(first = 0, last = 0)
+    set_on(command = &Command, on = true)
+    # what shows on the right while no command is under the pointer; in the
+    # error's colour when error
+    set_note(note = "", error = false)
+
+# Two panes with a divider between them, side by side or one over the
+# other (vertical).  One pane has a size the divider drags - the first,
+# or the second when fixed_second - and the other takes the rest.  A
+# window too small for both gives the fixed pane less, and its size back
+# once there is room.  The panes are empty views: content goes under them.
+Split in widgets.split:
+    ui = &Ui
+    root = &View
+    first = &View
+    grip = &View
+    second = &View
+    vertical = false
+    fixed_second = false
+    size = 0.0
+    min = 0.0
+    max = 0.0
+    init(ui = &Ui, parent = &View, vertical = false, fixed_second = false, size = 240.0, min = 80.0, max = 4000.0)
+    # the drag; before drawing
+    update()
+    # the fixed pane and the divider hidden: the other pane takes it all
+    set_fixed_visible(visible = true)
+    get_fixed_visible() -> bool
+    # the fixed pane's size, kept within min and max
+    set_size(size = 0.0)
+
+# Tabs over a body that shows the page of the open one, as natiny's panels
+# and its documents are: the strip on the backdrop, the open tab the
+# colour of the body.  The owner names each tab by a key of its own and
+# hangs its content under the page add gives; closing is asked of the
+# owner, not done.  A tab held with the left button and dragged changes
+# its place among the others.
+Tabs in widgets.tabs:
+    event selected(key = 0)
+    event close_asked(key = 0)
+    # a tab pressed with the right button (opened first), where
+    event context(key = 0, x = 0.0, y = 0.0)
+    # any press on the strip: the owner may make this group the one in front
+    event pressed()
+    ui = &Ui
+    root = &View
+    strip = &View
+    body = &View
+    init(ui = &Ui, parent = &View, empty = "")
+    # a tab opened at the end, its page
+    add(key = 0, title = "", closable = true, icon = Icon.none) -> &View
+    # the tab and its page gone; a neighbour opened
+    remove(key = 0)
+    open(key = 0)
+    # the key of the open tab; none with no tabs
+    get_open() -> none(int)
+    get_count() -> int
+    # the tabs' keys, in order
+    get_keys() -> [int]
+    has(key = 0) -> bool
+    set_title(key = 0, title = "")
+    # what the body says with no tab open
+    set_empty(text = "")
+    # the tab of key and its page to the end of other, open there
+    move_to(other = &Tabs, key = 0)
+    # the group in front: its open tab lit; not, it is shown as the others
+    set_active(active = true)
+    # the right button, a tab held and dragged along the strip to another
+    # place in it; before drawing
+    update()
+
+# A row of a menu: a command, or a separator line for none
+MenuItem:
+    command = none(&Command)
+    # a row that opens another menu beside it: its index among the
+    # menu's submenus, -1 for none
+    sub = -1
+    init(command = none(&Command), sub = -1):
+        self.command = command
+        self.sub = sub
+
+# A list of commands that opens over everything at a place in the window
+# and closes when one is chosen, the pointer presses outside it or Escape
+# goes down
+Menu in widgets.menu:
+    event closed()
+    ui = &Ui
+    title = ""
+    items = [MenuItem]
+    init(ui = &Ui, title = "")
+    add(command = &Command)
+    # a row (command's title and icon) that opens menu beside it while the
+    # pointer is over it; the caller keeps menu
+    add_submenu(command = &Command, menu = &Menu)
+    add_separator()
+    open(x = 0.0, y = 0.0)
+    close()
+    get_open() -> bool
+    # Escape; before drawing
+    update()
+
+# The strip of menu titles along the top of a window: a press opens a
+# title's menu under it, and while one is open the pointer over another
+# title opens that one instead
+MenuBar in widgets.menu_bar:
+    ui = &Ui
+    view = &View
+    menus = [&Menu]
+    init(ui = &Ui, parent = &View)
+    add(menu = &Menu)
+    # whether one of its menus is open
+    get_open() -> bool
+    # the switch between open menus; before drawing
+    update()
+
+# A row of a tree list: an item named by the owner's key, how deep it is,
+# its icon, its text and a note after it (in note_rgb, -1 faint), whether
+# it has children and shows them
+TreeRow:
+    key = 0
+    depth = 0
+    icon = Icon.none
+    text = ""
+    note = ""
+    note_rgb = -1
+    parent = false
+    open = false
+    # what it is and what it holds, as bits: an ordered tree drops rows
+    # into a row whose takes has their kinds
+    kind = 1
+    takes = 0
+    # a button at the row's right end (action), Icon.none for none
+    action = Icon.none
+    # the icon's colour; -1 its own
+    icon_rgb = -1
+    init(key = 0, depth = 0, icon = Icon.none, text = "", note = "", note_rgb = -1, parent = false, open = false, kind = 1, takes = 0, action = Icon.none, icon_rgb = -1):
+        self.key = key
+        self.depth = depth
+        self.icon = icon
+        self.text = text
+        self.note = note
+        self.note_rgb = note_rgb
+        self.parent = parent
+        self.open = open
+        self.kind = kind
+        self.takes = takes
+        self.action = action
+        self.icon_rgb = icon_rgb
+
+# where an ordered tree's drag drops, by the row it names
+enum TreePlace:
+    before
+    into
+    # after the row and all under it
+    after
+    # at the end of the top (no row)
+    end
+    nowhere
+
+# Rows of a tree as the owner gives them, flat and already opened or
+# closed; only the rows in sight are drawn, the wheel scrolls.  The arrow
+# of a row with children asks to toggle it.  One row is selected - the
+# last pressed - and with Ctrl and Shift more are chosen along with it.
+# With drops on, chosen rows dragged onto a row with children (or below
+# the rows) are asked to move there.  A row's text can be edited in place.
+TreeList in widgets.tree:
+    event selected(key = 0)
+    event toggled(key = 0)
+    event activated(key = 0)
+    # the right button on a row (key -1: below the rows), at x, y in the
+    # window
+    event context(key = 0, x = 0.0, y = 0.0)
+    # the chosen rows let go of over a row with children (-1: below the
+    # rows)
+    event dropped(target = 0)
+    # ordered: the chosen rows let go of before, into or after the row of
+    # target, or at the end of the top
+    event placed(target = 0, place = TreePlace.nowhere)
+    # a drag let go of outside the list, at x, y in the window
+    event dropped_out(x = 0.0, y = 0.0)
+    # a row's action button pressed
+    event action(key = 0)
+    # the text edited in place, Enter pressed or the field left
+    event edited(key = 0, text = "")
+    ui = &Ui
+    view = &View
+    init(ui = &Ui, parent = &View, empty = "")
+    set_rows(rows = [TreeRow])
+    set_empty(text = "")
+    # -1: none; the only one chosen
+    set_selected(key = -1)
+    # the only one chosen, scrolled into sight, the keys the list's
+    show(key = 0)
+    get_selected() -> int
+    # the chosen rows' keys, in the order of the rows
+    get_chosen() -> [int]
+    add_chosen(key = 0)
+    # the rows of keys chosen, primary the selected one
+    set_chosen(keys = [int], primary = -1)
+    set_drops(on = true)
+    # drops between rows too (placed), by kinds
+    set_ordered(on = true)
+    get_dragging() -> bool
+    # a drag outside the list
+    get_dragging_out() -> bool
+    # the row's text edited in place, start to end selected
+    begin_edit(key = 0, text = "", start = 0, end = -1)
+    get_editing() -> bool
+    # the wheel, the right button, a drag, the field's keys; before
+    # drawing
+    update()
+
+# One line of text edited over a row someone else draws: the owner hands
+# it the keys (update: 1 Enter, 2 Escape, 0 neither) and draws it
+TextInput in widgets.line_edit:
+    keys(ui = &Ui, editor = &TextEditor, multiline = false)
+    column(font = &Font, size = 0.0, line = "", x = 0.0, word = false) -> int
+
+LineEdit in widgets.line_edit:
+    ui = &Ui
+    editor = &TextEditor
+    init(ui = &Ui)
+    tick_caret(view = &View)
+    begin(text = "", start = 0, end = -1)
+    get_open() -> bool
+    get_text() -> str
+    close()
+    update() -> int
+    # the caret to the character nearest x from the text's left edge
+    # (Shift: the selection to it)
+    click(x = 0.0, size = 0.0, extend = false)
+    pointer(view = &View, left = 0.0, width = 0.0, select_all = false)
+    draw(x = 0.0, y = 0.0, w = 0.0, h = 0.0, size = 0.0)
+
+# Text typed in a field: a press places the caret and a drag selects;
+# Enter, Tab or a press elsewhere keeps it, Escape lets it go
+TextField in widgets.text_field:
+    # what was typed, kept (only when it differs)
+    event committed(text = "")
+    ui = &Ui
+    view = &View
+    text = ""
+    init(ui = &Ui, parent = &View, text = "")
+    # shown while not typed into
+    set_text(text = "")
+    # not enabled: shown a little dim, and nothing typed into it
+    set_enabled(enabled = true)
+    get_editing() -> bool
+    finish(keep = true)
+    # the keys while typed into; before drawing
+    update()
+
+# A number in a field, named by a short label in a colour (an axis'
+# tint), changed by dragging across it: step a unit of pointer travel;
+# a click without a drag types it (all of it selected)
+ValueField in widgets.value_field:
+    # while dragged, each change
+    event changed(value = 0.0)
+    # the drag let go of: what it changed is one step
+    event committed()
+    ui = &Ui
+    view = &View
+    label = ""
+    value = 0.0
+    step = 0.1
+    init(ui = &Ui, parent = &View, label = "", rgb = -1, step = 0.1)
+    # shown, without an event
+    set_value(value = 0.0)
+    set_enabled(enabled = true)
+    # the number being typed
+    get_editing() -> bool
+    # the drag or the typing; before drawing
+    update()
+
+# A scroll bar as VS Code's, drawn by its owner over the box it scrolls:
+# a thin track along the right (vertical) or bottom edge, shown while the
+# pointer is over the box, held or just scrolled; the thumb dragged, the
+# track pressed
+ScrollBar in widgets.scroll_bar:
+    ui = &Ui
+    vertical = true
+    init(ui = &Ui, vertical = true)
+    # in a column of its own right of (under) the content, always shown -
+    # a panel's; not: over it, fading - code's
+    set_beside(beside = true)
+    # what its column takes off the content's width (height); 0 over it or
+    # with all in sight
+    room(content = 0.0, visible = 0.0) -> float
+    # the box x, y, w, h; the content's length, the length in sight, the
+    # scroll: the scroll the bar leaves (a drag, a press on the track)
+    update(x = 0.0, y = 0.0, w = 0.0, h = 0.0, content = 0.0, visible = 0.0, scroll = 0.0) -> float
+    # a press at px, py is the bar's, not its owner's
+    hit(px = 0.0, py = 0.0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, content = 0.0, visible = 0.0) -> bool
+    get_dragging() -> bool
+    # shown a moment: the owner scrolled
+    wake()
+    # over the box, last; mark (0 to content, -1 none): a line on the track
+    draw(x = 0.0, y = 0.0, w = 0.0, h = 0.0, content = 0.0, visible = 0.0, scroll = 0.0, mark = -1.0)
+
+# What is laid out taller than its box: body (vertical, as wide as the
+# box) moved up by the scroll; the wheel and the scroll bar
+ScrollView in widgets.scroll_view:
+    ui = &Ui
+    # the box, clipping; what is put in it goes in body
+    view = &View
+    body = &View
+    init(ui = &Ui, parent = &View)
+    get_scroll() -> float
+    set_scroll(scroll = 0.0)
+    # the body's padding; the bar, when there, takes the right one
+    set_padding(left = 0.0, top = 0.0, right = 0.0, bottom = 0.0)
+    # the part of the body from top, h high, brought in sight
+    reveal(top = 0.0, h = 0.0)
+    update()
+
+# What is going on (a build), over a box the owner gives - a tab's page -
+# in its bottom right corner: a turning circle and the text on a soft plate,
+# faded in once it has lasted a moment and out when it is over; it takes
+# no pointer
+StatusBadge in widgets.status_badge:
+    ui = &Ui
+    view = &View
+    init(ui = &Ui)
+    # the status ("" nothing) and the box (in the window) it shows over;
+    # every frame
+    set_status(text = "", x = 0.0, y = 0.0, w = 0.0, h = 0.0)
+    # anything of it on the screen (shown, or fading)
+    get_showing() -> bool
+
+# A question over everything, the window dimmed: a title, what is asked
+# (a line each "\n"), the answers as buttons right to left, the primary
+# one in the accent; Enter answers it, Escape the cancel one
+Dialog in widgets.dialog:
+    # the answer's index among those given
+    event chosen(index = 0)
+    event preview(x = 0.0, y = 0.0, w = 0.0, h = 0.0)
+    ui = &Ui
+    init(ui = &Ui)
+    open(title = "", text = "", answers = [str], primary = 0, cancel = -1, preview_height = 0.0)
+    close()
+    get_open() -> bool
+    # the keys; before drawing
+    update()
+
+# One of a few words; a press opens them in a list under it
+ChoiceField in widgets.choice_field:
+    # the word picked, when it is another
+    event chosen(index = 0)
+    ui = &Ui
+    view = &View
+    choices = [str]
+    init(ui = &Ui, parent = &View, choices = [str])
+    set_current(index = 0)
+    get_current() -> int
+    # the press and the list; before drawing
+    update()
+
+# natiny's colour panel: the saturation and value square, the hue and
+# alpha strips, the hex and R G B A typed; what is dragged is handed over
+# when let go of, what is typed when kept
+ColorPicker in widgets.color_picker:
+    event changed(rgb = 0, alpha = 1.0)
+    event closed()
+    ui = &Ui
+    init(ui = &Ui)
+    # under the box at x, y of height h (over it when there is no room)
+    open(x = 0.0, y = 0.0, h = 0.0, rgb = 0, alpha = 1.0)
+    close()
+    get_open() -> bool
+    get_rgb() -> int
+    get_alpha() -> float
+    update()
+
+# A colour's swatch; a press opens the colour panel under it
+ColorField in widgets.color_field:
+    # the panel handed a colour over
+    event changed(rgb = 0, alpha = 1.0)
+    ui = &Ui
+    view = &View
+    init(ui = &Ui, parent = &View)
+    set_color(rgb = 0, alpha = 1.0)
+    get_open() -> bool
+    update()
+
+# Text in a field, as it is (editing comes with text input), with an
+# icon before it and a swatch of a colour behind it when given
+TextBox in widgets.text_box:
+    ui = &Ui
+    view = &View
+    text = ""
+    init(ui = &Ui, parent = &View, text = "", icon = Icon.none)
+    set_text(text = "")
+    # the field filled with a colour, the text in black or white over it;
+    # -1: none
+    set_swatch(rgb = -1)
+
+# A list to pick from by typing, opened over everything at a point: what
+# was typed on its first row, then the labels that have it in them (24 at
+# most); Enter or a click picks, Escape or a press elsewhere closes
+Picker in widgets.picker:
+    # the label picked: its index among the ones given
+    event chosen(index = 0)
+    event closed()
+    ui = &Ui
+    init(ui = &Ui)
+    # labels, each with its icon (icons may be shorter, or empty)
+    open(x = 0.0, y = 0.0, labels = [str], icons = [Icon])
+    # a plain list (a dropdown's): no typing, current checked and lit, at
+    # least width wide
+    open_list(x = 0.0, y = 0.0, labels = [str], current = 0, width = 0.0)
+    close()
+    get_open() -> bool
+    # typing, the keys; before drawing
+    update()
+
+# A field naming a file of the project, as natiny's editor has one: the
+# kind's icon and the name (None for none), not typed into; a button that
+# opens the file, a button that searches for another
+ResourceField in widgets.resource_field:
+    event open_asked()
+    # the search button: where a list of files may open (under the field)
+    event browse_asked(x = 0.0, y = 0.0)
+    ui = &Ui
+    view = &View
+    init(ui = &Ui, parent = &View, icon = Icon.none)
+    # a path, a shape's JSON, or "" for none
+    set_value(value = "")
+    # what it shows in place of the value ("Local Material"); "" the value
+    set_label(label = "")
+    # the box of the value under the pointer
+    get_box_hovered() -> bool
+    # outlined in the accent: a file dragged over it it would take
+    set_drop(on = false)
+    get_hovered() -> bool
+
+# A name typed in a field with a square button after it showing an icon
+# (a plus, open): the method an event calls and the button that adds it
+# or goes to it.  What is typed is kept as text is in a TextField
+EventField in widgets.event_field:
+    event committed(text = "")
+    event pressed()
+    ui = &Ui
+    view = &View
+    init(ui = &Ui, parent = &View, name = "")
+    set_text(text = "")
+    set_icon(icon = Icon.plus, size = 16.0)
+    get_editing() -> bool
+    # the keys while typed into; before drawing
+    update()
+
+# A box checked or not; a click toggles it and tells
+# a thing completion offers: what the list shows (label, its kind's
+# colour, detail on the right, doc beside it) and the text it puts in
+CodeChoice:
+    label = ""
+    kind = TokenKind.plain
+    detail = ""
+    doc = ""
+    insert = ""
+
+    init(label = "", kind = TokenKind.plain, detail = "", doc = "", insert = ""):
+        self.label = label
+        self.kind = kind
+        self.detail = detail
+        self.doc = doc
+        self.insert = insert
+
+# an icon left of a line's number (an event calling the method there),
+# and what it says when the pointer rests on it
+CodeGlyph:
+    line = 0
+    icon = Icon.none
+    tip = ""
+
+    init(line = 0, icon = Icon.none, tip = ""):
+        self.line = line
+        self.icon = icon
+        self.tip = tip
+
+# An editable view onto a TextEditor: code, in the Ui's monospaced font,
+# coloured by the editor's language, its problems (the editor's marks)
+# underlined.  What only an analysis of the code knows it asks for, and
+# whoever listens answers at once with show_*: completion as a name or a
+# dot is typed (Ctrl+Space: asked outright), what a name is when the
+# pointer rests on it, the parameters of the call being written,
+# where a name was declared (F12, Ctrl+click).  Ctrl+F finds in it: a
+# small panel at the top right, what is found lit (widgets/code_find); a
+# selection lights the other places holding the same text
+CodeView in widgets.code_view, widgets.code_find:
+    event asked_completion(line = 0, col = 0, explicit = false)
+    event asked_hover(line = 0, col = 0)
+    event asked_signature(line = 0, col = 0)
+    event asked_definition(line = 0, col = 0)
+    # a glyph of the gutter pressed: its line
+    event glyph_pressed(line = 0)
+    ui = &Ui
+    view = &View
+    editor = &TextEditor
+    init(ui = &Ui, parent = &View, editor = &TextEditor)
+    # the keys go to it
+    focus()
+    # input of the frame: before drawing
+    update()
+    # the answers: the choices for the word from column start to the caret
+    # (none: the list shuts); what the name rested on is; the call's
+    # label, its parameter at the caret from a to b in it
+    show_completion(choices = [CodeChoice], start = 0)
+    show_hover(text = "")
+    show_signature(text = "", a = 0, b = 0)
+    # the caret to a place, in sight
+    go_to(line = 0, col = 0)
+    # a column for glyphs left of the numbers (kept while on, so the text
+    # does not move as they come and go), and the glyphs in it
+    set_glyph_column(on = true)
+    set_glyphs(glyphs = [CodeGlyph])
+
+CheckBox in widgets.check_box:
+    event toggled(checked = false)
+    ui = &Ui
+    view = &View
+    checked = false
+    init(ui = &Ui, parent = &View, checked = false)
+    set_checked(checked = false)
+    # not enabled: shown a little dim, and a click changes nothing
+    set_enabled(enabled = true)
+
+# A box of rows under a title strip, as natiny's Properties draws a part
+# of a node: Node, Transform, Model.  rows: the column the rows go in
+Card in widgets.card:
+    ui = &Ui
+    root = &View
+    rows = &View
+    title = ""
+    init(ui = &Ui, parent = &View, title = "")
+    # a row: a plate with a name on the left (dim when muted: the node
+    # does not say it, natiny's own value holds), its fields after it in a
+    # row of their own, given back to put them in; cells: fields side by
+    # side, closer together; tall: as high as what is in it (a field that
+    # holds more than a line - a local material's fields), its name at the
+    # top
+    row(name = "", muted = false, cells = 1, tall = false) -> &View
+    # the name of the row at index dim or not
+    set_muted(index = 0, muted = true)
+    # the names' column, for the rows made after
+    set_label_width(width = 84.0)
+
+# A window floating over the workspace, as paint.net's Tools, History,
+# Layers and Colors are: a title strip that drags it (kept inside its
+# parent) and a close button, its body under the strip.  Content goes
+# under body; the owner places it (set_place) and shows it.
+FloatPanel in widgets.float_panel:
+    event closed()
+    ui = &Ui
+    root = &View
+    body = &View
+    title = ""
+    x = 0.0
+    y = 0.0
+    w = 0.0
+    h = 0.0
+    init(ui = &Ui, parent = &View, title = "", w = 200.0, h = 200.0)
+    set_title(title = "")
+    # its top left in its parent, kept inside it
+    set_place(x = 0.0, y = 0.0)
+    set_size(w = 0.0, h = 0.0)
+    client_size() -> (float, float)
+    set_min_size(w = 0.0, h = 0.0)
+    # held to sides of its parent: across 0 none, 1 left, 2 right; down 0
+    # none, 1 top, 2 bottom.  A drag near a side holds it there (a corner:
+    # both); the parent resized, it stays at them
+    dock(across = 0, down = 0)
+    set_visible(visible = true)
+    get_visible() -> bool
+    # the drag of the strip or border; before drawing
+    update()
+
+# paint.net's slider of a tool's option: a minus, a bar filled to the
+# value with it written in, a plus; a press or a drag on the bar sets it
+SliderBar in widgets.slider_bar:
+    # each change, while dragged too
+    event changed(value = 0.0)
+    ui = &Ui
+    view = &View
+    value = 0.0
+    min = 0.0
+    max = 100.0
+    suffix = ""
+    init(ui = &Ui, parent = &View, min = 0.0, max = 100.0, value = 0.0, suffix = "%", width = 180.0)
+    set_value(value = 0.0)
+    update()
+
+# a number typed in a field, with a list of common ones under its arrow
+# and a minus and a plus beside it (paint.net's brush width)
+NumberBox in widgets.number_box:
+    event changed(value = 0.0)
+    ui = &Ui
+    view = &View
+    value = 0.0
+    min = 0.0
+    max = 100.0
+    init(ui = &Ui, parent = &View, value = 0.0, min = 0.0, max = 100.0, presets = [float], width = 90.0, buttons = true)
+    set_value(value = 0.0)
+    get_editing() -> bool
+    update()
+
+# an icon (and text) with a small arrow: a press asks its owner to open
+# a menu under it
+DropButton in widgets.drop_button:
+    # the place under it, in the window
+    event pressed(x = 0.0, y = 0.0)
+    ui = &Ui
+    view = &View
+    icon = Icon.none
+    text = ""
+    init(ui = &Ui, parent = &View, icon = Icon.none, text = "", width = 0.0)
+    set_icon(icon = Icon.none)
+    set_text(text = "")
+    # what the tooltip says
+    set_hint(hint = "")
+    feedback()
+
+# a whole number in a field with arrows up and down beside it: typed,
+# stepped by the arrows or the wheel
+SpinField in widgets.spin_field:
+    event changed(value = 0)
+    ui = &Ui
+    view = &View
+    value = 0
+    min = 0
+    max = 100
+    init(ui = &Ui, parent = &View, value = 0, min = 0, max = 100, width = 60.0)
+    set_value(value = 0)
+    set_range(min = 0, max = 100)
+    get_editing() -> bool
+    finish(keep = true)
+    update()

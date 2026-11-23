@@ -1,0 +1,170 @@
+# history — the steps undo walks.  A step is the changes one edit made
+# (text put in or taken out, in order) and the caret and anchor before and
+# after it.  Undo takes them back in reverse; redo makes them again.
+# Characters typed one after another, where the last left off, are one
+# step: a word typed is undone at once.
+
+from text import Pos, TextEditor
+
+# one change: text put in at a place, or taken out from it
+Change:
+    put = true
+    at = Pos
+    text = ""
+
+    init(put = true, at = Pos(), text = ""):
+        self.put = put
+        self.at = at
+        self.text = text
+
+Step:
+    changes = [Change]
+    caret_before = Pos
+    anchor_before = Pos
+    caret_after = Pos()
+    anchor_after = Pos()
+    # "type" for characters typed: the next typed after it joins it
+    kind = ""
+
+    init(caret = Pos(), anchor = Pos(), kind = ""):
+        self.caret_before = caret
+        self.anchor_before = anchor
+        self.kind = kind
+
+    add(change = Change()):
+        self.changes.push(change)
+
+    finish(caret = Pos(), anchor = Pos()):
+        self.caret_after = caret
+        self.anchor_after = anchor
+
+    # the next step joined onto this one
+    join(next = Step()):
+        for c in next.changes:
+            self.changes.push(c)
+        self.caret_after = next.caret_after
+        self.anchor_after = next.anchor_after
+
+extend TextEditor:
+    steps = [Step]
+    # how many of steps are done: undo goes below it, redo above
+    done = 0
+    # a number for each state the history has been in: what saving
+    # remembers
+    serials = [int]
+    next_serial = 1
+    # the step being made, none outside an edit
+    open = none(Step)
+    # typing may join the last step: false once anything else happened
+    joinable = false
+
+    get_can_undo() -> bool:
+        return self.done > 0
+
+    get_can_redo() -> bool:
+        return self.done < len(self.steps)
+
+    get_state() -> int:
+        if self.done == 0:
+            return 0
+        return self.serials[self.done - 1]
+
+    undo() -> bool:
+        if self.done == 0:
+            return false
+        self.done -= 1
+        s = self.steps[self.done]
+        i = len(s.changes) - 1
+        while i >= 0:
+            c = s.changes[i]
+            if c.put:
+                self.buffer.remove(c.at, self.end_of(c.at, c.text))
+            else:
+                self.buffer.insert(c.at, c.text)
+            i -= 1
+        self.caret = s.caret_before
+        self.anchor = s.anchor_before
+        self.joinable = false
+        return true
+
+    redo() -> bool:
+        if self.done >= len(self.steps):
+            return false
+        s = self.steps[self.done]
+        for c in s.changes:
+            if c.put:
+                self.buffer.insert(c.at, c.text)
+            else:
+                self.buffer.remove(c.at, self.end_of(c.at, c.text))
+        self.done += 1
+        self.caret = s.caret_after
+        self.anchor = s.anchor_after
+        self.joinable = false
+        return true
+
+    # ─── Inside ───
+
+    # an edit begins: its changes go into one step
+    begin(kind = ""):
+        self.open = Step(self.caret, self.anchor, kind)
+
+    # the edit made: its step kept, joined onto the last when both are
+    # typing and nothing came between
+    finish():
+        if s := self.open:
+            self.open = none
+            if len(s.changes) == 0:
+                return
+            s.finish(self.caret, self.anchor)
+            # what was undone is gone
+            while len(self.steps) > self.done:
+                self.steps.pop()
+                self.serials.pop()
+            if self.joinable and s.kind == "type" and self.done > 0 and self.steps[self.done - 1].kind == "type":
+                self.steps[self.done - 1].join(s)
+                self.serials[self.done - 1] = self.next_serial
+            else:
+                self.steps.push(s)
+                self.serials.push(self.next_serial)
+                self.done += 1
+            self.next_serial += 1
+            self.joinable = s.kind == "type"
+
+    # text put in, kept in the step being made: where it ends
+    put(at = Pos(), text = "") -> Pos:
+        if text == "":
+            return at
+        end = self.buffer.insert(at, text)
+        if s := self.open:
+            s.add(Change(true, self.buffer.clamp(at), text))
+            self.open = s
+        return end
+
+    # text taken out, kept in the step being made
+    take(a = Pos(), b = Pos()) -> str:
+        if a.same(b):
+            return ""
+        lo = a if a.before(b) else b
+        out = self.buffer.remove(a, b)
+        if s := self.open:
+            s.add(Change(false, lo, out))
+            self.open = s
+        return out
+
+    # where text put in at a place ends
+    end_of(at = Pos(), text = "") -> Pos:
+        line = at.line
+        col = at.col
+        for c in text.chars():
+            if c == char("\n"):
+                line += 1
+                col = 0
+            else:
+                col += 1
+        return Pos(line, col)
+
+    forget_history():
+        self.steps.clear()
+        self.serials.clear()
+        self.done = 0
+        self.joinable = false

@@ -1,0 +1,68 @@
+# strings — the lookup; the words themselves are in table.
+
+from i18n import Lang, Tr
+from table import Table
+
+extend Tr:
+    en = [str: str]
+    ru = [str: str]
+    zh = [str: str]
+
+    init(lang = Lang.en):
+        self.lang = lang
+        for row in Table.rows():
+            key, en, ru, zh = row
+            self.en[key] = en
+            if ru != "":
+                self.ru[key] = ru
+            if zh != "":
+                self.zh[key] = zh
+
+    set_lang(lang = Lang.en):
+        self.lang = lang
+
+    app_name() -> str:
+        return "NT Paint"
+
+    t(key = "") -> str:
+        if key == "app.name":
+            return Tr.app_name()
+        match self.lang:
+            case Lang.ru:
+                if s := self.ru.get(key):
+                    return s
+            case Lang.zh:
+                if s := self.zh.get(key):
+                    return s
+            case _:
+                pass
+        if s := self.en.get(key):
+            return s
+        return key
+
+    f(key = "", args = [str]) -> str:
+        out = self.t(key)
+        for i, a in args.enumerate():
+            out.replace("{" + str(i) + "}", a)
+        return out
+
+    names() -> [str]:
+        return ["English", "Русский", "中文"]
+
+    code() -> str:
+        match self.lang:
+            case Lang.ru:
+                return "ru"
+            case Lang.zh:
+                return "zh"
+            case _:
+                return "en"
+
+    by_code(code = "") -> Lang:
+        match code:
+            case "ru":
+                return Lang.ru
+            case "zh":
+                return Lang.zh
+            case _:
+                return Lang.en

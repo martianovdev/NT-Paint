@@ -1,0 +1,57 @@
+# widgets/drop_button — an icon, maybe a word, and a small down arrow; a
+# press asks for the menu under it.
+
+from ui import DropButton, Icon
+from graphics import Align
+from window import Cursor
+from view import Layout
+
+extend DropButton:
+    hint = ""
+    init(ui = &Ui, parent = &View, icon = Icon.none, text = "", width = 0.0):
+        self.ui = ui
+        self.icon = icon
+        self.text = text
+        self.view = ui.create(Layout.free, parent)
+        w = width
+        if w <= 0.0:
+            w = 34.0 + (ui.measure(text) + 6.0 if text != "" else 0.0)
+        self.view.set_min_size(w, 24.0)
+        self.view.set_max_size(w, 24.0)
+        on self.view.draw():
+            self.draw()
+        on self.view.click():
+            x, y, _, h = self.ui.rect(self.view)
+            emit pressed(x, y + h)
+
+    set_icon(icon = Icon.none):
+        if self.icon != icon:
+            self.icon = icon
+            self.view.render_once()
+
+    set_text(text = ""):
+        if self.text != text:
+            self.text = text
+            self.view.render_once()
+
+    set_hint(hint = ""):
+        self.hint = hint
+
+    feedback():
+        if self.view.get_hovered():
+            self.ui.want_cursor(Cursor.hand)
+            self.ui.tip(self.hint if self.hint != "" else self.text)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        if self.view.get_hovered():
+            ui.fill_round(x, y, w, h, t.radius, t.hover)
+        left = x + 3.0
+        if self.icon != Icon.none:
+            ui.icon(self.icon, left, y + (h - 16.0) * 0.5, 16.0, -1)
+            left += 19.0
+        if self.text != "":
+            ui.text(left, y, w - (left - x) - 14.0, h, self.text, t.ink, Align.left + Align.middle, t.size)
+        ui.icon(Icon.twisty_open, x + w - 14.0, y + (h - 12.0) * 0.5, 12.0, t.ink_muted)

@@ -1,0 +1,372 @@
+# The NRBF records in a PDN3 document are read as data. References are
+# resolved by object ID, without loading the named .NET types.
+
+from compress import Gzip
+
+PdnBytes:
+    copy(data = [u8], start = 0, count = 0) -> [u8]:
+        out = [u8]
+        for at in range(start, start + count):
+            out.push(data[at])
+        return out
+
+PdnRecord:
+    export name = ""
+    fields = [str: (int, int)]
+    entries = [(int, int)]
+    export text = ""
+    export byte_offset = 0
+    export byte_count = 0
+
+    number(key = "", fallback = 0) -> int:
+        kind, value = self.fields.get(key).or((0, 0))
+        return value if kind == 1 else fallback
+
+PdnSchema:
+    name = ""
+    keys = [str]
+    types = [int]
+
+    init(name = "", keys = [str], types = [int]):
+        self.name = name
+        self.keys = keys
+        self.types = types
+
+PdnReader:
+    data = [u8]
+    at = 0
+    limit = 0
+    slots_left = 1048576
+    ok = true
+    root = 0
+    objects = [int: &PdnRecord]
+    schemas = [int: PdnSchema]
+    deferred = [int]
+
+    init(data = [u8]):
+        self.data = data
+        self.limit = len(data)
+
+    take(count = 0) -> int:
+        if not self.ok or count < 0 or count > self.limit - self.at:
+            self.ok = false
+            return 0
+        start = self.at
+        self.at += count
+        return start
+
+    le(count = 1) -> int:
+        start = self.take(count)
+        if not self.ok:
+            return 0
+        value = 0
+        for i in range(count):
+            value |= int(self.data[start + i]) << (i * 8)
+        return value
+
+    i32_value() -> int:
+        return int(i32(self.le(4)))
+
+    be32() -> int:
+        start = self.take(4)
+        if not self.ok:
+            return 0
+        value = 0
+        for i in range(4):
+            value = (value << 8) | int(self.data[start + i])
+        return value
+
+    string() -> str:
+        count = 0
+        for i in range(5):
+            b = self.le()
+            count |= (b & 127) << (i * 7)
+            if b < 128:
+                start = self.take(count)
+                if self.ok:
+                    if text := self.data.decode(start, start + count):
+                        return text
+                break
+        self.ok = false
+        return ""
+
+    primitive_size(kind = 0) -> int:
+        match kind:
+            case 1, 2, 10:
+                return 1
+            case 7, 14:
+                return 2
+            case 8, 11, 15:
+                return 4
+            case 6, 9, 12, 13, 16:
+                return 8
+            case _:
+                return 0
+
+    primitive(kind = 0) -> int:
+        size = self.primitive_size(kind)
+        if size > 0:
+            return self.i32_value() if kind == 8 else self.le(size)
+        if kind == 3:
+            first = self.le()
+            if first >= 128:
+                count = 1 if first < 224 else (2 if first < 240 else 3)
+                _ = self.take(count)
+            return 0
+        if kind == 5 or kind == 18:
+            _ = self.string()
+            return 0
+        self.ok = false
+        return 0
+
+    # MemberTypeInfo declares which values are inline primitives.
+    member_type(kind = 0) -> int:
+        match kind:
+            case 0:
+                return self.le()
+            case 3:
+                _ = self.string()
+            case 4:
+                _ = self.string()
+                _ = self.le(4)
+            case 7:
+                _ = self.le()
+            case _:
+                if kind < 0 or kind > 7:
+                    self.ok = false
+        return 0
+
+    add(id = 0, item = &PdnRecord()):
+        if id == 0 or len(self.objects) >= 131072 or self.objects.get(id) != none:
+            self.ok = false
+            return
+        self.objects[id] = item
+
+    class_record(tag = 0, depth = 0) -> (int, int):
+        id = self.i32_value()
+        schema = PdnSchema()
+        if tag == 1:
+            template = self.i32_value()
+            if known := self.schemas.get(template):
+                schema = known
+            else:
+                self.ok = false
+                return (0, 0)
+        else:
+            name = self.string()
+            count = self.i32_value()
+            if not self.ok or count < 0 or count > 256:
+                self.ok = false
+                return (0, 0)
+            keys = [str]
+            types = [int]
+            for _ in range(count):
+                keys.push(self.string())
+            if tag == 4 or tag == 5:
+                kinds = [int]
+                for _ in range(count):
+                    kinds.push(self.le())
+                for kind in kinds:
+                    types.push(self.member_type(kind))
+            else:
+                for _ in range(count):
+                    types.push(0)
+            if tag == 3 or tag == 5:
+                _ = self.le(4)
+            schema = PdnSchema(name, keys, types)
+            self.schemas[id] = schema
+        count = len(schema.keys)
+        if count > self.slots_left:
+            self.ok = false
+            return (0, 0)
+        self.slots_left -= count
+        item = &PdnRecord()
+        item.name = schema.name
+        self.add(id, item)
+        for i, key in schema.keys.enumerate():
+            if not self.ok:
+                break
+            kind = schema.types[i]
+            value = (1, self.primitive(kind)) if kind != 0 else self.record(depth + 1)
+            part, _ = value
+            if part >= 3:
+                self.ok = false
+            item.fields[key] = value
+        if item.name == "PaintDotNet.MemoryBlock" and item.number("deferred") == 1:
+            self.deferred.push(id)
+        return (2, id)
+
+    array_record(tag = 0, depth = 0) -> (int, int):
+        id = self.i32_value()
+        count = 0
+        kind = 0
+        if tag == 7:
+            shape = self.le()
+            rank = self.i32_value()
+            if shape > 5 or rank <= 0 or rank > 8:
+                self.ok = false
+                return (0, 0)
+            count = 1
+            for _ in range(rank):
+                dimension = self.i32_value()
+                if dimension < 0 or dimension > 536870912 or (dimension > 0 and count > 536870912 / dimension):
+                    self.ok = false
+                    return (0, 0)
+                count *= dimension
+            if shape >= 3:
+                _ = self.take(rank * 4)
+            kind = self.member_type(self.le())
+        else:
+            count = self.i32_value()
+            if tag == 15:
+                kind = self.le()
+        if not self.ok or count < 0:
+            self.ok = false
+            return (0, 0)
+        item = &PdnRecord()
+        self.add(id, item)
+        if kind != 0:
+            size = self.primitive_size(kind)
+            if size > 0:
+                start = self.take(count * size)
+                if kind == 2:
+                    item.byte_offset = start
+                    item.byte_count = count
+                return (2, id)
+        if count > 262144 or count > self.slots_left:
+            self.ok = false
+            return (0, 0)
+        self.slots_left -= count
+        while self.ok and len(item.entries) < count:
+            value = (1, self.primitive(kind)) if kind != 0 else self.record(depth + 1)
+            part, number = value
+            if part == 3:
+                if number <= 0 or number > count - len(item.entries):
+                    self.ok = false
+                    break
+                for _ in range(number):
+                    item.entries.push((0, 0))
+            else:
+                item.entries.push(value)
+        return (2, id)
+
+    record(depth = 0) -> (int, int):
+        if depth > 64:
+            self.ok = false
+            return (0, 0)
+        tag = self.le()
+        while self.ok and tag == 12:
+            _ = self.le(4)
+            _ = self.string()
+            tag = self.le()
+        match tag:
+            case 1, 2, 3, 4, 5:
+                return self.class_record(tag, depth)
+            case 6:
+                id = self.i32_value()
+                item = &PdnRecord()
+                item.text = self.string()
+                self.add(id, item)
+                return (2, id)
+            case 7, 15, 16, 17:
+                return self.array_record(tag, depth)
+            case 8:
+                return (1, self.primitive(self.le()))
+            case 9:
+                return (2, self.i32_value())
+            case 10:
+                return (0, 0)
+            case 11:
+                return (4, 0)
+            case 13:
+                return (3, self.le())
+            case 14:
+                return (3, self.i32_value())
+        self.ok = false
+        return (0, 0)
+
+    read() -> bool:
+        if self.le(4) != 0x334E4450:
+            return false
+        _ = self.take(self.le(3))
+        # PDN's two data markers followed by NRBF's stream header.
+        if self.le(3) != 0x000100:
+            return false
+        self.root = self.i32_value()
+        _ = self.i32_value()
+        if self.le(4) != 1 or self.le(4) != 0 or self.root <= 0:
+            return false
+        self.limit = min(self.limit, self.at + 64 * 1024 * 1024)
+        while self.ok:
+            kind, _ = self.record()
+            if kind == 4:
+                self.limit = len(self.data)
+                return self.ok
+            if kind != 2:
+                return false
+        return false
+
+    object(value = (0, 0)) -> none(&PdnRecord):
+        kind, id = value
+        if kind == 2:
+            return self.objects.get(id)
+        return none
+
+    field(item = &PdnRecord, key = "") -> none(&PdnRecord):
+        return self.object(item.fields.get(key).or((0, 0)))
+
+    metadata(item = &PdnRecord) -> [(str, str)]:
+        out = [(str, str)]
+        if array := self.field(item, "userMetadataItems"):
+            for entry in array.entries:
+                if pair := self.object(entry):
+                    if key := self.field(pair, "key"):
+                        if value := self.field(pair, "value"):
+                            out.push((key.text, value.text))
+        return out
+
+    pixels(length = 0) -> none([u8]):
+        format = self.le()
+        size = self.be32()
+        if not self.ok or (format != 0 and format != 1) or size <= 0 or size > 1024 * 1024:
+            return none
+        count = (length + size - 1) / size
+        if count > (self.limit - self.at) / 8:
+            return none
+        out = [u8]
+        for _ in range(length):
+            out.push(u8(0))
+        seen = [bool]
+        for _ in range(count):
+            seen.push(false)
+        for _ in range(count):
+            index = self.be32()
+            packed = self.be32()
+            if not self.ok or index >= count or seen[index]:
+                return none
+            seen[index] = true
+            offset = index * size
+            expected = min(size, length - offset)
+            start = self.take(packed)
+            if not self.ok:
+                return none
+            if format == 1:
+                if packed != expected:
+                    return none
+                for i in range(expected):
+                    out[offset + i] = self.data[start + i]
+            else:
+                if packed < 18 or packed > expected + 65536:
+                    return none
+                end = start + packed
+                footer = int(self.data[end - 4]) | (int(self.data[end - 3]) << 8) | (int(self.data[end - 2]) << 16) | (int(self.data[end - 1]) << 24)
+                if footer != expected:
+                    return none
+                if bytes := Gzip.decompress(PdnBytes.copy(self.data, start, packed)):
+                    if len(bytes) != expected:
+                        return none
+                    for i in range(expected):
+                        out[offset + i] = bytes[i]
+                else:
+                    return none
+        return out

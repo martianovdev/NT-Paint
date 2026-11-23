@@ -1,0 +1,41 @@
+# widgets/button — a plate with a title, the theme's button or its accent;
+# a click on it is pressed.
+
+from ui import Button
+from graphics import Align
+from window import Cursor
+from view import Layout
+
+extend Button:
+    init(ui = &Ui, parent = &View, text = "", accent = false):
+        self.ui = ui
+        self.accent = accent
+        self.view = ui.create(Layout.free, parent)
+        self.set_text(text)
+        on self.view.draw():
+            self.draw()
+        on self.view.click():
+            if self.enabled:
+                emit pressed()
+
+    set_text(text = ""):
+        self.text = text
+        t = self.ui.theme
+        self.view.set_min_size(max(t.button_width, self.ui.measure(text) + 32.0), t.button_height)
+
+    set_enabled(enabled = true):
+        self.enabled = enabled
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        hot = self.enabled and self.view.get_hovered()
+        if hot:
+            ui.want_cursor(Cursor.hand)
+        if self.accent:
+            ui.fill_round(x, y, w, h, t.radius, t.accent, 1.0 if self.enabled else 0.4)
+            ui.text(x, y, w, h, self.text, t.accent_ink, Align.center + Align.middle)
+        else:
+            ui.fill_round(x, y, w, h, t.radius, t.button_hot if hot else t.button)
+            ui.text(x, y, w, h, self.text, t.ink if self.enabled else t.ink_faint, Align.center + Align.middle)

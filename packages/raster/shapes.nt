@@ -1,0 +1,155 @@
+# shapes — coverage of polygons (scanlines, four sub-rows a pixel, exact
+# coverage along each) raised into a mask: the selection tools' shapes.
+
+from raster import Rect, Shapes
+
+extend Shapes:
+    box(pts = [float], pad = 0.0) -> Rect:
+        if len(pts) < 2:
+            return Rect()
+        x0 = pts[0]
+        y0 = pts[1]
+        x1 = x0
+        y1 = y0
+        i = 2
+        while i + 1 < len(pts):
+            x0 = min(x0, pts[i])
+            x1 = max(x1, pts[i])
+            y0 = min(y0, pts[i + 1])
+            y1 = max(y1, pts[i + 1])
+            i += 2
+        return Rect.around(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+
+    polygon(m = &Mask, pts = [float], aa = true, value = 255):
+        n = len(pts) / 2
+        if n < 3:
+            return
+        r = Shapes.box(pts, 1.0).clip(m.width, m.height)
+        if r.empty():
+            return
+        # the edges that cross rows: x0, y0, x1, y1, direction
+        ex0 = [float]
+        ey0 = [float]
+        ex1 = [float]
+        ey1 = [float]
+        dirs = [int]
+        for k in range(n):
+            ax = pts[k * 2]
+            ay = pts[k * 2 + 1]
+            j = (k + 1) % n
+            bx = pts[j * 2]
+            by = pts[j * 2 + 1]
+            if ay == by:
+                continue
+            ex0.push(ax)
+            ey0.push(ay)
+            ex1.push(bx)
+            ey1.push(by)
+            dirs.push(1 if by > ay else -1)
+        subs = 4 if aa else 1
+        weight = 1.0 / float(subs)
+        acc = [float]
+        for _ in range(r.w + 2):
+            acc.push(0.0)
+        cross = [(float, int)]
+        for y in range(r.y, r.y + r.h):
+            for i in range(len(acc)):
+                acc[i] = 0.0
+            touched = false
+            for s in range(subs):
+                sy = float(y) + (float(s) + 0.5) / float(subs)
+                cross.clear()
+                for e in range(len(dirs)):
+                    a = ey0[e]
+                    b = ey1[e]
+                    lo = min(a, b)
+                    hi = max(a, b)
+                    if sy >= lo and sy < hi:
+                        x = ex0[e] + (sy - a) * (ex1[e] - ex0[e]) / (b - a)
+                        cross.push((x, dirs[e]))
+                if len(cross) < 2:
+                    continue
+                cross.sort()
+                wind = 0
+                start = 0.0
+                for c in cross:
+                    x, d = c
+                    before = wind
+                    wind += d
+                    if before == 0 and wind != 0:
+                        start = x
+                    elif before != 0 and wind == 0:
+                        if aa:
+                            Shapes.span(acc, start - float(r.x), x - float(r.x), weight, r.w)
+                        else:
+                            # the pixels whose centres are inside
+                            a0 = int(ceil(start - 0.5)) - r.x
+                            a1 = int(ceil(x - 0.5)) - r.x
+                            for k in range(max(a0, 0), min(a1, r.w)):
+                                acc[k] = 1.0
+                        touched = true
+            if not touched:
+                continue
+            row = y * m.width
+            d = m.data
+            for x in range(r.w):
+                v = int(min(acc[x], 1.0) * float(value) + 0.5)
+                if v > 0:
+                    i = row + r.x + x
+                    if int(d[i]) < v:
+                        d[i] = u8(min(v, 255))
+
+    # coverage of the span a…b (columns from 0) added to acc, weighted
+    span(acc = [float], a = 0.0, b = 0.0, weight = 0.0, width = 0):
+        lo = max(a, 0.0)
+        hi = min(b, float(width))
+        if hi <= lo:
+            return
+        ia = int(floor(lo))
+        ib = int(floor(hi))
+        if ia == ib:
+            acc[ia] += (hi - lo) * weight
+            return
+        acc[ia] += (float(ia + 1) - lo) * weight
+        for k in range(ia + 1, ib):
+            acc[k] += weight
+        if ib < width:
+            acc[ib] += (hi - float(ib)) * weight
+
+    ellipse_points(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0) -> [float]:
+        cx = (x0 + x1) * 0.5
+        cy = (y0 + y1) * 0.5
+        rx = abs(x1 - x0) * 0.5
+        ry = abs(y1 - y0) * 0.5
+        n = clamp(int((rx + ry) * 1.6), 24, 1440)
+        out = [float]
+        for k in range(n):
+            t = float(k) / float(n) * 6.283185307179586
+            out.push(cx + cos(t) * rx)
+            out.push(cy + sin(t) * ry)
+        return out
+
+    ellipse(m = &Mask, x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, aa = true, value = 255):
+        Shapes.polygon(m, Shapes.ellipse_points(x0, y0, x1, y1), aa, value)
+
+    rounded_points(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, radius = 0.0) -> [float]:
+        l = min(x0, x1)
+        t = min(y0, y1)
+        r = max(x0, x1)
+        b = max(y0, y1)
+        rad = min(radius, (r - l) * 0.5, (b - t) * 0.5)
+        out = [float]
+        if rad <= 0.5:
+            for v in [l, t, r, t, r, b, l, b]:
+                out.push(v)
+            return out
+        steps = clamp(int(rad), 4, 64)
+        # the corners' arcs, clockwise from the top right
+        centres = [(r - rad, t + rad, -90.0), (r - rad, b - rad, 0.0), (l + rad, b - rad, 90.0), (l + rad, t + rad, 180.0)]
+        for c in centres:
+            cx, cy, start = c
+            for k in range(steps + 1):
+                a = (start + 90.0 * float(k) / float(steps)) * 3.141592653589793 / 180.0
+                out.push(cx + cos(a) * rad)
+                out.push(cy + sin(a) * rad)
+        return out

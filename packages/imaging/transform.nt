@@ -1,0 +1,225 @@
+# transform — surfaces made anew from others by shaders: resized (bilinear
+# up, a box of up to 8 × 8 samples down), flipped, turned a quarter at a
+# time, set on a bigger or smaller canvas; and a picture placed moved,
+# scaled and turned (moving selected pixels, Layer › Rotate / Zoom).
+
+from imaging import Transforms
+from gpu import Shaders
+from graphics import Filter
+from raster import Rect
+
+extend Transforms:
+    resized(gpu = &Gpu, src = &Surface, w = 0, h = 0) -> &Surface:
+        out = gpu.surface(w, h)
+        Transforms.resize_into(gpu, src, out)
+        return out
+
+    resize_into(gpu = &Gpu, src = &Surface, out = &Surface):
+        w = out.get_width()
+        h = out.get_height()
+        m = gpu.material("resize", TransformShaders.resize())
+        m.set_texture("src", src.get_texture(), Filter.linear, Filter.linear)
+        sw = float(src.get_width())
+        sh = float(src.get_height())
+        m.set_constant("from", sw, sh, sw / float(max(w, 1)), sh / float(max(h, 1)))
+        gpu.run(out, m, 0.0, 0.0, float(w), float(h))
+
+    flipped(gpu = &Gpu, src = &Surface, horizontal = true) -> &Surface:
+        w = src.get_width()
+        h = src.get_height()
+        out = gpu.surface(w, h)
+        m = gpu.material("remap", TransformShaders.remap())
+        m.set_texture("src", src.get_texture(), Filter.nearest, Filter.nearest)
+        # source pixel = (a·x + b·y + c, d·x + e·y + f): rows of a matrix
+        if horizontal:
+            m.set_constant("mx", -1.0, 0.0, float(w), float(w))
+            m.set_constant("my", 0.0, 1.0, 0.0, float(h))
+        else:
+            m.set_constant("mx", 1.0, 0.0, 0.0, float(w))
+            m.set_constant("my", 0.0, -1.0, float(h), float(h))
+        gpu.run(out, m, 0.0, 0.0, float(w), float(h))
+        return out
+
+    rotated(gpu = &Gpu, src = &Surface, turns = 1) -> &Surface:
+        w = src.get_width()
+        h = src.get_height()
+        t = ((turns % 4) + 4) % 4
+        ow = h if t % 2 == 1 else w
+        oh = w if t % 2 == 1 else h
+        out = gpu.surface(ow, oh)
+        m = gpu.material("remap", TransformShaders.remap())
+        m.set_texture("src", src.get_texture(), Filter.nearest, Filter.nearest)
+        match t:
+            case 1:
+                # clockwise: target (x, y) shows source (y, h - x)
+                m.set_constant("mx", 0.0, 1.0, 0.0, float(w))
+                m.set_constant("my", -1.0, 0.0, float(h), float(h))
+            case 2:
+                m.set_constant("mx", -1.0, 0.0, float(w), float(w))
+                m.set_constant("my", 0.0, -1.0, float(h), float(h))
+            case 3:
+                # counter-clockwise: target (x, y) shows source (w - y, x)
+                m.set_constant("mx", 0.0, -1.0, float(w), float(w))
+                m.set_constant("my", 1.0, 0.0, 0.0, float(h))
+            case _:
+                m.set_constant("mx", 1.0, 0.0, 0.0, float(w))
+                m.set_constant("my", 0.0, 1.0, 0.0, float(h))
+        gpu.run(out, m, 0.0, 0.0, float(ow), float(oh))
+        return out
+
+    canvas(gpu = &Gpu, src = &Surface, w = 0, h = 0, ox = 0, oy = 0, c = 0) -> &Surface:
+        out = gpu.surface(w, h)
+        gpu.clear(out, c)
+        sw = src.get_width()
+        sh = src.get_height()
+        r = Rect(ox, oy, sw, sh).clip(w, h)
+        if not r.empty():
+            gpu.blit(out, src.get_texture(), sw, sh, r.x - ox, r.y - oy, r.x, r.y, r.w, r.h)
+        return out
+
+    place(gpu = &Gpu, dst = &Surface, under = &Texture, src = &Texture, sel = none(&Texture), r = Rect(), cx = 0.0, cy = 0.0, dx = 0.0, dy = 0.0, sx = 1.0, sy = 1.0, angle = 0.0, source = Rect()):
+        c = r.clip(dst.get_width(), dst.get_height())
+        if c.empty():
+            return
+        m = gpu.material("place", TransformShaders.place(), true, true)
+        m.set_texture("under", under, Filter.nearest, Filter.nearest)
+        smooth = angle != 0.0 or sx != 1.0 or sy != 1.0 or dx != floor(dx) or dy != floor(dy)
+        f = Filter.linear if smooth else Filter.nearest
+        m.set_texture("src", src, f, f)
+        m.set_texture("sel", sel.or(gpu.everything()), f, f)
+        a = angle * 3.141592653589793 / 180.0
+        m.set_constant("centre", cx, cy, dx, dy)
+        m.set_constant("turn", cos(a), sin(a), 1.0 / (sx if sx != 0.0 else 1.0), 1.0 / (sy if sy != 0.0 else 1.0))
+        bounds = Rect(0, 0, dst.get_width(), dst.get_height()) if source.empty() else source
+        m.set_constant("source", float(bounds.x), float(bounds.y), float(bounds.w), float(bounds.h))
+        gpu.run(dst, m, float(c.x), float(c.y), float(c.w), float(c.h))
+
+    cut(gpu = &Gpu, dst = &Surface, src = &Texture, sel = &Texture, r = Rect()):
+        c = r.clip(dst.get_width(), dst.get_height())
+        m = gpu.material("cut", TransformShaders.cut(), true)
+        m.set_texture("src", src, Filter.nearest, Filter.nearest)
+        m.set_texture("sel", sel, Filter.nearest, Filter.nearest)
+        m.set_constant("how", 0.0, 0.0, 0.0, 0.0)
+        gpu.run(dst, m, float(c.x), float(c.y), float(c.w), float(c.h))
+
+    erase(gpu = &Gpu, dst = &Surface, src = &Texture, sel = &Texture, r = Rect()):
+        c = r.clip(dst.get_width(), dst.get_height())
+        m = gpu.material("cut", TransformShaders.cut(), true)
+        m.set_texture("src", src, Filter.nearest, Filter.nearest)
+        m.set_texture("sel", sel, Filter.nearest, Filter.nearest)
+        m.set_constant("how", 1.0, 0.0, 0.0, 0.0)
+        gpu.run(dst, m, float(c.x), float(c.y), float(c.w), float(c.h))
+
+    fill(gpu = &Gpu, dst = &Surface, src = &Texture, sel = &Texture, r = Rect(), c = 0):
+        cl = r.clip(dst.get_width(), dst.get_height())
+        m = gpu.material("sel_fill", TransformShaders.fill(), true, true)
+        m.set_texture("src", src, Filter.nearest, Filter.nearest)
+        m.set_texture("sel", sel, Filter.nearest, Filter.nearest)
+        m.set_constant("paint", Shaders.channel(c, 16), Shaders.channel(c, 8), Shaders.channel(c, 0), Shaders.channel(c, 24))
+        gpu.run(dst, m, float(cl.x), float(cl.y), float(cl.w), float(cl.h))
+
+TransformShaders:
+    # from: the source's size and how many source pixels a target pixel
+    # spans; down: a box of samples across that span
+    resize() -> str:
+        return """
+uniform sampler2D src;
+uniform vec4 from;
+void fragment()
+{
+    vec2 p = px();
+    vec2 span = from.zw;
+    if (span.x <= 1.0 && span.y <= 1.0)
+    {
+        COLOR = texture(src, p * span / from.xy);
+        return;
+    }
+    vec2 n = clamp(ceil(span), vec2(1.0, 1.0), vec2(8.0, 8.0));
+    vec2 start = (p - 0.5) * span;
+    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+    for (int j = 0; j < 8; j++)
+    {
+        if (float(j) >= n.y) { break; }
+        for (int i = 0; i < 8; i++)
+        {
+            if (float(i) >= n.x) { break; }
+            vec2 q = start + (vec2(float(i), float(j)) + 0.5) / n * span;
+            vec4 c = texture(src, q / from.xy);
+            acc += vec4(c.rgb * c.a, c.a);
+        }
+    }
+    acc /= n.x * n.y;
+    COLOR = acc.a > 0.0 ? vec4(acc.rgb / acc.a, acc.a) : vec4(0.0, 0.0, 0.0, 0.0);
+}
+"""
+
+    # the source pixel of a target pixel through a matrix: mx = (a, b, c,
+    # source width), my = (d, e, f, source height)
+    remap() -> str:
+        return """
+uniform sampler2D src;
+uniform vec4 mx;
+uniform vec4 my;
+void fragment()
+{
+    vec2 p = px();
+    vec2 s = vec2(mx.x * p.x + mx.y * p.y + mx.z, my.x * p.x + my.y * p.y + my.z);
+    COLOR = texture(src, s / vec2(mx.w, my.w));
+}
+"""
+
+    # centre (cx, cy) and the move (dx, dy); turn: cos, sin, 1/sx, 1/sy.
+    # The target pixel is taken back to the source: moved, turned and
+    # scaled about the centre the other way
+    place() -> str:
+        return """
+uniform sampler2D under;
+uniform sampler2D src;
+uniform vec4 centre;
+uniform vec4 turn;
+uniform vec4 source;
+void fragment()
+{
+    vec2 p = px();
+    vec4 u = texture(under, tuv(p));
+    vec2 q = p - centre.xy - centre.zw;
+    vec2 r = vec2(q.x * turn.x + q.y * turn.y, -q.x * turn.y + q.y * turn.x);
+    vec2 s = centre.xy + r * turn.zw;
+    vec2 st = (s - source.xy) / source.zw;
+    if (st.x < 0.0 || st.y < 0.0 || st.x >= 1.0 || st.y >= 1.0)
+    {
+        COLOR = u;
+        return;
+    }
+    vec4 c = texture(src, st);
+    float k = selk(st);
+    COLOR = over(vec4(c.rgb, c.a * k), u, 0.0);
+}
+"""
+
+    # how.x 0: the selected part kept (the rest see-through); 1: the
+    # selected part taken away
+    cut() -> str:
+        return """
+uniform sampler2D src;
+uniform vec4 how;
+void fragment()
+{
+    vec2 t = tuv(px());
+    vec4 c = texture(src, t);
+    float k = selk(t);
+    COLOR = vec4(c.rgb, c.a * (how.x < 0.5 ? k : 1.0 - k));
+}
+"""
+
+    fill() -> str:
+        return """
+uniform sampler2D src;
+uniform vec4 paint;
+void fragment()
+{
+    vec2 t = tuv(px());
+    vec4 c = texture(src, t);
+    COLOR = over(vec4(paint.rgb, paint.a * selk(t)), c, 0.0);
+}
+"""

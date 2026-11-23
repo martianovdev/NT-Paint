@@ -1,0 +1,347 @@
+# tools/session — what the tools share: the picture worked on, the GPU and
+# its painter, the palette's two colours, every tool's options (paint.net's
+# toolbar), the view (to turn the pointer into pixels and back) and the
+# fonts the text tool draws with.  The tools tell the rest of the program
+# what they want done by its events.
+
+from graphics import Font, Texture
+from imaging import BlendMode, GradientKind, Gpu, Painter
+from raster import Mask, Rect, SelectMode
+from ui import Ui
+from i18n import Tr
+from document.document import Document
+from fs import Fs
+
+# the tools in the order of paint.net's Tools window, two to a row
+enum ToolKind:
+    rect_select
+    move_pixels
+    lasso
+    move_selection
+    ellipse_select
+    zoom
+    magic_wand
+    pan
+    bucket
+    gradient
+    brush
+    eraser
+    pencil
+    picker
+    clone
+    recolor
+    text
+    line
+    shapes
+
+enum ShapeKind:
+    rectangle
+    rounded
+    ellipse
+    triangle
+    diamond
+    hexagon
+    star
+    arrow
+
+# how a shape is drawn: its outline, filled, or both
+enum ShapeStyle:
+    outline
+    fill
+    both
+
+# every tool's options, as the toolbar shows and sets them
+ToolSettings:
+    width = 2.0
+    hardness = 75.0
+    spacing = 15.0
+    antialias = true
+    mode = BlendMode.normal
+    overwrite = false
+    select_mode = SelectMode.replace
+    tolerance = 50.0
+    global_fill = false
+    sample_image = false
+    gradient = GradientKind.linear
+    gradient_alpha = false
+    shape = ShapeKind.rectangle
+    style = ShapeStyle.outline
+    radius = 20.0
+    font = 0
+    font_size = 24.0
+    bold = false
+    italic = false
+    # the color picker: after picking, back to the tool before it
+    picker_back = false
+
+    set_width(v = 0.0):
+        self.width = clamp(v, 1.0, 2000.0)
+
+    set_hardness(v = 0.0):
+        self.hardness = clamp(v, 0.0, 100.0)
+
+    set_spacing(v = 0.0):
+        self.spacing = clamp(v, 1.0, 1000.0)
+
+    set_antialias(on = true):
+        self.antialias = on
+
+    set_mode(mode = BlendMode.normal, overwrite = false):
+        self.mode = mode
+        self.overwrite = overwrite
+
+    set_select_mode(mode = SelectMode.replace):
+        self.select_mode = mode
+
+    set_tolerance(v = 0.0):
+        self.tolerance = clamp(v, 0.0, 100.0)
+
+    set_global_fill(on = true):
+        self.global_fill = on
+
+    set_sample_image(on = true):
+        self.sample_image = on
+
+    set_gradient(kind = GradientKind.linear):
+        self.gradient = kind
+
+    set_gradient_alpha(on = true):
+        self.gradient_alpha = on
+
+    set_shape(kind = ShapeKind.rectangle):
+        self.shape = kind
+
+    set_style(style = ShapeStyle.outline):
+        self.style = style
+
+    set_radius(v = 0.0):
+        self.radius = clamp(v, 0.0, 500.0)
+
+    set_font(index = 0):
+        self.font = index
+
+    set_font_size(v = 0.0):
+        self.font_size = clamp(v, 4.0, 1000.0)
+
+    set_bold(on = true):
+        self.bold = on
+
+    set_italic(on = true):
+        self.italic = on
+
+    set_picker_back(on = true):
+        self.picker_back = on
+
+# where the picture is on the screen: its top left (sx, sy) and the zoom
+Viewport:
+    sx = 0.0
+    sy = 0.0
+    zoom = 1.0
+
+    init(sx = 0.0, sy = 0.0, zoom = 1.0):
+        self.sx = sx
+        self.sy = sy
+        self.zoom = zoom
+
+    to_screen(x = 0.0, y = 0.0) -> (float, float):
+        return self.sx + x * self.zoom, self.sy + y * self.zoom
+
+    to_image(x = 0.0, y = 0.0) -> (float, float):
+        return (x - self.sx) / self.zoom, (y - self.sy) / self.zoom
+
+# A screen-resolution selection while a shape is being dragged.
+SelectionPreview:
+    area = Rect
+    width = 0
+    height = 0
+    base = Mask
+    texture = none(&Texture)
+    bounds = Rect()
+
+    init(area = Rect(), width = 0, height = 0, base = Mask(), texture = none(&Texture)):
+        self.area = area
+        self.width = width
+        self.height = height
+        self.base = base
+        self.texture = texture
+
+    show_rect(r = Rect()):
+        self.bounds = r
+
+    show(gpu = &Gpu, mask = Mask(), measure = true):
+        if mask.is_full():
+            self.texture = none
+            self.bounds = self.area
+            return
+        self.texture = gpu.mask_texture(mask, self.texture)
+        if not measure:
+            return
+        b = mask.bounds()
+        if b.empty():
+            self.bounds = Rect()
+        else:
+            sx = float(self.area.w) / float(self.width)
+            sy = float(self.area.h) / float(self.height)
+            self.bounds = Rect.around(float(self.area.x) + float(b.x) * sx, float(self.area.y) + float(b.y) * sy, float(self.area.x) + float(b.right()) * sx, float(self.area.y) + float(b.bottom()) * sy)
+
+# the fonts the text tool offers: a family's file in the system's fonts,
+# with its bold and italic files when there are
+FontFace:
+    name = ""
+    regular = ""
+    bold = ""
+    italic = ""
+    bold_italic = ""
+
+    init(name = "", regular = "", bold = "", italic = "", bold_italic = ""):
+        self.name = name
+        self.regular = regular
+        self.bold = bold
+        self.italic = italic
+        self.bold_italic = bold_italic
+
+Fonts:
+    faces = [FontFace]
+    loaded = [str: &Font]
+    fallback = none(&Font)
+    builtin = none(&Font)
+
+    init():
+        dir = "C:/Windows/Fonts/"
+        known = [
+            FontFace("Arial", "arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf"),
+            FontFace("Calibri", "calibri.ttf", "calibrib.ttf", "calibrii.ttf", "calibriz.ttf"),
+            FontFace("Cambria", "cambria.ttc", "cambriab.ttf", "cambriai.ttf", "cambriaz.ttf"),
+            FontFace("Comic Sans MS", "comic.ttf", "comicbd.ttf", "comici.ttf", "comicz.ttf"),
+            FontFace("Consolas", "consola.ttf", "consolab.ttf", "consolai.ttf", "consolaz.ttf"),
+            FontFace("Courier New", "cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf"),
+            FontFace("Georgia", "georgia.ttf", "georgiab.ttf", "georgiai.ttf", "georgiaz.ttf"),
+            FontFace("Impact", "impact.ttf"),
+            FontFace("Segoe UI", "segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf"),
+            FontFace("Tahoma", "tahoma.ttf", "tahomabd.ttf"),
+            FontFace("Times New Roman", "times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"),
+            FontFace("Trebuchet MS", "trebuc.ttf", "trebucbd.ttf", "trebucit.ttf", "trebucbi.ttf"),
+            FontFace("Verdana", "verdana.ttf", "verdanab.ttf", "verdanai.ttf", "verdanaz.ttf"),
+            FontFace("Microsoft YaHei", "msyh.ttc", "msyhbd.ttc"),
+        ]
+        fs = Fs()
+        for f in known:
+            if fs.exists(dir + f.regular):
+                self.faces.push(FontFace(f.name, dir + f.regular, Fonts.or_empty(fs, dir, f.bold), Fonts.or_empty(fs, dir, f.italic), Fonts.or_empty(fs, dir, f.bold_italic)))
+
+    or_empty(fs = Fs(), dir = "", file = "") -> str:
+        if file != "" and fs.exists(dir + file):
+            return dir + file
+        return ""
+
+    set_builtin(font = &Font, fallback = none(&Font)):
+        self.builtin = font
+        self.fallback = fallback
+
+    names() -> [str]:
+        out = [str]
+        for f in self.faces:
+            out.push(f.name)
+        if len(out) == 0:
+            out.push("Roboto")
+        return out
+
+    # the font of a face (its bold, italic file when asked and there is one)
+    get(gpu = &Gpu, index = 0, bold = false, italic = false) -> none(&Font):
+        if index < 0 or index >= len(self.faces):
+            return self.builtin
+        f = self.faces[index]
+        path = f.regular
+        if bold and italic and f.bold_italic != "":
+            path = f.bold_italic
+        elif bold and f.bold != "":
+            path = f.bold
+        elif italic and f.italic != "":
+            path = f.italic
+        if got := self.loaded.get(path):
+            return got
+        if bytes := Fs().read_bytes(path):
+            font = gpu.graphics.font_create(bytes)
+            if fb := self.fallback:
+                gpu.graphics.font_set_fallback(font, fb)
+            self.loaded[path] = font
+            return font
+        return self.builtin
+
+Session:
+    event colors_changed()
+    # a tool option changed in the toolbar (tolerance, mode, width...)
+    event options_changed()
+    # a tool asks for another (the picker going back, a paste moving)
+    event tool_asked(kind = ToolKind.rect_select)
+    # the zoom tool: in (factor > 1) or out about a point of the screen; a
+    # rectangle of the picture to fit (w > 0)
+    event zoom_asked(factor = 1.0, x = 0.0, y = 0.0, w = 0.0, h = 0.0)
+    # the pan tool: the view moved by dx, dy screen pixels
+    event pan_asked(dx = 0.0, dy = 0.0)
+    ui = &Ui
+    gpu = &Gpu
+    painter = &Painter
+    tr = &Tr
+    settings = &ToolSettings()
+    fonts = &Fonts()
+    doc = none(&Document)
+    view = Viewport()
+    visible_image = Rect()
+    selection_preview = none(&SelectionPreview)
+    primary = 0xFF000000
+    secondary = 0xFFFFFFFF
+    # the tool before the current one (the picker goes back to it)
+    previous = ToolKind.brush
+
+    init(ui = &Ui, gpu = &Gpu, tr = &Tr):
+        self.ui = ui
+        self.gpu = gpu
+        self.tr = tr
+        self.painter = &Painter(gpu)
+
+    set_doc(doc = none(&Document)):
+        self.doc = doc
+
+    set_view(view = Viewport(), visible = Rect()):
+        self.view = view
+        self.visible_image = visible
+
+    set_selection_preview(preview = none(&SelectionPreview)):
+        self.selection_preview = preview
+
+    set_primary(c = 0):
+        if c != self.primary:
+            self.primary = c
+            emit colors_changed()
+
+    set_secondary(c = 0):
+        if c != self.secondary:
+            self.secondary = c
+            emit colors_changed()
+
+    swap_colors():
+        p = self.primary
+        self.primary = self.secondary
+        self.secondary = p
+        emit colors_changed()
+
+    reset_colors():
+        self.primary = 0xFF000000
+        self.secondary = 0xFFFFFFFF
+        emit colors_changed()
+
+    set_previous(kind = ToolKind.brush):
+        self.previous = kind
+
+    ask_tool(kind = ToolKind.rect_select):
+        emit tool_asked(kind)
+
+    ask_zoom(factor = 1.0, x = 0.0, y = 0.0, w = 0.0, h = 0.0):
+        emit zoom_asked(factor, x, y, w, h)
+
+    tell_options():
+        emit options_changed()
+
+    ask_pan(dx = 0.0, dy = 0.0):
+        emit pan_asked(dx, dy)

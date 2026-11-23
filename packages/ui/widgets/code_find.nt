@@ -1,0 +1,492 @@
+# widgets/code_find — finding in a CodeView, as VS Code's find: Ctrl+F
+# opens a small panel at the text's top right corner, what is selected
+# (one line of it) put in its field and the field's text selected to be
+# typed over.  What it finds is lit all over the text, the one at hand
+# selected in it, and the panel says which of how many: "3 of 12".
+#
+#   Enter, Down, F3         the next one (from the last, the first again)
+#   Shift+Enter, Up, Shift+F3   the one before
+#   Alt+C, Aa               matching case
+#   Alt+W, ab               whole words only
+#   Escape, the cross       the panel shut, the keys back to the text
+#
+# A press in the text gives the keys back to it and keeps the panel open
+# (F3 still steps); Ctrl+F gives them to the field again.  Typing finds
+# as it goes, the first one at or after where the caret was.
+#
+# With no panel open, a selection within one line lights the other places
+# that hold the same text, as VS Code does.
+
+from ui import CodeView, Icon, LineEdit
+from graphics import Align
+from window import Cursor, Key
+from text import Pos
+
+extend CodeView:
+    # the panel open; its field has the keys
+    finding = false
+    find_focus = false
+    find_edit = none(&LineEdit)
+    find_case = false
+    find_word = false
+    # where finding began: the first found is the first at or after it
+    find_from = Pos()
+    # what was found: the start of each and its end column, in order; the
+    # places of each line's; the one at hand (-1 none)
+    found = [Pos]
+    found_ends = [int]
+    found_lines = [int: [int]]
+    found_at = -1
+    found_more = false
+    # what the finding was for, to know when to look again
+    found_query = ""
+    found_case = false
+    found_word = false
+    found_revision = -1
+    # the places holding the selected text (no panel): the text, the
+    # buffer's revision they were found in, each line's (start, end)
+    same_text = ""
+    same_revision = -1
+    same_lines = [int: [(int, int)]]
+    # the panel's rectangle, as drawn
+    panel_x = 0.0
+    panel_y = 0.0
+    # what was found moved the selection: the view brings it in sight
+    find_moved = false
+
+    # ─── Opening and shutting ───
+
+    # Ctrl+F: the panel open, the selection (one line of it) in its field,
+    # the field's text selected, the keys to it
+    open_find():
+        e = self.editor
+        if self.find_edit == none:
+            self.find_edit = &LineEdit(self.ui)
+        text = self.found_query
+        if e.has_selection():
+            picked = e.get_selected_text()
+            if not ("\n" in picked):
+                text = picked
+        a, _ = e.get_selection()
+        self.find_from = a
+        if f := self.find_edit:
+            f.begin(text, 0, len(text.chars()))
+        self.finding = true
+        self.find_focus = true
+        self.ui.views.set_focus(self.view)
+        self.found_revision = -1
+        self.refresh_found(false)
+
+    close_find():
+        self.finding = false
+        self.find_focus = false
+        self.ui.views.set_focus(self.view)
+
+    get_query() -> str:
+        if f := self.find_edit:
+            return f.get_text()
+        return ""
+
+    # ─── The keys ───
+
+    # the field's keys while it has them: stepping, the switches, shutting,
+    # then typing (found again as it changes)
+    find_keys():
+        win = self.ui.window
+        ctrl = win.input_get_key_down(Key.control)
+        shift = win.input_get_key_down(Key.shift)
+        alt = win.input_get_key_down(Key.alt)
+        self.ui.hold_keys()
+        if win.input_get_key_pressed(Key.escape):
+            self.close_find()
+            return
+        if win.input_get_key_repeated(Key.enter):
+            self.step_found(-1 if shift else 1)
+            return
+        if win.input_get_key_repeated(Key.down):
+            self.step_found(1)
+            return
+        if win.input_get_key_repeated(Key.up):
+            self.step_found(-1)
+            return
+        if win.input_get_key_repeated(Key.f3):
+            self.step_found(-1 if shift else 1)
+            return
+        if alt and win.input_get_key_pressed(Key.c):
+            self.find_case = not self.find_case
+            self.refresh_found(true)
+            return
+        if alt and win.input_get_key_pressed(Key.w):
+            self.find_word = not self.find_word
+            self.refresh_found(true)
+            return
+        if ctrl and win.input_get_key_pressed(Key.f):
+            if f := self.find_edit:
+                text = f.get_text()
+                f.begin(text, 0, len(text.chars()))
+            return
+        if f := self.find_edit:
+            before = f.get_text()
+            f.update()
+            if f.get_text() != before:
+                self.refresh_found(true)
+
+    # the text's keys for finding: Ctrl+F, F3, Escape (busy: a box over the
+    # text has Escape first); true when one was taken
+    find_text_keys(busy = false) -> bool:
+        win = self.ui.window
+        if win.input_get_key_down(Key.control) and win.input_get_key_pressed(Key.f):
+            self.open_find()
+            return true
+        if self.finding and win.input_get_key_repeated(Key.f3):
+            self.step_found(-1 if win.input_get_key_down(Key.shift) else 1)
+            return true
+        if self.finding and not busy and win.input_get_key_pressed(Key.escape):
+            self.close_find()
+            return true
+        return false
+
+    # ─── What is found ───
+
+    # Found again when the query, the switches or the text changed; typed
+    # (go): the first at or after where finding began, selected
+    refresh_found(go = false):
+        query = self.get_query()
+        b = self.editor.buffer
+        if query == self.found_query and self.find_case == self.found_case and self.find_word == self.found_word and b.revision == self.found_revision:
+            return
+        self.found_query = query
+        self.found_case = self.find_case
+        self.found_word = self.find_word
+        self.found_revision = b.revision
+        self.found.clear()
+        self.found_ends.clear()
+        self.found_lines = [int: [int]]
+        self.found_at = -1
+        self.found_more = false
+        if query == "":
+            return
+        q = query if self.find_case else query.lower()
+        qc = q.chars()
+        for l in range(b.get_line_count()):
+            text = b.get_line(l)
+            low = text if self.find_case else text.lower()
+            if not (q in low):
+                continue
+            for start in Seek.all(low.chars(), qc, self.find_word):
+                if len(self.found) >= 20000:
+                    self.found_more = true
+                    break
+                at = self.found_lines.get(l).or([int])
+                at.push(len(self.found))
+                self.found_lines[l] = at
+                self.found.push(Pos(l, start))
+                self.found_ends.push(start + len(qc))
+            if self.found_more:
+                break
+        if len(self.found) == 0:
+            return
+        # the first at or after where finding began
+        self.found_at = 0
+        for i, p in self.found.enumerate():
+            if p.line > self.find_from.line or (p.line == self.find_from.line and p.col >= self.find_from.col):
+                self.found_at = i
+                break
+        if go:
+            self.select_found()
+
+    # the next found (dir 1) or the one before (-1), round the ends
+    step_found(dir = 1):
+        self.refresh_found(false)
+        n = len(self.found)
+        if n == 0:
+            return
+        if self.found_at < 0:
+            self.found_at = 0
+        else:
+            # from where the caret is, when it moved off the one at hand
+            e = self.editor
+            sa, sb = e.get_selection()
+            here = self.found[self.found_at]
+            on = sa.line == here.line and sa.col == here.col and sb.col == self.found_ends[self.found_at]
+            if on:
+                self.found_at = (self.found_at + dir + n) % n
+            else:
+                self.found_at = Seek.near(self.found, e.caret, dir)
+        self.find_from = self.found[self.found_at]
+        self.select_found()
+
+    # the one at hand selected in the text, in sight
+    select_found():
+        if self.found_at < 0 or self.found_at >= len(self.found):
+            return
+        p = self.found[self.found_at]
+        e = self.editor
+        e.set_caret(p)
+        e.set_caret(Pos(p.line, self.found_ends[self.found_at]), true)
+        self.find_moved = true
+
+    # the places holding the selected text, found again as it changes
+    refresh_same():
+        e = self.editor
+        text = ""
+        if e.has_selection():
+            picked = e.get_selected_text()
+            if not ("\n" in picked) and picked.strip() != "" and len(picked.chars()) <= 200:
+                text = picked
+        if text == self.same_text and e.buffer.revision == self.same_revision:
+            return
+        self.same_text = text
+        self.same_revision = e.buffer.revision
+        self.same_lines = [int: [(int, int)]]
+        if text == "":
+            return
+        tc = text.chars()
+        b = e.buffer
+        count = 0
+        for l in range(b.get_line_count()):
+            line = b.get_line(l)
+            if not (text in line):
+                continue
+            spans = [(int, int)]
+            for start in Seek.all(line.chars(), tc, false):
+                spans.push((start, start + len(tc)))
+            self.same_lines[l] = spans
+            count += len(spans)
+            if count > 5000:
+                break
+
+    # ─── Drawing ───
+
+    # what is found on line l, lit under its text: the panel's finds, or
+    # (no panel) the places holding the selected text
+    draw_found(l = 0, line = "", text_x = 0.0, ly = 0.0, cw = 0.0, lh = 0.0):
+        ui = self.ui
+        t = ui.theme
+        if self.finding and self.found_query != "":
+            if at := self.found_lines.get(l):
+                for i in at:
+                    p = self.found[i]
+                    d0 = Seek.display(line, p.col, self.editor.tab)
+                    d1 = Seek.display(line, self.found_ends[i], self.editor.tab)
+                    fx = text_x + float(d0) * cw
+                    fw = float(max(1, d1 - d0)) * cw
+                    if i == self.found_at:
+                        ui.fill(fx, ly, fw, lh, 0xF2A33A, 0.45)
+                        ui.outline_round(fx, ly, fw, lh, 2.0, 0xF2A33A)
+                    else:
+                        ui.fill(fx, ly, fw, lh, 0xF2A33A, 0.22)
+            return
+        if self.same_text == "":
+            return
+        if spans := self.same_lines.get(l):
+            sa, _ = self.editor.get_selection()
+            for s in spans:
+                a, b = s
+                # the selection itself is lit already
+                if l == sa.line and a == sa.col:
+                    continue
+                d0 = Seek.display(line, a, self.editor.tab)
+                d1 = Seek.display(line, b, self.editor.tab)
+                fx = text_x + float(d0) * cw
+                fw = float(max(1, d1 - d0)) * cw
+                ui.fill(fx, ly, fw, lh, t.accent, 0.16)
+                ui.outline_round(fx, ly, fw, lh, 2.0, t.accent, 1.0)
+
+    # where each of the panel's parts is, from its left: the field, Aa,
+    # ab, the count, up, down, the cross
+    find_part(i = 0) -> (float, float):
+        field = 230.0
+        button = 24.0
+        count = 74.0
+        match i:
+            case 0:
+                return 6.0, field
+            case 1:
+                return 6.0 + field + 4.0, button
+            case 2:
+                return 6.0 + field + 4.0 + button + 2.0, button
+            case 3:
+                return 6.0 + field + 4.0 + button * 2.0 + 8.0, count
+            case 4:
+                return 6.0 + field + 4.0 + button * 2.0 + 8.0 + count, button
+            case 5:
+                return 6.0 + field + 4.0 + button * 3.0 + 10.0 + count, button
+            case _:
+                return 6.0 + field + 4.0 + button * 4.0 + 14.0 + count, button
+
+    find_size() -> (float, float):
+        x, w = self.find_part(6)
+        return x + w + 6.0, self.ui.theme.field_height + 10.0
+
+    # the part of the panel under the pointer, -1 for none (or off it)
+    find_part_at(px = 0.0, py = 0.0) -> int:
+        pw, ph = self.find_size()
+        if px < self.panel_x or px >= self.panel_x + pw or py < self.panel_y or py >= self.panel_y + ph:
+            return -1
+        for i in range(7):
+            x, w = self.find_part(i)
+            if px >= self.panel_x + x and px < self.panel_x + x + w:
+                return i
+        return 7
+
+    # a press on the panel: the field takes the keys (and the caret), a
+    # switch flips, an arrow steps, the cross shuts; false when it was not
+    # on the panel
+    find_press(px = 0.0, py = 0.0, size = 0.0) -> bool:
+        if not self.finding:
+            return false
+        part = self.find_part_at(px, py)
+        if part < 0:
+            return false
+        match part:
+            case 0:
+                self.find_focus = true
+                if f := self.find_edit:
+                    x, _ = self.find_part(0)
+                    f.click(px - self.panel_x - x, size, self.ui.window.input_get_key_down(Key.shift))
+            case 1:
+                self.find_case = not self.find_case
+                self.find_focus = true
+                self.refresh_found(true)
+            case 2:
+                self.find_word = not self.find_word
+                self.find_focus = true
+                self.refresh_found(true)
+            case 4:
+                self.step_found(-1)
+            case 5:
+                self.step_found(1)
+            case 6:
+                self.close_find()
+            case _:
+                self.find_focus = true
+        return true
+
+    draw_find(x = 0.0, y = 0.0, size = 0.0):
+        if not self.finding:
+            return
+        ui = self.ui
+        t = ui.theme
+        self.panel_x = x
+        self.panel_y = y
+        pw, ph = self.find_size()
+        px, py = ui.pointer()
+        hot = self.find_part_at(px, py)
+        if hot >= 0:
+            ui.want_cursor(Cursor.text if hot == 0 else Cursor.hand)
+        ui.fill_round(x + 1.0, y + 2.0, pw, ph, t.radius, 0x000000, 0.35)
+        ui.fill_round(x, y, pw, ph, t.radius, t.menu_panel)
+        ui.outline_round(x, y, pw, ph, t.radius, t.field_edge)
+        fh = t.field_height
+        top = y + 5.0
+        # the field
+        fx, fw = self.find_part(0)
+        focused = self.find_focus and self.view.get_focused()
+        query = self.get_query()
+        if focused:
+            if f := self.find_edit:
+                f.draw(x + fx, top, fw, fh, size)
+        else:
+            ui.fill_round(x + fx, top, fw, fh, t.radius, t.field)
+            ui.outline_round(x + fx, top, fw, fh, t.radius, t.field_edge)
+            ui.text(x + fx + 4.0, top, fw - 8.0, fh, query, t.ink, Align.left + Align.middle, size)
+        if query == "":
+            ui.text(x + fx + 4.0, top, fw - 8.0, fh, "Find", t.ink_faint, Align.left + Align.middle, size)
+        # the switches
+        for i in [1, 2]:
+            bx, bw = self.find_part(i)
+            on = self.find_case if i == 1 else self.find_word
+            if on:
+                ui.fill_round(x + bx, top + 1.0, bw, fh - 2.0, t.radius, t.accent, 0.35)
+                ui.outline_round(x + bx, top + 1.0, bw, fh - 2.0, t.radius, t.accent)
+            elif hot == i:
+                ui.fill_round(x + bx, top + 1.0, bw, fh - 2.0, t.radius, t.button_hot)
+            ui.text(x + bx, top, bw, fh, "Aa" if i == 1 else "ab", t.ink if on or hot == i else t.ink_muted, Align.center + Align.middle, t.small)
+            if i == 2:
+                ui.line(x + bx + 6.0, top + fh - 6.0, x + bx + bw - 6.0, top + fh - 6.0, t.ink if on or hot == i else t.ink_muted, 1.0)
+        # which of how many
+        cx, cwidth = self.find_part(3)
+        n = len(self.found)
+        said = "No results"
+        if query == "":
+            said = ""
+        elif n > 0:
+            more = "+" if self.found_more else ""
+            said = f"{self.found_at + 1} of {n}{more}" if self.found_at >= 0 else f"? of {n}{more}"
+        ui.text(x + cx, top, cwidth, fh, said, t.error if query != "" and n == 0 else t.ink_muted, Align.left + Align.middle, t.small)
+        # the arrows and the cross
+        for i in [4, 5, 6]:
+            bx, bw = self.find_part(i)
+            if hot == i:
+                ui.fill_round(x + bx, top + 1.0, bw, fh - 2.0, t.radius, t.button_hot)
+            ink = t.ink if hot == i else t.ink_muted
+            mx = x + bx + bw * 0.5
+            my = top + fh * 0.5
+            if i == 6:
+                ui.icon(Icon.cross, mx - 7.0, my - 7.0, 14.0, ink)
+            else:
+                d = -1.0 if i == 4 else 1.0
+                ui.line(mx - 4.5, my - 2.0 * d, mx, my + 2.5 * d, ink, 1.5)
+                ui.line(mx, my + 2.5 * d, mx + 4.5, my - 2.0 * d, ink, 1.5)
+
+# where a query is in a line, as characters
+Seek:
+    # the start of each place query is in text (none overlapping); whole:
+    # only where it stands as a word of its own
+    all(text = [char], query = [char], whole = false) -> [int]:
+        out = [int]
+        n = len(text)
+        m = len(query)
+        if m == 0 or m > n:
+            return out
+        i = 0
+        while i + m <= n:
+            same = true
+            for k in range(m):
+                if text[i + k] != query[k]:
+                    same = false
+                    break
+            if same and whole:
+                if (i > 0 and Seek.word(text[i - 1])) or (i + m < n and Seek.word(text[i + m])):
+                    same = false
+            if same:
+                out.push(i)
+                i += m
+            else:
+                i += 1
+        return out
+
+    # the column a character is drawn at, a tab to the next stop
+    display(line = "", col = 0, tab = 4) -> int:
+        if not ("	" in line):
+            return col
+        d = 0
+        for i, c in line.chars().enumerate():
+            if i >= col:
+                break
+            if c == char("	"):
+                d = (d / tab + 1) * tab
+            else:
+                d += 1
+        return d
+
+    word(c = char(" ")) -> bool:
+        return (c >= char("a") and c <= char("z")) or (c >= char("A") and c <= char("Z")) or (c >= char("0") and c <= char("9")) or c == char("_") or int(c) >= 128
+
+    # the next found after at (dir 1) or the one before it (-1), round
+    # the ends
+    near(found = [Pos], at = Pos(), dir = 1) -> int:
+        n = len(found)
+        if dir > 0:
+            for i, p in found.enumerate():
+                if p.line > at.line or (p.line == at.line and p.col >= at.col):
+                    return i
+            return 0
+        i = n - 1
+        while i >= 0:
+            p = found[i]
+            if p.line < at.line or (p.line == at.line and p.col < at.col):
+                return i
+            i -= 1
+        return n - 1

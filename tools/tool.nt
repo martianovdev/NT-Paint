@@ -1,0 +1,207 @@
+# tools/tool — what every tool answers: the pointer pressed, dragged, let
+# go of and moving over the picture; keys; finishing what it holds open;
+# drawing its marks over the canvas.  And the pieces several tools share.
+
+from graphics import Surface
+from window import Cursor
+from raster import Mask, Rect, SelectMode
+from ui import Icon
+from document.document import Document
+from document.history import Step
+from tools.session import Session, ToolKind
+
+# the pointer: where on the picture (pixels, fractional) and on the
+# screen, which button, which keys are held
+Pointer:
+    x = 0.0
+    y = 0.0
+    sx = 0.0
+    sy = 0.0
+    right = false
+    shift = false
+    ctrl = false
+    alt = false
+    pressure = 1.0
+    both = false
+
+    init(x = 0.0, y = 0.0, sx = 0.0, sy = 0.0, right = false, shift = false, ctrl = false, alt = false, pressure = 1.0, both = false):
+        self.x = x
+        self.y = y
+        self.sx = sx
+        self.sy = sy
+        self.right = right
+        self.shift = shift
+        self.ctrl = ctrl
+        self.alt = alt
+        self.pressure = pressure
+        self.both = both
+
+interface Tool:
+    kind() -> ToolKind
+    press(s = &Session, p = Pointer())
+    drag(s = &Session, p = Pointer())
+    release(s = &Session, p = Pointer())
+    hover(s = &Session, p = Pointer())
+    # the keys of the frame while the canvas has them
+    key(s = &Session)
+    # whatever is held open finished and kept (a text, moved pixels)
+    commit(s = &Session)
+    # its marks over the canvas, in the window's pixels
+    overlay(s = &Session)
+    # Escape: what is being done thrown away, the picture as it was
+    # before it; false when nothing was going on
+    cancel(s = &Session) -> bool
+    # the colours or the toolbar's options changed: what it made last,
+    # while nothing came after it, made again with them (paint.net keeps a
+    # fill, a wand's selection, a gradient, a shape open)
+    recolor(s = &Session)
+    # a drag or an edit going on: the keys are the tool's
+    busy() -> bool
+    cursor() -> Cursor
+
+# a tool's drawing shown as it is dragged: the layer kept as it was at
+# the press, put back before each new look, then kept as one step
+Preview:
+    orig = none(&Surface)
+    layer = 0
+    touched = Rect()
+    # the step it kept last and in which document: reopened while it is
+    # still the last one done
+    kept = none(&Document)
+    kept_step = none(&Step)
+
+    # the press: the current layer kept
+    start(s = &Session) -> bool:
+        if d := s.doc:
+            self.orig = s.gpu.duplicate(d.layer().surface)
+            self.layer = d.current
+            self.touched = Rect()
+            self.kept = none
+            self.kept_step = none
+            return true
+        return false
+
+    # the step kept last undone and begun again, when nothing came after
+    # it; false when it cannot be
+    reopen(s = &Session) -> bool:
+        if d := s.doc:
+            if k := self.kept:
+                if step := self.kept_step:
+                    h = d.history
+                    if k is d and h.at == len(h.steps) and h.at > 0 and h.steps[h.at - 1] is step:
+                        d.undo()
+                        return self.start(s)
+        return false
+
+    active() -> bool:
+        return self.orig != none
+
+    # the layer as it was, and the painter begun on it
+    reset(s = &Session):
+        if d := s.doc:
+            if o := self.orig:
+                l = d.layers[clamp(self.layer, 0, len(d.layers) - 1)]
+                s.gpu.copy(l.surface, o.get_texture(), self.touched)
+                s.painter.begin(l.surface)
+
+    # what the painter changed this time
+    mark(r = Rect()):
+        self.touched = self.touched.union(r)
+
+    # kept as a step of history
+    finish(s = &Session, title = "", icon = Icon.history_item):
+        if d := s.doc:
+            if o := self.orig:
+                d.commit_pixels(o, title, icon, clamp(self.layer, 0, len(d.layers) - 1), self.touched)
+                h = d.history
+                if h.at > 0:
+                    self.kept = d
+                    self.kept_step = h.steps[h.at - 1]
+        self.orig = none
+        self.touched = Rect()
+
+    # thrown away: the layer as it was
+    cancel(s = &Session):
+        if d := s.doc:
+            if o := self.orig:
+                l = d.layers[clamp(self.layer, 0, len(d.layers) - 1)]
+                s.gpu.copy(l.surface, o.get_texture(), self.touched)
+                d.touch()
+        self.orig = none
+        self.touched = Rect()
+
+Modes:
+    # the selection mode the keys ask for over the toolbar's: Ctrl adds,
+    # Alt takes away, both intersect, the right button with Alt xor
+    select_mode(s = &Session, p = Pointer()) -> SelectMode:
+        if p.right:
+            if p.alt:
+                return SelectMode.intersect
+            if p.ctrl:
+                return SelectMode.xor
+        if p.ctrl and p.alt:
+            return SelectMode.intersect
+        if p.ctrl:
+            return SelectMode.union
+        if p.alt:
+            return SelectMode.exclude
+        return s.settings.select_mode
+
+    # a new region joined to what was selected before by a mode
+    joined(before = Mask(), had = false, region = Mask(), mode = SelectMode.replace) -> Mask:
+        if mode == SelectMode.replace or not had:
+            if mode == SelectMode.exclude or mode == SelectMode.intersect:
+                if not had:
+                    return Mask(region.width, region.height)
+            return region
+        out = before.copy()
+        out.combine(region, mode)
+        return out
+
+    # the layer's colour (straight alpha) at a pixel of a bitmap
+    selection_icon(kind = ToolKind.rect_select) -> Icon:
+        match kind:
+            case ToolKind.lasso:
+                return Icon.tool_lasso
+            case ToolKind.ellipse_select:
+                return Icon.tool_ellipse_select
+            case ToolKind.magic_wand:
+                return Icon.tool_magic_wand
+            case _:
+                return Icon.tool_rect_select
+
+# the drawing of marks over the canvas, in screen pixels
+Marks:
+    # a dashed-looking line: dark under light
+    ants(s = &Session, x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0):
+        s.ui.line(x0, y0, x1, y1, 0x000000, 1.0)
+        s.ui.line(x0, y0, x1, y1, 0xFFFFFF, 1.0, 0.55)
+
+    box(s = &Session, x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0):
+        l = min(x0, x1)
+        t = min(y0, y1)
+        r = max(x0, x1)
+        b = max(y0, y1)
+        Marks.ants(s, l, t, r, t)
+        Marks.ants(s, r, t, r, b)
+        Marks.ants(s, r, b, l, b)
+        Marks.ants(s, l, b, l, t)
+
+    # a handle: a small square
+    handle(s = &Session, x = 0.0, y = 0.0):
+        s.ui.fill(x - 4.0, y - 4.0, 8.0, 8.0, 0xFFFFFF)
+        s.ui.outline(x - 4.0, y - 4.0, 8.0, 8.0, 0x000000)
+
+    # a round handle (a gradient's ends)
+    knob(s = &Session, x = 0.0, y = 0.0):
+        s.ui.circle(x, y, 6.0, 0x000000)
+        s.ui.circle(x, y, 5.0, 0xFFFFFF)
+
+    # the brush's size around the pointer
+    brush(s = &Session, x = 0.0, y = 0.0, radius = 1.0):
+        sx, sy = s.view.to_screen(x, y)
+        r = max(radius * s.view.zoom, 1.5)
+        s.ui.graphics.render_set_color(s.ui.color(0x000000, 0.8))
+        s.ui.graphics.render_circle_outline(sx, sy, r, 1.0)
+        s.ui.graphics.render_set_color(s.ui.color(0xFFFFFF, 0.6))
+        s.ui.graphics.render_circle_outline(sx, sy, r + 1.0, 1.0)

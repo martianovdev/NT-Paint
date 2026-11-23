@@ -1,0 +1,213 @@
+# workspace/actions — every command of the editor in one place, with
+# paint.net's shortcuts: the menus, the toolbar, the context menus and
+# the keys all run these.  Their titles are translation keys, set again
+# when the language changes; the editor listens to each one's run and
+# sets which can run once a frame.
+
+from window import Key
+from ui import Command, Icon, Ui
+from i18n import Tr
+from effects import Effects
+from tools.session import ToolKind
+from tools.toolbox import Toolbox
+
+Actions:
+    # File
+    new = &Command("", Key.n, true, false, Icon.act_new)
+    open = &Command("", Key.o, true, false, Icon.act_open)
+    recent = &Command("", Key.unknown, false, false, Icon.act_recent)
+    save = &Command("", Key.s, true, false, Icon.act_save)
+    save_as = &Command("", Key.s, true, true, Icon.act_save_as)
+    save_all = &Command("", Key.s, true, false, Icon.act_save_all, true)
+    close = &Command("", Key.w, true, false, Icon.act_close)
+    exit = &Command("", Key.unknown, false, false, Icon.act_exit)
+    # Edit
+    undo = &Command("", Key.z, true, false, Icon.act_undo)
+    redo = &Command("", Key.y, true, false, Icon.act_redo)
+    cut = &Command("", Key.x, true, false, Icon.act_cut)
+    copy = &Command("", Key.c, true, false, Icon.act_copy)
+    copy_merged = &Command("", Key.c, true, true, Icon.act_copy_merged)
+    paste = &Command("", Key.v, true, false, Icon.act_paste)
+    paste_layer = &Command("", Key.v, true, true, Icon.act_paste_layer)
+    paste_image = &Command("", Key.v, true, false, Icon.act_paste_image, true)
+    erase_selection = &Command("", Key.delete, false, false, Icon.act_erase_selection)
+    fill_selection = &Command("", Key.backspace, false, false, Icon.act_fill_selection)
+    invert_selection = &Command("", Key.i, true, false, Icon.act_invert_selection)
+    select_all = &Command("", Key.a, true, false, Icon.act_select_all)
+    deselect = &Command("", Key.d, true, false, Icon.act_deselect)
+    # View
+    zoom_in = &Command("", Key.equal, true, false, Icon.zoom_in)
+    zoom_out = &Command("", Key.minus, true, false, Icon.zoom_out)
+    zoom_window = &Command("", Key.b, true, false, Icon.zoom_fit)
+    zoom_selection = &Command("", Key.b, true, true, Icon.zoom_selection)
+    actual_size = &Command("", Key.d0, true, false, Icon.zoom_actual)
+    grid = &Command("", Key.unknown, false, false, Icon.act_grid)
+    rulers = &Command("", Key.unknown, false, false, Icon.act_ruler)
+    # Image
+    crop = &Command("", Key.x, true, true, Icon.act_crop)
+    resize = &Command("", Key.r, true, false, Icon.img_resize)
+    canvas_size = &Command("", Key.r, true, true, Icon.img_canvas)
+    flip_h = &Command("", Key.unknown, false, false, Icon.img_flip_h)
+    flip_v = &Command("", Key.unknown, false, false, Icon.img_flip_v)
+    rotate_cw = &Command("", Key.h, true, false, Icon.img_rotate_cw)
+    rotate_ccw = &Command("", Key.g, true, false, Icon.img_rotate_ccw)
+    rotate_180 = &Command("", Key.j, true, false, Icon.img_rotate_180)
+    flatten = &Command("", Key.f, true, true, Icon.img_flatten)
+    # Layers
+    add_layer = &Command("", Key.n, true, true, Icon.layer_add)
+    delete_layer = &Command("", Key.delete, true, true, Icon.layer_delete)
+    duplicate_layer = &Command("", Key.d, true, true, Icon.layer_duplicate)
+    merge_down = &Command("", Key.m, true, false, Icon.layer_merge)
+    toggle_layer = &Command("", Key.comma, true, false, Icon.layer_visibility)
+    import_layer = &Command("", Key.unknown, false, false, Icon.layer_import)
+    flip_layer_h = &Command("", Key.unknown, false, false, Icon.img_flip_h)
+    flip_layer_v = &Command("", Key.unknown, false, false, Icon.img_flip_v)
+    rotate_layer_180 = &Command("", Key.unknown, false, false, Icon.img_rotate_180)
+    rotate_zoom = &Command("", Key.z, true, true, Icon.layer_rotate_zoom)
+    go_top = &Command("", Key.page_up, true, false, Icon.layer_top, true)
+    go_up = &Command("", Key.page_up, false, false, Icon.layer_go_up, true)
+    go_down = &Command("", Key.page_down, false, false, Icon.layer_go_down, true)
+    go_bottom = &Command("", Key.page_down, true, false, Icon.layer_bottom, true)
+    move_top = &Command("", Key.unknown, false, false, Icon.layer_top)
+    move_up = &Command("", Key.unknown, false, false, Icon.layer_up)
+    move_down = &Command("", Key.unknown, false, false, Icon.layer_down)
+    move_bottom = &Command("", Key.unknown, false, false, Icon.layer_bottom)
+    layer_properties = &Command("", Key.f4, false, false, Icon.layer_properties)
+    # Windows, settings, help
+    win_tools = &Command("", Key.f5, false, false, Icon.win_tools)
+    win_history = &Command("", Key.f6, false, false, Icon.win_history)
+    win_layers = &Command("", Key.f7, false, false, Icon.win_layers)
+    win_colors = &Command("", Key.f8, false, false, Icon.win_colors)
+    settings = &Command("", Key.unknown, false, false, Icon.win_settings)
+    help = &Command("", Key.f1, false, false, Icon.win_help)
+    about = &Command("", Key.unknown, false, false, Icon.win_help)
+    lang_en = &Command("English")
+    lang_ru = &Command("Русский")
+    lang_zh = &Command("中文")
+    # the Effects submenus' rows (each opens its menu)
+    menu_rows = [str: &Command]
+    # an adjustment or an effect by its id
+    effects = [str: &Command]
+    # a tool by its kind
+    tools = [&Command]
+    # each command and the key of its title
+    titled = [(&Command, str)]
+
+    init():
+        self.title(self.new, "cmd.new")
+        self.title(self.open, "cmd.open")
+        self.title(self.recent, "cmd.recent")
+        self.title(self.save, "cmd.save")
+        self.title(self.save_as, "cmd.save_as")
+        self.title(self.save_all, "cmd.save_all")
+        self.title(self.close, "cmd.close")
+        self.title(self.exit, "cmd.exit")
+        self.title(self.undo, "cmd.undo")
+        self.title(self.redo, "cmd.redo")
+        self.title(self.cut, "cmd.cut")
+        self.title(self.copy, "cmd.copy")
+        self.title(self.copy_merged, "cmd.copy_merged")
+        self.title(self.paste, "cmd.paste")
+        self.title(self.paste_layer, "cmd.paste_layer")
+        self.title(self.paste_image, "cmd.paste_image")
+        self.title(self.erase_selection, "cmd.erase_selection")
+        self.title(self.fill_selection, "cmd.fill_selection")
+        self.title(self.invert_selection, "cmd.invert_selection")
+        self.title(self.select_all, "cmd.select_all")
+        self.title(self.deselect, "cmd.deselect")
+        self.title(self.zoom_in, "cmd.zoom_in")
+        self.title(self.zoom_out, "cmd.zoom_out")
+        self.title(self.zoom_window, "cmd.zoom_window")
+        self.title(self.zoom_selection, "cmd.zoom_selection")
+        self.title(self.actual_size, "cmd.actual_size")
+        self.title(self.grid, "cmd.grid")
+        self.title(self.rulers, "cmd.rulers")
+        self.title(self.crop, "cmd.crop")
+        self.title(self.resize, "cmd.resize")
+        self.title(self.canvas_size, "cmd.canvas_size")
+        self.title(self.flip_h, "cmd.flip_h")
+        self.title(self.flip_v, "cmd.flip_v")
+        self.title(self.rotate_cw, "cmd.rotate_cw")
+        self.title(self.rotate_ccw, "cmd.rotate_ccw")
+        self.title(self.rotate_180, "cmd.rotate_180")
+        self.title(self.flatten, "cmd.flatten")
+        self.title(self.add_layer, "cmd.add_layer")
+        self.title(self.delete_layer, "cmd.delete_layer")
+        self.title(self.duplicate_layer, "cmd.duplicate_layer")
+        self.title(self.merge_down, "cmd.merge_down")
+        self.title(self.toggle_layer, "cmd.toggle_layer")
+        self.title(self.import_layer, "cmd.import_layer")
+        self.title(self.flip_layer_h, "cmd.flip_h")
+        self.title(self.flip_layer_v, "cmd.flip_v")
+        self.title(self.rotate_layer_180, "cmd.rotate_180")
+        self.title(self.rotate_zoom, "cmd.rotate_zoom")
+        self.title(self.go_top, "cmd.go_top")
+        self.title(self.go_up, "cmd.go_up")
+        self.title(self.go_down, "cmd.go_down")
+        self.title(self.go_bottom, "cmd.go_bottom")
+        self.title(self.move_top, "cmd.move_top")
+        self.title(self.move_up, "cmd.move_up")
+        self.title(self.move_down, "cmd.move_down")
+        self.title(self.move_bottom, "cmd.move_bottom")
+        self.title(self.layer_properties, "cmd.layer_properties")
+        self.title(self.win_tools, "win.tools")
+        self.title(self.win_history, "win.history")
+        self.title(self.win_layers, "win.layers")
+        self.title(self.win_colors, "win.colors")
+        self.title(self.settings, "cmd.settings")
+        self.title(self.help, "cmd.help")
+        self.zoom_in.set_shortcut_text("Ctrl++")
+        self.zoom_out.set_shortcut_text("Ctrl+-")
+        self.exit.set_shortcut_text("Alt+F4")
+        self.toggle_layer.set_shortcut_text("Ctrl+,")
+        for m in Effects.menus():
+            c = &Command("", Key.unknown, false, false, Icon.effect_item)
+            self.menu_rows[m] = c
+            self.title(c, "fx.menu." + m)
+        for e in Effects.catalog():
+            icon = Icon.adjust_item if e.menu == "adjust" else Icon.effect_item
+            c = &Command("", Actions.key_of(e.shortcut), e.shortcut.find("Ctrl") != none, e.shortcut.find("Shift") != none, icon, e.shortcut.find("Alt") != none)
+            self.effects[e.id] = c
+            self.title(c, "fx." + e.id)
+        for k in ToolKind:
+            c = &Command("", Key.unknown, false, false, Toolbox.icon(k))
+            self.tools.push(c)
+            self.title(c, "tool." + Toolbox.id(k))
+
+    title(c = &Command, key = ""):
+        self.titled.push((c, key))
+
+    # every title in the language of tr; effects with parameters end in …
+    retitle(tr = &Tr):
+        self.about.set_title(tr.f("cmd.about", [Tr.app_name()]))
+        for pair in self.titled:
+            c, key = pair
+            text = tr.t(key)
+            c.set_title(text)
+        for e in Effects.catalog():
+            if c := self.effects.get(e.id):
+                if len(e.params) > 0:
+                    c.set_title(tr.t("fx." + e.id) + "...")
+            _ = e
+
+    # the key of a shortcut's last part: "Ctrl+Shift+L" -> L
+    key_of(shortcut = "") -> Key:
+        if shortcut == "":
+            return Key.unknown
+        parts = shortcut.split("+")
+        last = parts[len(parts) - 1]
+        if len(last) == 1:
+            ch = int(last[0])
+            if ch >= 65 and ch <= 90:
+                return Key.a + i32(ch - 65)
+        return Key.unknown
+
+    # the shortcuts of the frame: whichever went down runs (a field being
+    # typed into holds them)
+    poll(ui = &Ui):
+        if ui.get_keys_held():
+            return
+        for pair in self.titled:
+            c, _ = pair
+            if c.poll(ui):
+                return

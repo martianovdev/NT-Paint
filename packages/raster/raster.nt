@@ -1,0 +1,327 @@
+# raster — pixels on the CPU: the engine under the editor, knowing nothing
+# of windows or the GPU.
+#
+#   Bitmap      RGBA8 pixels, straight alpha, rows from the top
+#   Mask        one byte a pixel, 0…255: a selection, a stroke's coverage
+#   Rect        a rectangle of whole pixels
+#   Pixel       a colour packed in an int as 0xAARRGGBB
+#   Shapes      polygons and ellipses rasterised into masks (selections)
+#   Fill        flood fill (the bucket's and the magic wand's region)
+#
+# Only what the CPU does better lives here: regions found by walking
+# pixels, a selection's outline, files.  Painting, blending, effects and
+# transforms are the GPU's (the package imaging).
+
+package raster "0.1.0"
+
+# a rectangle of whole pixels; empty when w or h is not above 0
+Rect:
+    x = 0
+    y = 0
+    w = 0
+    h = 0
+
+    init(x = 0, y = 0, w = 0, h = 0):
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+
+    empty() -> bool:
+        return self.w <= 0 or self.h <= 0
+
+    right() -> int:
+        return self.x + self.w
+
+    bottom() -> int:
+        return self.y + self.h
+
+    contains(px = 0, py = 0) -> bool:
+        return px >= self.x and py >= self.y and px < self.x + self.w and py < self.y + self.h
+
+    intersect(o = Rect()) -> Rect:
+        x0 = max(self.x, o.x)
+        y0 = max(self.y, o.y)
+        x1 = min(self.x + self.w, o.x + o.w)
+        y1 = min(self.y + self.h, o.y + o.h)
+        if x1 <= x0 or y1 <= y0:
+            return Rect()
+        return Rect(x0, y0, x1 - x0, y1 - y0)
+
+    # both in one; an empty side is left out
+    union(o = Rect()) -> Rect:
+        if self.empty():
+            return o
+        if o.empty():
+            return self
+        x0 = min(self.x, o.x)
+        y0 = min(self.y, o.y)
+        x1 = max(self.x + self.w, o.x + o.w)
+        y1 = max(self.y + self.h, o.y + o.h)
+        return Rect(x0, y0, x1 - x0, y1 - y0)
+
+    inflate(n = 1) -> Rect:
+        return Rect(self.x - n, self.y - n, self.w + n * 2, self.h + n * 2)
+
+    # kept within 0, 0 … w, h
+    clip(w = 0, h = 0) -> Rect:
+        return self.intersect(Rect(0, 0, w, h))
+
+    # the rectangle spanning two corners, either way round, inclusive of both
+    span(x0 = 0, y0 = 0, x1 = 0, y1 = 0) -> Rect:
+        return Rect(min(x0, x1), min(y0, y1), abs(x1 - x0) + 1, abs(y1 - y0) + 1)
+
+    # the whole pixels a box of floats touches
+    around(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0) -> Rect:
+        l = int(floor(min(x0, x1)))
+        t = int(floor(min(y0, y1)))
+        r = int(ceil(max(x0, x1)))
+        b = int(ceil(max(y0, y1)))
+        return Rect(l, t, r - l, b - t)
+
+# a colour packed in an int: 0xAARRGGBB
+Pixel:
+    pack(r = 0, g = 0, b = 0, a = 255) -> int:
+        return (clamp(a, 0, 255) << 24) | (clamp(r, 0, 255) << 16) | (clamp(g, 0, 255) << 8) | clamp(b, 0, 255)
+
+    # 0xRRGGBB opaque
+    rgb(rgb = 0, a = 255) -> int:
+        return (clamp(a, 0, 255) << 24) | (rgb & 0xFFFFFF)
+
+    red(c = 0) -> int:
+        return (c >> 16) & 255
+
+    green(c = 0) -> int:
+        return (c >> 8) & 255
+
+    blue(c = 0) -> int:
+        return c & 255
+
+    alpha(c = 0) -> int:
+        return (c >> 24) & 255
+
+    # the colour without its alpha, 0xRRGGBB
+    opaque(c = 0) -> int:
+        return c & 0xFFFFFF
+
+    with_alpha(c = 0, a = 255) -> int:
+        return (clamp(a, 0, 255) << 24) | (c & 0xFFFFFF)
+
+    # each channel a to b by t (0…1)
+    lerp(a = 0, b = 0, t = 0.0) -> int:
+        u = clamp(t, 0.0, 1.0)
+        r = int(round(lerp(float(Pixel.red(a)), float(Pixel.red(b)), u)))
+        g = int(round(lerp(float(Pixel.green(a)), float(Pixel.green(b)), u)))
+        bl = int(round(lerp(float(Pixel.blue(a)), float(Pixel.blue(b)), u)))
+        al = int(round(lerp(float(Pixel.alpha(a)), float(Pixel.alpha(b)), u)))
+        return Pixel.pack(r, g, bl, al)
+
+    # hue (0…360), saturation and value (0…100) of a colour
+    to_hsv(c = 0) -> (float, float, float):
+        r = float(Pixel.red(c)) / 255.0
+        g = float(Pixel.green(c)) / 255.0
+        b = float(Pixel.blue(c)) / 255.0
+        hi = max(r, g, b)
+        lo = min(r, g, b)
+        d = hi - lo
+        h = 0.0
+        if d > 0.0:
+            if hi == r:
+                h = 60.0 * ((g - b) / d)
+            elif hi == g:
+                h = 60.0 * ((b - r) / d + 2.0)
+            else:
+                h = 60.0 * ((r - g) / d + 4.0)
+        if h < 0.0:
+            h += 360.0
+        s = 0.0 if hi <= 0.0 else d / hi
+        return h, s * 100.0, hi * 100.0
+
+    # a colour of hue (0…360), saturation and value (0…100), alpha 0…255
+    from_hsv(h = 0.0, s = 0.0, v = 0.0, a = 255) -> int:
+        hh = h - floor(h / 360.0) * 360.0
+        ss = clamp(s / 100.0, 0.0, 1.0)
+        vv = clamp(v / 100.0, 0.0, 1.0)
+        c = vv * ss
+        x = c * (1.0 - abs((hh / 60.0) - floor(hh / 120.0) * 2.0 - 1.0))
+        m = vv - c
+        r = 0.0
+        g = 0.0
+        b = 0.0
+        if hh < 60.0:
+            r = c
+            g = x
+        elif hh < 120.0:
+            r = x
+            g = c
+        elif hh < 180.0:
+            g = c
+            b = x
+        elif hh < 240.0:
+            g = x
+            b = c
+        elif hh < 300.0:
+            r = x
+            b = c
+        else:
+            r = c
+            b = x
+        return Pixel.pack(int(round((r + m) * 255.0)), int(round((g + m) * 255.0)), int(round((b + m) * 255.0)), a)
+
+    # "RRGGBB" (or "AARRGGBB" when alpha is asked for)
+    hex(c = 0, with_alpha = false) -> str:
+        digits = "0123456789ABCDEF"
+        out = ""
+        n = 8 if with_alpha else 6
+        for i in range(n):
+            shift = (n - 1 - i) * 4
+            k = (c >> shift) & 15
+            out += digits.slice(k, k + 1)
+        return out
+
+    # the colour of 6 or 8 hex digits (a leading # allowed), none when not
+    parse_hex(text = "", alpha = 255) -> none(int):
+        t = text.strip().upper()
+        if t.starts_with("#"):
+            t = t.slice(1, len(t))
+        if len(t) != 6 and len(t) != 8:
+            return none
+        v = 0
+        for ch in t:
+            d = int(ch)
+            k = -1
+            if d >= 48 and d <= 57:
+                k = d - 48
+            elif d >= 65 and d <= 70:
+                k = d - 55
+            if k < 0:
+                return none
+            v = v * 16 + k
+        if len(t) == 6:
+            return Pixel.with_alpha(v, alpha)
+        return v
+
+    # luma, 0…255, as the eye weighs the channels
+    luma(c = 0) -> int:
+        return (Pixel.red(c) * 299 + Pixel.green(c) * 587 + Pixel.blue(c) * 114) / 1000
+
+# RGBA8 pixels, straight alpha, rows from the top
+Bitmap in bitmap:
+    width = 0
+    height = 0
+    pixels = [u8]
+    # width × height, filled with a colour (0xAARRGGBB; 0 is see-through)
+    init(width = 0, height = 0, color = 0)
+    # pixels of a decoded file, kept as they are (width × height × 4 bytes)
+    adopt(width = 0, height = 0, pixels = [u8]) -> Bitmap
+    # a PNG, JPEG or BMP file's bytes decoded; none when it is not one
+    decode(data = [u8]) -> none(Bitmap)
+    # the bitmap as a PNG file
+    encode_png() -> [u8]
+    # as a 32-bit BMP file
+    encode_bmp() -> [u8]
+    # a BMP file decoded (24 or 32 bits, uncompressed); none when not one
+    decode_bmp(data = [u8]) -> none(Bitmap)
+    bounds() -> Rect
+    get(x = 0, y = 0) -> int
+    set(x = 0, y = 0, c = 0)
+    # a deep copy: pixels of its own
+    copy() -> Bitmap
+    # the pixels of a rectangle (clipped to the bitmap) as a bitmap of its size
+    region(r = Rect()) -> Bitmap
+    # another bitmap's pixels put at x, y as they are (no blending)
+    put(src = Bitmap(), x = 0, y = 0)
+    # the pixels of a rectangle of src put at the same place, as they are
+    restore(src = Bitmap(), r = Rect())
+    # src drawn over at x, y (normal blending) with an opacity 0…255
+    draw(src = Bitmap(), x = 0, y = 0, opacity = 255)
+    fill(c = 0)
+    fill_rect(r = Rect(), c = 0)
+    # the masked pixels made see-through, by how much they are selected
+    erase(mask = Mask(), r = Rect())
+    flipped_h() -> Bitmap
+    flipped_v() -> Bitmap
+    rotated_cw() -> Bitmap
+    rotated_ccw() -> Bitmap
+    rotated_180() -> Bitmap
+    # the picture on a canvas of w × h, its top left at ox, oy, the rest c
+    canvas(w = 0, h = 0, ox = 0, oy = 0, c = 0) -> Bitmap
+    # the colour between pixels at fx, fy (pixel centres at .5), clamped at
+    # the edges
+    sample(fx = 0.0, fy = 0.0) -> int
+    # the rectangle of pixels that are not fully see-through; empty for none
+    opaque_bounds() -> Rect
+    # a smaller (or larger) picture of the whole, for thumbnails: nearest
+    # pixels, quick
+    thumbnail(w = 0, h = 0) -> Bitmap
+
+# one byte a pixel, 0…255: a selection, or a stroke's coverage
+Mask in mask:
+    width = 0
+    height = 0
+    data = [u8]
+    init(width = 0, height = 0, value = 0)
+    copy() -> Mask
+    get(x = 0, y = 0) -> int
+    set(x = 0, y = 0, v = 0)
+    # the value where x, y is outside counts as 0
+    at(x = 0, y = 0) -> int
+    clear()
+    fill(v = 255)
+    fill_rect(r = Rect(), v = 255)
+    # the larger of the two at each pixel (a stroke growing)
+    lift(x = 0, y = 0, v = 0)
+    # every pixel 255 - it
+    invert()
+    # the rectangle of pixels above 0; empty when there are none
+    bounds() -> Rect
+    is_empty() -> bool
+    is_full() -> bool
+    # another mask of the same size joined into this one by a mode
+    combine(other = Mask(), mode = SelectMode.replace)
+    # the edges between pixels at or above half and those below, as
+    # segments x0, y0, x1, y1 in pixel corners, runs merged
+    outline() -> [int]
+    # the mask moved by dx, dy (what leaves is lost, what comes in is 0)
+    shifted(dx = 0, dy = 0) -> Mask
+    flipped_h() -> Mask
+    flipped_v() -> Mask
+    rotated_cw() -> Mask
+    rotated_ccw() -> Mask
+    rotated_180() -> Mask
+    canvas(w = 0, h = 0, ox = 0, oy = 0) -> Mask
+    resized(w = 0, h = 0) -> Mask
+    sample_region(area = Rect(), w = 0, h = 0) -> Mask
+    # moved by dx, dy, scaled by sx, sy and turned by angle (degrees)
+    # about cx, cy; each pixel the nearest of the source's
+    transformed(cx = 0.0, cy = 0.0, dx = 0.0, dy = 0.0, sx = 1.0, sy = 1.0, angle = 0.0, target = Rect()) -> Mask
+
+# how a new selection joins the one there
+enum SelectMode:
+    replace
+    union
+    exclude
+    intersect
+    xor
+
+# rasterising into masks: what is covered goes up to its coverage (the
+# larger kept), so overlapping parts of one stroke never add up
+Shapes in shapes:
+    # a polygon (x, y pairs) filled by the nonzero rule; aa smooths its edge
+    polygon(m = &Mask, pts = [float], aa = true, value = 255)
+    # an ellipse in the box x0, y0 to x1, y1
+    ellipse(m = &Mask, x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, aa = true, value = 255)
+    # the points of an ellipse's outline, closed
+    ellipse_points(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0) -> [float]
+    # a rounded rectangle's outline
+    rounded_points(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, radius = 0.0) -> [float]
+    # the box a list of points spans, grown by pad
+    box(pts = [float], pad = 0.0) -> Rect
+
+# flood fill: the pixels like the one at x, y
+Fill in fill:
+    # the region of pixels like the one at x, y within tolerance (0…1),
+    # touching it (contiguous) or anywhere (global)
+    flood(src = Bitmap(), x = 0, y = 0, tolerance = 0.5, contiguous = true) -> Mask
+    # how far apart two colours are, 0…1
+    distance(a = 0, b = 0) -> float

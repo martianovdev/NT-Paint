@@ -1,0 +1,1493 @@
+# workspace/editor — the window of the editor, laid out as paint.net's:
+#
+#   [menus][open pictures' thumbnails ...........][Tools History Layers Colors ⚙ ?]
+#   [New Open Save | Cut Copy Paste Crop Deselect | Undo Redo | Grid Rulers]
+#   [Tool: ▾ | the tool's options .......................................]
+#   [ canvas, with the floating Tools, History, Layers and Colors windows ]
+#   [ the tool's help ........... size · selection · pointer · px · zoom ]
+#
+# It holds the open documents and the one in front, carries out every
+# command, opens the dialogs, keeps the clipboard and the settings
+# (language, recent files).
+
+from graphics import Font, Surface
+from window import ClipboardState, Key, Window
+from view import Layout, View
+from ui import CheckBox, ChoiceField, Command, Dialog, Icon, Menu, MenuBar, SliderBar, SpinField, TextField, ToolButton, Ui
+from i18n import Lang, Tr
+from raster import Bitmap, Mask, Pixel, Rect
+from imaging import BlendMode, Display, Gpu, Transforms
+from effects import Effects, ParamKind
+from osdialog import FileDialog
+from fs import Fs
+from document.document import Document
+from document.pdn import Pdn
+from tools.session import Session, ToolKind
+from tools.toolbox import Toolbox
+from workspace.actions import Actions
+from workspace.canvas import CanvasView
+from workspace.panels import HistoryPanel, LayersPanel, ToolsPanel
+from workspace.colors import ColorsPanel
+from workspace.bars import ImageStrip, MainToolbar, OptionsBar, StatusBar
+from workspace.form import Form
+
+# what waits for the next frame: a save (the picture read back once the
+# GPU has drawn it)
+Job:
+    doc = none(&Document)
+    path = ""
+    age = 0
+    close_after = false
+
+    init(doc = none(&Document), path = "", close_after = false):
+        self.doc = doc
+        self.path = path
+        self.close_after = close_after
+
+    older():
+        self.age += 1
+
+# the parts of a file's path
+Files:
+    name(path = "") -> str:
+        i = -1
+        for k, c in path.chars().enumerate():
+            if c == char("/") or c == char("\\"):
+                i = k
+        return path.slice(i + 1, len(path))
+
+    stem(name = "") -> str:
+        i = -1
+        for k, c in name.chars().enumerate():
+            if c == char("."):
+                i = k
+        return name.slice(0, i) if i > 0 else name
+
+    # a format it can be saved in
+    writable(path = "") -> bool:
+        p = path.lower()
+        return p.ends_with(".pdn") or p.ends_with(".png") or p.ends_with(".bmp")
+
+    # Reserve a sibling file first so a failed PDN write leaves the project intact.
+    write_project(path = "", data = [u8]) -> bool:
+        fs = Fs()
+        for i in range(64):
+            temp = f"{path}.{i}.tmp"
+            if fs.create_file(temp):
+                if fs.write_bytes(temp, data) and fs.rename(temp, path, true):
+                    return true
+                _ = fs.remove(temp)
+                return false
+            if not fs.exists(temp):
+                return false
+        return false
+
+Editor:
+    ui = &Ui
+    tr = &Tr
+    gpu = &Gpu
+    window = &Window
+    session = &Session
+    toolbox = &Toolbox()
+    a = &Actions()
+    docs = [&Document]
+    current = -1
+    # the layout
+    top = &View
+    menu_holder = &View
+    menubar = none(&MenuBar)
+    menus = [&Menu]
+    strip = &ImageStrip
+    corner = &View
+    toolbar = &MainToolbar
+    options = &OptionsBar
+    work = &View
+    canvas = &CanvasView
+    status = &StatusBar
+    tools = &ToolsPanel
+    history = &HistoryPanel
+    layers = &LayersPanel
+    colors = &ColorsPanel
+    corner_buttons = [&ToolButton]
+    # menus opened by the right button: an image's, a layer's
+    popup = none(&Menu)
+    popup_commands = [&Command]
+    form = &Form
+    dialog = &Dialog
+    # what a form is doing: its kind and the controls it reads back
+    form_kind = ""
+    spins = [&SpinField]
+    sliders = [&SliderBar]
+    checks = [&CheckBox]
+    choices = [&ChoiceField]
+    fields = [&TextField]
+    fx_id = ""
+    fx_base = none(&Surface)
+    fx_rect = Rect()
+    fx_scales = [float]
+    anchor = 4
+    # the layer's properties as the dialog found them
+    props = (0, "", true, 255, BlendMode.normal)
+    # a question asked: what its answer is for
+    asking = ""
+    asking_doc = -1
+    clip = Bitmap()
+    clip_has = false
+    # where the copy was taken from: pasted back at the same place
+    clip_x = 0
+    clip_y = 0
+    # the selection's shape over the copy (its box's size); empty: all of it
+    clip_mask = Mask()
+    # the system's clipboard: its number when we last put our copy there,
+    # and when we last looked whether it holds a picture (and if it does)
+    clip_seq = -1
+    paste_pending = -1
+    paste_doc = none(&Document)
+    paste_preview = none(&Surface)
+    paste_target = none(&Document)
+    paste_new_layer = false
+    sys_seq = -1
+    sys_has = false
+    jobs = [&Job]
+    recent = [str]
+    pointer_text = ""
+    grid_on = false
+    rulers_on = false
+    quitting = false
+    quit_pending = false
+    menus_stale = false
+    shown_title = ""
+    started = false
+
+    init(ui = &Ui, gpu = &Gpu, window = &Window, args = [str], fallback = none(&Font)):
+        self.ui = ui
+        self.gpu = gpu
+        self.window = window
+        self.tr = &Tr(Lang.en)
+        self.session = &Session(ui, gpu, self.tr)
+        self.session.fonts.set_builtin(ui.font, fallback)
+        self.form = &Form(ui)
+        self.dialog = &Dialog(ui)
+        t = ui.theme
+        root = ui.content
+        # the top row: menus, thumbnails, the windows' toggles
+        self.top = ui.create(Layout.horizontal, root)
+        self.top.set_min_size(0.0, 58.0)
+        self.top.set_max_size(100000.0, 58.0)
+        self.menu_holder = ui.create(Layout.vertical, self.top)
+        self.menu_holder.set_min_size(10.0, 58.0)
+        self.strip = &ImageStrip(ui, self.top, self.gpu)
+        self.corner = ui.create(Layout.horizontal, self.top)
+        self.corner.set_min_size(6.0 * 27.0 + 8.0, 28.0)
+        self.corner.set_max_size(6.0 * 27.0 + 8.0, 58.0)
+        self.corner.set_padding(4.0, 4.0, 4.0, 22.0)
+        self.corner.set_gap(1.0, 0.0)
+        ui.cache(self.corner)
+        for c in [self.a.win_tools, self.a.win_history, self.a.win_layers, self.a.win_colors, self.a.settings, self.a.help]:
+            self.corner_buttons.push(&ToolButton(ui, self.corner, c))
+        # under the menus, as paint.net has it
+        self.toolbar = &MainToolbar(ui, self.menu_holder, self.a)
+        self.options = &OptionsBar(ui, root, self.tr, self.session)
+        self.work = ui.create(Layout.free, root)
+        self.work.set_expand(true)
+        self.canvas = &CanvasView(ui, self.work, self.session, self.toolbox)
+        self.tools = &ToolsPanel(ui, self.work, self.a)
+        self.history = &HistoryPanel(ui, self.work, self.tr, self.a)
+        self.layers = &LayersPanel(ui, self.work, self.tr, self.gpu, self.a)
+        self.colors = &ColorsPanel(ui, self.work, self.tr, self.session)
+        self.status = &StatusBar(ui, root, self.tr)
+        on self.top.draw():
+            x, y, w, h = ui.rect(self.top)
+            ui.fill(x, y, w, h, t.backdrop)
+            self.top.render_children()
+        self.load_settings()
+        self.wire()
+        self.choose_tool(ToolKind.brush)
+        self.retitle()
+        for a in args:
+            if not a.starts_with("--"):
+                self.open_path(a)
+        if len(self.docs) == 0:
+            self.add_doc(Document.blank(gpu, 800, 600, 0xFFFFFFFF, self.tr.t("layer.background")))
+
+    # ─── Layout ───
+
+    # the floating windows at paint.net's places: Tools at the left, History
+    # and Layers at the right, Colors at the bottom left
+    place_panels():
+        _, _, w, h = self.ui.rect(self.work)
+        if w < 100.0:
+            return
+        _ = h
+        self.tools.panel.dock(1, 1)
+        self.history.panel.dock(2, 1)
+        self.layers.panel.dock(2, 2)
+        self.colors.panel.dock(1, 2)
+
+    # ─── Menus ───
+
+    build_menus():
+        ui = self.ui
+        tr = self.tr
+        a = self.a
+        if old := self.menubar:
+            old.view.set_parent(none)
+        bar = &MenuBar(ui, self.menu_holder)
+        self.menus.clear()
+        file = &Menu(ui, tr.t("menu.file"))
+        file.add(a.new)
+        file.add(a.open)
+        recent = &Menu(ui)
+        for p in self.recent:
+            c = &Command(p)
+            path = p
+            on c.run():
+                self.open_path(path)
+            self.popup_commands.push(c)
+            recent.add(c)
+        file.add_submenu(a.recent, recent)
+        file.add_separator()
+        file.add(a.save)
+        file.add(a.save_as)
+        file.add(a.save_all)
+        file.add_separator()
+        file.add(a.close)
+        file.add_separator()
+        file.add(a.exit)
+        edit = &Menu(ui, tr.t("menu.edit"))
+        for c in [a.undo, a.redo]:
+            edit.add(c)
+        edit.add_separator()
+        for c in [a.cut, a.copy, a.copy_merged, a.paste, a.paste_layer, a.paste_image]:
+            edit.add(c)
+        edit.add_separator()
+        for c in [a.erase_selection, a.fill_selection, a.invert_selection, a.select_all, a.deselect]:
+            edit.add(c)
+        view = &Menu(ui, tr.t("menu.view"))
+        for c in [a.zoom_in, a.zoom_out, a.zoom_window, a.zoom_selection, a.actual_size]:
+            view.add(c)
+        view.add_separator()
+        view.add(a.grid)
+        view.add(a.rulers)
+        image = &Menu(ui, tr.t("menu.image"))
+        image.add(a.crop)
+        image.add(a.resize)
+        image.add(a.canvas_size)
+        image.add_separator()
+        image.add(a.flip_h)
+        image.add(a.flip_v)
+        image.add_separator()
+        image.add(a.rotate_cw)
+        image.add(a.rotate_ccw)
+        image.add(a.rotate_180)
+        image.add_separator()
+        image.add(a.flatten)
+        layers = &Menu(ui, tr.t("menu.layers"))
+        for c in [a.add_layer, a.delete_layer, a.duplicate_layer, a.merge_down, a.toggle_layer]:
+            layers.add(c)
+        layers.add_separator()
+        layers.add(a.import_layer)
+        layers.add_separator()
+        for c in [a.flip_layer_h, a.flip_layer_v, a.rotate_layer_180, a.rotate_zoom]:
+            layers.add(c)
+        layers.add_separator()
+        for c in [a.go_top, a.go_up, a.go_down, a.go_bottom]:
+            layers.add(c)
+        layers.add_separator()
+        for c in [a.move_top, a.move_up, a.move_down, a.move_bottom]:
+            layers.add(c)
+        layers.add_separator()
+        layers.add(a.layer_properties)
+        adjust = &Menu(ui, tr.t("menu.adjustments"))
+        effects = &Menu(ui, tr.t("menu.effects"))
+        subs = [str: &Menu]
+        for m in Effects.menus():
+            sub = &Menu(ui)
+            subs[m] = sub
+            if row := a.menu_rows.get(m):
+                effects.add_submenu(row, sub)
+        for e in Effects.catalog():
+            if c := a.effects.get(e.id):
+                if e.menu == "adjust":
+                    adjust.add(c)
+                elif sub := subs.get(e.menu):
+                    sub.add(c)
+        help = &Menu(ui, tr.t("cmd.help"))
+        help.add(a.help)
+        help.add(a.about)
+        top_menus = [file, edit, view, image, layers, adjust, effects, help]
+        # the submenus are kept by the menus that open them
+        for m in top_menus:
+            self.menus.push(m)
+            bar.add(m)
+        for m in subs.values():
+            self.menus.push(m)
+        self.menus.push(recent)
+        self.menubar = bar
+        # the toolbar back under the new menu bar
+        self.toolbar.view.set_parent(none)
+        self.toolbar.view.set_parent(self.menu_holder)
+        w = 8.0
+        for m in top_menus:
+            w += ui.measure(m.title, ui.theme.size) + ui.theme.menu_pad * 2.0
+        w = max(w, 400.0)
+        self.menu_holder.set_min_size(w, 58.0)
+        self.menu_holder.set_max_size(w, 58.0)
+
+    # ─── Commands ───
+
+    wire():
+        a = self.a
+        s = self.session
+        on a.new.run():
+            self.new_dialog()
+        on a.open.run():
+            self.open_dialog()
+        on a.save.run():
+            self.save(self.current, false)
+        on a.save_as.run():
+            self.save(self.current, true)
+        on a.save_all.run():
+            self.toolbox.commit(s)
+            for i in range(len(self.docs)):
+                if self.docs[i].dirty():
+                    self.save(i, false)
+        on a.close.run():
+            self.close_doc(self.current)
+        on a.exit.run():
+            self.quit()
+        on a.undo.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.undo()
+        on a.redo.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.redo()
+        on a.cut.run():
+            self.copy(false)
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.erase_selection()
+        on a.copy.run():
+            self.copy(false)
+        on a.copy_merged.run():
+            self.copy(true)
+        on a.paste.run():
+            self.paste(0)
+        on a.paste_layer.run():
+            self.paste(1)
+        on a.paste_image.run():
+            self.paste(2)
+        on a.erase_selection.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.erase_selection()
+        on a.fill_selection.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.fill_selection(s.primary)
+        on a.invert_selection.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.invert_selection()
+        on a.select_all.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.select_all()
+        on a.deselect.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.deselect()
+        on a.zoom_in.run():
+            self.canvas.zoom_step(1)
+        on a.zoom_out.run():
+            self.canvas.zoom_step(-1)
+        on a.zoom_window.run():
+            self.canvas.fit_window()
+        on a.zoom_selection.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                b = d.sel_bounds()
+                self.canvas.zoom_rect(float(b.x), float(b.y), float(b.w), float(b.h))
+        on a.actual_size.run():
+            self.canvas.zoom_to(1.0)
+        on a.grid.run():
+            self.grid_on = not self.grid_on
+            self.canvas.set_grid(self.grid_on)
+        on a.rulers.run():
+            self.rulers_on = not self.rulers_on
+            self.canvas.set_rulers(self.rulers_on)
+        on a.crop.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.crop_to_selection()
+                self.canvas.fit()
+        on a.resize.run():
+            self.resize_dialog()
+        on a.canvas_size.run():
+            self.canvas_dialog()
+        on a.flip_h.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.flip_image(true)
+        on a.flip_v.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.flip_image(false)
+        on a.rotate_cw.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.rotate_image(1)
+                self.canvas.fit()
+        on a.rotate_ccw.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.rotate_image(3)
+                self.canvas.fit()
+        on a.rotate_180.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.rotate_image(2)
+        on a.flatten.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.flatten(self.tr.t("layer.background"))
+        on a.add_layer.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.add_layer(self.tr.t("layer.n"))
+        on a.delete_layer.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.delete_layer()
+        on a.duplicate_layer.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.duplicate_layer(self.tr.t("layer.copy"))
+        on a.merge_down.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.merge_down()
+        on a.toggle_layer.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                l = d.layer()
+                d.set_layer_props(d.current, l.name, not l.visible, l.opacity, l.mode)
+        on a.import_layer.run():
+            self.import_layer()
+        on a.flip_layer_h.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.flip_layer(true)
+        on a.flip_layer_v.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.flip_layer(false)
+        on a.rotate_layer_180.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.rotate_layer_180()
+        on a.rotate_zoom.run():
+            self.rotate_zoom_dialog()
+        on a.go_top.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.set_current(len(d.layers) - 1)
+        on a.go_up.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.set_current(d.current + 1)
+        on a.go_down.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.set_current(d.current - 1)
+        on a.go_bottom.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.set_current(0)
+        on a.move_top.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.move_layer(len(d.layers) - 1)
+        on a.move_up.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.move_layer(d.current + 1)
+        on a.move_down.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.move_layer(d.current - 1)
+        on a.move_bottom.run():
+            if d := self.doc():
+                self.toolbox.commit(s)
+                d.move_layer(0)
+        on a.layer_properties.run():
+            self.layer_dialog()
+        on a.win_tools.run():
+            self.tools.panel.set_visible(not self.tools.panel.get_visible())
+        on a.win_history.run():
+            self.history.panel.set_visible(not self.history.panel.get_visible())
+        on a.win_layers.run():
+            self.layers.panel.set_visible(not self.layers.panel.get_visible())
+        on a.win_colors.run():
+            self.colors.panel.set_visible(not self.colors.panel.get_visible())
+        on a.settings.run():
+            self.settings_dialog()
+        on a.help.run():
+            self.message("cmd.help", "msg.help")
+        on a.about.run():
+            name = [Tr.app_name()]
+            self.asking = "message"
+            self.dialog.open(self.tr.f("cmd.about", name), self.tr.f("msg.about", name), ["OK"], 0, 0)
+        on a.lang_en.run():
+            self.set_lang(Lang.en)
+        on a.lang_ru.run():
+            self.set_lang(Lang.ru)
+        on a.lang_zh.run():
+            self.set_lang(Lang.zh)
+        for e in Effects.catalog():
+            if c := a.effects.get(e.id):
+                id = e.id
+                on c.run():
+                    self.effect(id)
+        for k in ToolKind:
+            kind = k
+            on a.tools[int(k)].run():
+                self.choose_tool(kind)
+        on s.tool_asked(kind = ToolKind.rect_select):
+            self.choose_tool(kind)
+        on s.zoom_asked(factor = 1.0, x = 0.0, y = 0.0, w = 0.0, h = 0.0):
+            if w > 0.0:
+                self.canvas.zoom_rect(x, y, w, h)
+            elif d := self.doc():
+                self.canvas.zoom_to(d.zoom * factor, x, y)
+        on s.colors_changed():
+            self.toolbox.recolor(s)
+        on s.options_changed():
+            self.toolbox.recolor(s)
+        on s.pan_asked(dx = 0.0, dy = 0.0):
+            self.canvas.pan(dx, dy)
+        on self.canvas.pointer_moved(x = 0, y = 0):
+            self.pointer_text = f"{x}, {y}"
+        on self.strip.chosen(index = 0):
+            self.show_doc(index)
+        on self.strip.close_asked(index = 0):
+            self.close_doc(index)
+        on self.strip.menu_asked(index = 0, x = 0.0, y = 0.0):
+            self.image_menu(index, x, y)
+        on self.history.navigating():
+            self.toolbox.commit(s)
+        on self.layers.selecting():
+            self.toolbox.commit(s)
+        on self.layers.properties_asked():
+            self.layer_dialog()
+        on self.layers.menu_asked(x = 0.0, y = 0.0):
+            self.layer_menu(x, y)
+        on self.layers.visibility(index = 0, visible = true):
+            if d := self.doc():
+                self.toolbox.commit(s)
+                l = d.layers[index]
+                d.set_layer_props(index, l.name, visible, l.opacity, l.mode)
+        on self.options.tool_menu(x = 0.0, y = 0.0):
+            m = &Menu(self.ui)
+            for c in self.a.tools:
+                m.add(c)
+            self.popup = m
+            m.open(x, y)
+        on self.status.zoom_asked(zoom = 1.0):
+            self.canvas.zoom_to(zoom)
+        on self.status.fit_asked():
+            self.canvas.fit_window()
+        on self.form.answered(ok = true):
+            self.form_answered(ok)
+        on self.dialog.chosen(index = 0):
+            self.dialog_answered(index)
+        on self.dialog.preview(x = 0.0, y = 0.0, w = 0.0, h = 0.0):
+            if image := self.paste_preview:
+                sw = image.get_width()
+                sh = image.get_height()
+                k = min(w / float(sw), h / float(sh))
+                iw = max(1.0, floor(float(sw) * k))
+                ih = max(1.0, floor(float(sh) * k))
+                self.ui.fill(x, y, w, h, self.ui.theme.editor)
+                Display.draw(self.gpu, image.get_texture(), sw, sh, x + floor((w - iw) * 0.5), y + floor((h - ih) * 0.5), iw, ih, k >= 1.0, true)
+
+    choose_tool(k = ToolKind.brush):
+        self.toolbox.choose(self.session, k)
+        self.tools.set_current(k)
+        self.options.build(k)
+
+    # every text in the language of tr
+    retitle():
+        self.a.retitle(self.tr)
+        self.tools.retitle(self.tr)
+        self.history.retitle()
+        self.layers.retitle()
+        self.colors.retitle()
+        self.build_menus()
+        self.options.build(self.toolbox.current)
+
+    set_lang(lang = Lang.en):
+        self.tr.set_lang(lang)
+        self.retitle()
+        self.save_settings()
+
+    # ─── Documents ───
+
+    doc() -> none(&Document):
+        if self.current >= 0 and self.current < len(self.docs):
+            return self.docs[self.current]
+        return none
+
+    add_doc(d = &Document):
+        self.docs.push(d)
+        self.show_doc(len(self.docs) - 1)
+
+    show_doc(index = 0):
+        self.toolbox.commit(self.session)
+        self.current = clamp(index, -1, len(self.docs) - 1)
+        d = self.doc()
+        self.session.set_doc(d)
+        self.canvas.set_doc(d)
+        self.history.set_doc(d)
+        self.layers.set_doc(d)
+
+    # the document at index closed; asked first when it has changes
+    close_doc(index = 0, asked = false):
+        if index < 0 or index >= len(self.docs):
+            return
+        if index == self.current:
+            self.toolbox.commit(self.session)
+        d = self.docs[index]
+        if d.dirty() and not asked:
+            self.asking = "close"
+            self.asking_doc = index
+            self.dialog.open(self.tr.t("ask.save_title"), self.tr.f("ask.save_changes", [self.doc_name(d)]), [self.tr.t("ask.save"), self.tr.t("ask.dont_save"), self.tr.t("ask.cancel")], 0, 2)
+            return
+        self.toolbox.commit(self.session)
+        _ = self.docs.remove_at(index)
+        if self.quitting:
+            self.quit_pending = true
+            return
+        if len(self.docs) == 0:
+            self.add_doc(Document.blank(self.gpu, 800, 600, 0xFFFFFFFF, self.tr.t("layer.background")))
+        else:
+            self.show_doc(min(index, len(self.docs) - 1))
+
+    quit():
+        self.toolbox.commit(self.session)
+        self.quitting = true
+        for i, d in self.docs.enumerate():
+            if d.dirty():
+                self.show_doc(i)
+                self.close_doc(i)
+                return
+        self.save_settings()
+        self.window.close()
+
+    doc_name(d = &Document) -> str:
+        if d.name != "":
+            return d.name
+        return self.tr.t("doc.untitled")
+
+    # ─── Files ───
+
+    open_dialog():
+        filters = [(self.tr.t("file.images"), "*.pdn;*.png;*.jpg;*.jpeg;*.bmp"), ("Paint.NET (PDN)", "*.pdn"),
+            ("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg"), ("BMP", "*.bmp")]
+        if path := FileDialog.open(self.tr.t("cmd.open"), filters):
+            self.open_path(path)
+
+    open_path(path = ""):
+        if data := Fs().read_bytes(path):
+            if Pdn.matches(data) or path.lower().ends_with(".pdn"):
+                if image := Pdn.decode(data):
+                    self.add_doc(Document.from_pdn(self.gpu, image, path, Files.name(path)))
+                    self.touch_recent(path)
+                    return
+            elif b := Bitmap.decode(data):
+                d = Document.from_bitmap(self.gpu, b, path, Files.name(path), self.tr.t("layer.background"))
+                self.add_doc(d)
+                self.touch_recent(path)
+                return
+        self.message("msg.error", "msg.cannot_open")
+
+    touch_recent(path = ""):
+        out = [path]
+        for p in self.recent:
+            if p != path and len(out) < 10:
+                out.push(p)
+        self.recent = out
+        self.save_settings()
+        self.menus_stale = true
+
+    # saved to its file (or one asked for); the pixels read back next frame
+    save(index = 0, ask = false, close_after = false):
+        if index < 0 or index >= len(self.docs):
+            return
+        d = self.docs[index]
+        self.toolbox.commit(self.session)
+        path = d.path
+        if ask or path == "" or not Files.writable(path):
+            pdn = ("Paint.NET (PDN)", "*.pdn")
+            png = ("PNG", "*.png")
+            bmp = ("BMP", "*.bmp")
+            lower = path.lower()
+            filters = [pdn, png, bmp]
+            if lower.ends_with(".png"):
+                filters = [png, pdn, bmp]
+            elif lower.ends_with(".bmp"):
+                filters = [bmp, pdn, png]
+            _, pattern = filters[0]
+            extension = FileDialog.first_extension(pattern)
+            if p := FileDialog.save(self.tr.t("cmd.save_as"), filters, Files.stem(self.doc_name(d)) + "." + extension):
+                path = p
+            else:
+                return
+        if not Files.writable(path):
+            self.message("msg.error", "msg.cannot_save")
+            return
+        _ = d.composite()
+        self.jobs.push(&Job(d, path, close_after))
+
+    # the saves waiting: done once the picture they read is drawn
+    run_jobs():
+        keep = [&Job]
+        for j in self.jobs:
+            if d := j.doc:
+                if j.age >= 1 and d.composed == d.version:
+                    path = j.path.lower()
+                    saved = false
+                    if path.ends_with(".pdn"):
+                        if data := d.encode_pdn():
+                            saved = Files.write_project(j.path, data)
+                    else:
+                        b = d.flattened_pixels()
+                        data = b.encode_bmp() if path.ends_with(".bmp") else b.encode_png()
+                        saved = Fs().write_bytes(j.path, data)
+                    if saved and FileDialog.publish(j.path):
+                        d.set_file(j.path, Files.name(j.path))
+                        d.mark_saved()
+                        self.touch_recent(j.path)
+                        if j.close_after:
+                            for i, other in self.docs.enumerate():
+                                if other is d:
+                                    self.close_doc(i, true)
+                                    break
+                    else:
+                        self.message("msg.error", "msg.cannot_save")
+                else:
+                    _ = d.composite()
+                    j.older()
+                    keep.push(j)
+        self.jobs = keep
+
+    import_layer():
+        if d := self.doc():
+            filters = [(self.tr.t("file.images"), "*.png;*.jpg;*.jpeg;*.bmp")]
+            if path := FileDialog.open(self.tr.t("cmd.import_layer"), filters):
+                if data := Fs().read_bytes(path):
+                    if b := Bitmap.decode(data):
+                        self.toolbox.commit(self.session)
+                        _ = d.add_layer_of(b, Files.stem(Files.name(path)), "history.import_layer")
+                        return
+                self.message("msg.error", "msg.cannot_open")
+
+    # ─── Clipboard ───
+
+    # what is selected (of the layer, or of the whole picture: merged) cut
+    # to its box, the rest of the box see-through
+    copy(merged = false):
+        if d := self.doc():
+            self.toolbox.commit(self.session)
+            pixels = d.flattened_pixels() if merged else d.layer_pixels(d.current)
+            r = d.sel_bounds()
+            out = pixels.region(r)
+            if d.has_selection:
+                px = out.pixels
+                for y in range(out.height):
+                    for x in range(out.width):
+                        k = d.selection.at(r.x + x, r.y + y)
+                        i = (y * out.width + x) * 4 + 3
+                        px[i] = u8(int(px[i]) * k / 255)
+            self.clip = out
+            self.clip_has = true
+            self.clip_x = r.x
+            self.clip_y = r.y
+            self.clip_mask = Mask()
+            if d.has_selection:
+                cm = Mask(out.width, out.height)
+                for y in range(out.height):
+                    for x in range(out.width):
+                        cm.set(x, y, d.selection.at(r.x + x, r.y + y))
+                self.clip_mask = cm
+            # for other programs too: PNG, and a bitmap for those that
+            # take only that
+            self.window.clipboard_set_image(out.encode_png(), out.encode_bmp())
+            self.clip_seq = self.window.clipboard_get_sequence()
+
+    # a picture another program put on the system's clipboard (an image, or
+    # an image file copied in the Explorer); none when it holds ours or none
+    system_clip() -> none(Bitmap):
+        win = self.window
+        if win.clipboard_get_sequence() == self.clip_seq and self.clip_has:
+            return none
+        data = win.clipboard_get_image()
+        if len(data) > 0:
+            if b := Bitmap.decode(data):
+                return b
+        for path in win.clipboard_get_files():
+            if bytes := Fs().read_bytes(path):
+                if b := Bitmap.decode(bytes):
+                    return b
+        return none
+
+    # whether the system's clipboard holds a picture, looked at again only
+    # when it changed
+    system_has() -> bool:
+        when build.target.web:
+            # The browser can only tell us what's on the clipboard on paste.
+            return true
+        else:
+            win = self.window
+            seq = win.clipboard_get_sequence()
+            if seq != self.sys_seq:
+                self.sys_seq = seq
+                self.sys_has = false
+                if seq != self.clip_seq:
+                    self.sys_has = len(win.clipboard_get_image()) > 0
+                    if not self.sys_has:
+                        for path in win.clipboard_get_files():
+                            p = path.lower()
+                            if p.ends_with(".png") or p.ends_with(".jpg") or p.ends_with(".jpeg") or p.ends_with(".bmp"):
+                                self.sys_has = true
+            return self.sys_has or self.clip_has
+
+    # 0 into the layer (selected, the move tool in hand), 1 into a new
+    # layer, 2 as a new picture
+    paste(how = 0):
+        when build.target.web:
+            self.paste_pending = how
+            self.paste_doc = self.doc()
+            self.window.clipboard_request_image()
+        else:
+            self.paste_from_clip(how)
+
+    poll_browser_paste(accept_event = true, apply_pending = true):
+        if self.window.clipboard_take_image_paste() and self.paste_pending < 0 and accept_event:
+            if d := self.doc():
+                self.paste_pending = 0
+                self.paste_doc = d
+        if not apply_pending:
+            self.paste_pending = -1
+            self.paste_doc = none
+        if self.paste_pending < 0 or self.window.clipboard_get_image_state() == ClipboardState.pending:
+            return
+        how = self.paste_pending
+        self.paste_pending = -1
+        if how == 2 or self.paste_doc == self.doc():
+            self.paste_from_clip(how)
+        self.paste_doc = none
+
+    paste_from_clip(how = 0):
+        if got := self.system_clip():
+            # another program's picture: at the top left
+            self.clip = got
+            self.clip_has = true
+            self.clip_x = 0
+            self.clip_y = 0
+            self.clip_mask = Mask()
+            self.clip_seq = self.window.clipboard_get_sequence()
+        if not self.clip_has:
+            return
+        b = self.clip
+        if how == 2:
+            self.add_doc(Document.from_bitmap(self.gpu, b, "", "", self.tr.t("layer.background")))
+            return
+        if d := self.doc():
+            image = self.gpu.upload(b)
+            if b.width > d.width or b.height > d.height:
+                self.asking = "paste_size"
+                self.paste_preview = image
+                self.paste_target = d
+                self.paste_new_layer = how == 1
+                self.dialog.open(self.tr.t("dlg.paste_size"), self.tr.t("dlg.paste_larger"),
+                    [self.tr.t("dlg.paste_keep"), self.tr.t("dlg.paste_enlarge"), self.tr.t("ask.cancel")], 0, 2, 132.0)
+                return
+            self.place_paste(image, false, how == 1)
+
+    place_paste(image = &Surface, enlarge = false, new_layer = false):
+        if d := self.doc():
+            self.toolbox.commit(self.session)
+            x = clamp(self.clip_x, 0, max(d.width - image.get_width(), 0))
+            y = clamp(self.clip_y, 0, max(d.height - image.get_height(), 0))
+            self.choose_tool(ToolKind.move_pixels)
+            self.toolbox.move_pixels.paste(self.session, image, self.clip_mask, x, y, enlarge, new_layer, self.tr.t("layer.n"))
+
+    # ─── Context menus ───
+
+    image_menu(index = 0, x = 0.0, y = 0.0):
+        self.show_doc(index)
+        m = &Menu(self.ui)
+        self.popup_commands.clear()
+        for c in [self.a.save, self.a.save_as, self.a.close]:
+            m.add(c)
+        m.add_separator()
+        others = &Command(self.tr.t("cmd.close_others"))
+        on others.run():
+            keep = self.docs[self.current]
+            i = len(self.docs) - 1
+            while i >= 0:
+                if not (self.docs[i] is keep) and not self.docs[i].dirty():
+                    _ = self.docs.remove_at(i)
+                i -= 1
+            for j, dd in self.docs.enumerate():
+                if dd is keep:
+                    self.show_doc(j)
+        self.popup_commands.push(others)
+        m.add(others)
+        self.popup = m
+        m.open(x, y)
+
+    layer_menu(x = 0.0, y = 0.0):
+        m = &Menu(self.ui)
+        a = self.a
+        for c in [a.add_layer, a.delete_layer, a.duplicate_layer, a.merge_down]:
+            m.add(c)
+        m.add_separator()
+        for c in [a.move_up, a.move_down, a.flip_layer_h, a.flip_layer_v]:
+            m.add(c)
+        m.add_separator()
+        m.add(a.layer_properties)
+        self.popup = m
+        m.open(x, y)
+
+    # ─── Dialogs ───
+
+    message(title = "", text = ""):
+        self.asking = "message"
+        self.dialog.open(self.tr.t(title), self.tr.t(text), ["OK"], 0, 0)
+
+    dialog_answered(index = 0):
+        match self.asking:
+            case "paste_size":
+                image = self.paste_preview
+                target = self.paste_target
+                self.paste_preview = none
+                self.paste_target = none
+                self.asking = ""
+                if index < 2 and target == self.doc():
+                    if src := image:
+                        self.place_paste(src, index == 1, self.paste_new_layer)
+            case "close":
+                i = self.asking_doc
+                self.asking = ""
+                if index == 0:
+                    self.save(i, false, true)
+                elif index == 1:
+                    self.close_doc(i, true)
+                else:
+                    self.quitting = false
+            case _:
+                self.asking = ""
+
+    form_reset(kind = "", title = "", width = 420.0):
+        self.form_kind = kind
+        self.spins.clear()
+        self.sliders.clear()
+        self.checks.clear()
+        self.choices.clear()
+        self.fields.clear()
+        self.form.open(self.tr.t(title), width, self.tr.t("ask.ok"), self.tr.t("ask.cancel"))
+
+    spin(row = &View, value = 0, min = 0, max = 100) -> &SpinField:
+        s = &SpinField(self.ui, row, value, min, max, 80.0)
+        self.spins.push(s)
+        return s
+
+    new_dialog():
+        self.form_reset("new", "dlg.new_image", 360.0)
+        w = 800
+        h = 600
+        if self.clip_has:
+            w = self.clip.width
+            h = self.clip.height
+        _ = self.spin(self.form.row(self.tr.t("dlg.width")), w, 1, 65535)
+        _ = self.spin(self.form.row(self.tr.t("dlg.height")), h, 1, 65535)
+        self.form.note(self.tr.t("dlg.new_note"))
+
+    resize_dialog():
+        if d := self.doc():
+            self.toolbox.commit(self.session)
+            self.form_reset("resize", "dlg.resize", 380.0)
+            pct = self.spin(self.form.row(self.tr.t("dlg.percentage")), 100, 1, 10000)
+            ws = self.spin(self.form.row(self.tr.t("dlg.width")), d.width, 1, 65535)
+            hs = self.spin(self.form.row(self.tr.t("dlg.height")), d.height, 1, 65535)
+            keep = &CheckBox(self.ui, self.form.row(self.tr.t("dlg.keep_aspect")), true)
+            self.checks.push(keep)
+            dw = float(d.width)
+            dh = float(d.height)
+            on pct.changed(value = 0):
+                ws.set_value(int(round(dw * float(value) / 100.0)))
+                hs.set_value(int(round(dh * float(value) / 100.0)))
+            on ws.changed(value = 0):
+                if keep.checked:
+                    hs.set_value(max(1, int(round(dh * float(value) / dw))))
+            on hs.changed(value = 0):
+                if keep.checked:
+                    ws.set_value(max(1, int(round(dw * float(value) / dh))))
+
+    canvas_dialog():
+        if d := self.doc():
+            self.toolbox.commit(self.session)
+            self.form_reset("canvas", "dlg.canvas_size", 380.0)
+            _ = self.spin(self.form.row(self.tr.t("dlg.width")), d.width, 1, 65535)
+            _ = self.spin(self.form.row(self.tr.t("dlg.height")), d.height, 1, 65535)
+            self.anchor = 4
+            row = self.form.row(self.tr.t("dlg.anchor"), 130.0, 78.0)
+            grid = self.form.keep(self.ui.create(Layout.grid, row))
+            grid.set_columns(3)
+            grid.set_gap(2.0, 2.0)
+            grid.set_min_size(78.0, 78.0)
+            grid.set_max_size(78.0, 78.0)
+            for i in range(9):
+                cell = self.form.keep(self.ui.create(Layout.free, grid))
+                k = i
+                on cell.click():
+                    self.anchor = k
+                on cell.draw():
+                    x, y, w, h = self.ui.rect(cell)
+                    on_it = self.anchor == k
+                    self.ui.fill(x, y, w, h, self.ui.theme.accent if on_it else self.ui.theme.button)
+                    if on_it:
+                        self.ui.icon(Icon.image_item, x + (w - 16.0) * 0.5, y + (h - 16.0) * 0.5, 16.0, -1)
+
+    layer_dialog():
+        if d := self.doc():
+            self.toolbox.commit(self.session)
+            l = d.layer()
+            self.props = (d.current, l.name, l.visible, l.opacity, l.mode)
+            self.form_reset("layer", "dlg.layer_properties", 420.0)
+            name = &TextField(self.ui, self.form.row(self.tr.t("dlg.name")), l.name)
+            self.fields.push(name)
+            vis = &CheckBox(self.ui, self.form.row(self.tr.t("dlg.visible")), l.visible)
+            self.checks.push(vis)
+            modes = [str]
+            for m in ["normal", "multiply", "additive", "color_burn", "color_dodge", "reflect", "glow", "overlay", "difference", "negation", "lighten", "darken", "screen", "xor"]:
+                modes.push(self.tr.t("blend." + m))
+            mode = &ChoiceField(self.ui, self.form.row(self.tr.t("dlg.blend_mode")), modes)
+            mode.set_current(int(l.mode))
+            self.choices.push(mode)
+            op = &SliderBar(self.ui, self.form.row(self.tr.t("dlg.opacity")), 0.0, 255.0, float(l.opacity), "", 220.0)
+            self.sliders.push(op)
+            on name.committed(text = ""):
+                self.layer_preview()
+            on vis.toggled(checked = false):
+                self.layer_preview()
+            on mode.chosen(index = 0):
+                self.layer_preview()
+            on op.changed(value = 0.0):
+                self.layer_preview()
+
+    layer_preview():
+        if d := self.doc():
+            i, _, _, _, _ = self.props
+            d.preview_layer_props(i, self.fields[0].text, self.checks[0].checked, int(self.sliders[0].value), BlendMode.normal + i32(self.choices[0].get_current()))
+
+    rotate_zoom_dialog():
+        if d := self.doc():
+            self.toolbox.commit(self.session)
+            self.fx_base = self.gpu.duplicate(d.layer().surface)
+            self.fx_rect = d.bounds()
+            self.form_reset("rotate_zoom", "dlg.rotate_zoom", 420.0)
+            for p in [("dlg.angle", -180.0, 180.0, 0.0), ("dlg.pan_x", -2000.0, 2000.0, 0.0), ("dlg.pan_y", -2000.0, 2000.0, 0.0), ("dlg.zoom", 1.0, 1000.0, 100.0)]:
+                key, lo, hi, v = p
+                s = &SliderBar(self.ui, self.form.row(self.tr.t(key)), lo, hi, v, "", 240.0)
+                on s.changed(value = 0.0):
+                    self.rotate_zoom_preview()
+                self.sliders.push(s)
+
+    rotate_zoom_preview():
+        if d := self.doc():
+            if b := self.fx_base:
+                z = self.sliders[3].value / 100.0
+                cx = float(d.width) * 0.5
+                cy = float(d.height) * 0.5
+                clear = self.gpu.surface(d.width, d.height)
+                self.gpu.clear(clear, 0)
+                Transforms.place(self.gpu, d.layer().surface, clear.get_texture(), b.get_texture(), d.sel_texture(), d.bounds(), cx, cy, self.sliders[1].value, self.sliders[2].value, z, z, self.sliders[0].value)
+                d.touch()
+
+    settings_dialog():
+        self.form_reset("settings", "dlg.settings", 380.0)
+        lang = &ChoiceField(self.ui, self.form.row(self.tr.t("dlg.language")), self.tr.names())
+        lang.set_current(int(self.tr.lang))
+        self.choices.push(lang)
+        self.form.note(self.tr.t("dlg.settings_note"))
+
+    # an adjustment or effect: at once when it has no parameters, else its
+    # dialog with the picture showing it as the parameters change
+    effect(id = ""):
+        if d := self.doc():
+            if info := Effects.find(id):
+                self.toolbox.commit(self.session)
+                g = self.gpu
+                self.fx_id = id
+                self.fx_base = g.duplicate(d.layer().surface)
+                self.fx_rect = d.sel_bounds()
+                if len(info.params) == 0:
+                    values = [float]
+                    if id == "auto_level":
+                        values = Effects.levels_of(d.layer_pixels(d.current), self.fx_rect)
+                    self.fx_apply(values)
+                    self.fx_commit()
+                    return
+                self.form_reset("effect", "fx." + id, 460.0)
+                self.fx_scales.clear()
+                for p in info.params:
+                    row = self.form.row(self.tr.t(p.key), 150.0)
+                    match p.kind:
+                        case ParamKind.toggle:
+                            c = &CheckBox(self.ui, row, p.value > 0.5)
+                            on c.toggled(checked = false):
+                                self.fx_preview()
+                            self.checks.push(c)
+                        case ParamKind.choice:
+                            labels = [str]
+                            for k in p.choices:
+                                labels.push(self.tr.t(k))
+                            ch = &ChoiceField(self.ui, row, labels)
+                            ch.set_current(int(p.value))
+                            on ch.chosen(index = 0):
+                                self.fx_preview()
+                            self.choices.push(ch)
+                        case _:
+                            k = 10.0 ** float(p.digits)
+                            self.fx_scales.push(k)
+                            s = &SliderBar(self.ui, row, p.min * k, p.max * k, p.value * k, "", 250.0)
+                            on s.changed(value = 0.0):
+                                self.fx_preview()
+                            self.sliders.push(s)
+                self.fx_preview()
+
+    # the dialog's values in the order of the effect's parameters
+    fx_values() -> [float]:
+        out = [float]
+        if info := Effects.find(self.fx_id):
+            si = 0
+            ci = 0
+            hi = 0
+            for p in info.params:
+                match p.kind:
+                    case ParamKind.toggle:
+                        out.push(1.0 if self.checks[ci].checked else 0.0)
+                        ci += 1
+                    case ParamKind.choice:
+                        out.push(float(self.choices[hi].get_current()))
+                        hi += 1
+                    case _:
+                        out.push(self.sliders[si].value / self.fx_scales[si])
+                        si += 1
+        return out
+
+    fx_apply(values = [float]):
+        if d := self.doc():
+            if b := self.fx_base:
+                s = self.session
+                Effects.apply(self.gpu, d.layer().surface, b, self.fx_id, values, self.fx_rect, d.sel_texture(), s.primary, s.secondary)
+                d.touch()
+
+    fx_preview():
+        self.fx_apply(self.fx_values())
+
+    fx_commit():
+        if d := self.doc():
+            if b := self.fx_base:
+                info = Effects.find(self.fx_id)
+                icon = Icon.effect_item
+                if i := info:
+                    if i.menu == "adjust":
+                        icon = Icon.adjust_item
+                d.commit_pixels(b, "fx." + self.fx_id, icon, d.current, self.fx_rect)
+        self.fx_base = none
+
+    fx_cancel():
+        if d := self.doc():
+            if b := self.fx_base:
+                self.gpu.copy(d.layer().surface, b.get_texture(), self.fx_rect)
+                d.touch()
+        self.fx_base = none
+
+    form_answered(ok = true):
+        for field in self.fields:
+            field.finish(ok)
+        for spin in self.spins:
+            spin.finish(ok)
+        kind = self.form_kind
+        self.form_kind = ""
+        match kind:
+            case "new":
+                if ok:
+                    d = Document.blank(self.gpu, self.spins[0].value, self.spins[1].value, Pixel.with_alpha(self.session.secondary, 255), self.tr.t("layer.background"))
+                    self.add_doc(d)
+            case "resize":
+                if ok:
+                    if d := self.doc():
+                        d.resize(self.spins[1].value, self.spins[2].value)
+                        self.canvas.fit()
+            case "canvas":
+                if ok:
+                    if d := self.doc():
+                        w = self.spins[0].value
+                        h = self.spins[1].value
+                        ax = self.anchor % 3
+                        ay = self.anchor / 3
+                        ox = (w - d.width) * ax / 2
+                        oy = (h - d.height) * ay / 2
+                        d.canvas_size(w, h, ox, oy, Pixel.with_alpha(self.session.secondary, 255))
+                        self.canvas.fit()
+            case "layer":
+                if d := self.doc():
+                    i, name, visible, opacity, mode = self.props
+                    # back to what it was, then the change as one step
+                    d.preview_layer_props(i, name, visible, opacity, mode)
+                    if ok:
+                        d.set_layer_props(i, self.fields[0].text, self.checks[0].checked, int(self.sliders[0].value), BlendMode.normal + i32(self.choices[0].get_current()))
+            case "effect":
+                if ok:
+                    self.fx_preview()
+                    self.fx_commit()
+                else:
+                    self.fx_cancel()
+            case "rotate_zoom":
+                if ok:
+                    self.rotate_zoom_preview()
+                    if d := self.doc():
+                        if b := self.fx_base:
+                            d.commit_pixels(b, "history.rotate_zoom", Icon.layer_rotate_zoom, d.current, d.bounds())
+                    self.fx_base = none
+                else:
+                    self.fx_cancel()
+            case "settings":
+                if ok:
+                    self.set_lang(Lang.en + i32(self.choices[0].get_current()))
+            case _:
+                pass
+
+    # ─── Settings ───
+
+    settings_path() -> str:
+        if dir := Fs().get_save_dir("natiny-paint"):
+            return dir + "/settings.txt"
+        return ""
+
+    load_settings():
+        path = self.settings_path()
+        if path == "":
+            return
+        if text := Fs().read(path):
+            for line in text.split("\n"):
+                if line.starts_with("lang="):
+                    self.tr.set_lang(self.tr.by_code(line.slice(5, len(line)).strip()))
+                elif line.starts_with("recent="):
+                    p = line.slice(7, len(line)).strip()
+                    if p != "":
+                        self.recent.push(p)
+
+    save_settings():
+        path = self.settings_path()
+        if path == "":
+            return
+        out = "lang=" + self.tr.code() + "\n"
+        for p in self.recent:
+            if not FileDialog.is_temporary(p):
+                out += "recent=" + p + "\n"
+        _ = Fs().write(path, out)
+
+    # ─── The frame ───
+
+    update():
+        ui = self.ui
+        win = self.window
+        if not self.started:
+            _, _, w, _ = ui.rect(self.work)
+            if w > 100.0:
+                self.started = true
+                self.place_panels()
+        if win.take_close_asked():
+            self.quit()
+        if self.quit_pending:
+            self.quit_pending = false
+            self.quit()
+        if self.menus_stale:
+            self.menus_stale = false
+            self.build_menus()
+        self.run_jobs()
+        # files dropped onto the window open as pictures
+        for path in win.take_dropped_files():
+            self.open_path(path)
+        self.canvas.update_view_centre()
+        self.enable()
+        modal = self.form.get_open() or self.dialog.get_open()
+        if bar := self.menubar:
+            bar.update()
+        if p := self.popup:
+            p.update()
+        self.form.update()
+        self.dialog.update()
+        for s in self.spins:
+            s.update()
+        for s in self.sliders:
+            s.update()
+        for c in self.choices:
+            c.update()
+        for f in self.fields:
+            f.update()
+        menu_open = false
+        if bar := self.menubar:
+            menu_open = bar.get_open()
+        typing = self.options.editing() or self.toolbox.busy() and self.toolbox.current == ToolKind.text
+        if not modal:
+            self.tools.update()
+            self.history.update()
+            self.layers.update()
+            self.colors.update()
+            self.options.update()
+            self.strip.update()
+            self.status.update()
+            popup_open = false
+            if p := self.popup:
+                popup_open = p.get_open()
+            can_take_paste = not menu_open and not typing and not popup_open and not ui.get_keys_held()
+            if can_take_paste:
+                self.a.poll(ui)
+                self.tool_keys()
+                if win.input_get_key_pressed(Key.escape):
+                    self.escape()
+                if win.input_get_key_pressed(Key.enter) and not self.toolbox.busy() and not self.toolbox.line.pending() and not self.toolbox.move_pixels.changed():
+                    if d := self.doc():
+                        d.deselect()
+            when build.target.web:
+                self.poll_browser_paste(can_take_paste)
+            self.canvas.update(not menu_open)
+        else:
+            when build.target.web:
+                self.poll_browser_paste(false, false)
+        self.strip.set_docs(self.docs, self.current)
+        self.toolbar.set_toggles(self.grid_on, self.rulers_on)
+        self.toolbar.feedback()
+        self.a.grid.set_checked(self.grid_on)
+        self.a.rulers.set_checked(self.rulers_on)
+        self.a.win_tools.set_checked(self.tools.panel.get_visible())
+        self.a.win_history.set_checked(self.history.panel.get_visible())
+        self.a.win_layers.set_checked(self.layers.panel.get_visible())
+        self.a.win_colors.set_checked(self.colors.panel.get_visible())
+        self.corner_buttons[0].set_on(self.tools.panel.get_visible())
+        self.corner_buttons[1].set_on(self.history.panel.get_visible())
+        self.corner_buttons[2].set_on(self.layers.panel.get_visible())
+        self.corner_buttons[3].set_on(self.colors.panel.get_visible())
+        for b in self.corner_buttons:
+            b.feedback()
+        self.update_status()
+        self.update_title()
+
+    # Escape applies a pending transform or curve, cancels other tool
+    # gestures, or drops the selection when the tool is idle.
+    escape():
+        if self.toolbox.move_pixels.changed():
+            if d := self.doc():
+                d.show_selection(Mask(d.width, d.height), false)
+                self.toolbox.commit(self.session)
+            return
+        if self.toolbox.line.pending():
+            self.toolbox.commit(self.session)
+            return
+        if self.toolbox.cancel(self.session):
+            return
+        if d := self.doc():
+            if d.has_selection:
+                d.deselect()
+
+    # the letters that choose tools (a second press goes on to the next
+    # tool sharing the letter), X swaps the colours
+    tool_keys():
+        win = self.window
+        if win.input_get_key_down(Key.control) or win.input_get_key_down(Key.alt) or self.toolbox.busy():
+            return
+        if win.input_get_key_pressed(Key.x):
+            self.session.swap_colors()
+            return
+        for key in [Key.s, Key.m, Key.z, Key.h, Key.f, Key.g, Key.b, Key.e, Key.p, Key.k, Key.l, Key.r, Key.t, Key.o]:
+            if win.input_get_key_pressed(key):
+                if k := self.toolbox.by_key(key, win.input_get_key_down(Key.shift)):
+                    self.choose_tool(k)
+                return
+
+    # which commands can run now
+    enable():
+        a = self.a
+        d = self.doc()
+        has = d != none
+        sel = false
+        layers = 0
+        current = 0
+        undo = false
+        redo = false
+        if dd := d:
+            sel = dd.has_selection
+            layers = len(dd.layers)
+            current = dd.current
+            moving = self.toolbox.move_pixels.changed()
+            undo = moving or self.toolbox.line.pending() or dd.history.can_undo()
+            redo = not moving and dd.history.can_redo()
+        for c in [a.save, a.save_as, a.close, a.copy, a.copy_merged, a.select_all, a.zoom_in, a.zoom_out, a.zoom_window, a.actual_size, a.resize, a.canvas_size, a.flip_h, a.flip_v, a.rotate_cw, a.rotate_ccw, a.rotate_180, a.add_layer, a.duplicate_layer, a.toggle_layer, a.import_layer, a.flip_layer_h, a.flip_layer_v, a.rotate_layer_180, a.rotate_zoom, a.layer_properties, a.fill_selection, a.invert_selection]:
+            c.set_enabled(has)
+        for c in [a.cut, a.erase_selection, a.deselect, a.crop, a.zoom_selection]:
+            c.set_enabled(sel)
+        a.undo.set_enabled(undo)
+        a.redo.set_enabled(redo)
+        can_paste = self.system_has()
+        a.paste.set_enabled(has and can_paste)
+        a.paste_layer.set_enabled(has and can_paste)
+        a.paste_image.set_enabled(can_paste)
+        a.delete_layer.set_enabled(layers > 1)
+        a.flatten.set_enabled(layers > 1)
+        a.merge_down.set_enabled(current > 0)
+        a.move_down.set_enabled(current > 0)
+        a.move_bottom.set_enabled(current > 0)
+        a.go_down.set_enabled(current > 0)
+        a.go_bottom.set_enabled(current > 0)
+        a.move_up.set_enabled(current < layers - 1)
+        a.move_top.set_enabled(current < layers - 1)
+        a.go_up.set_enabled(current < layers - 1)
+        a.go_top.set_enabled(current < layers - 1)
+        a.recent.set_enabled(len(self.recent) > 0)
+
+    update_status():
+        k = self.toolbox.current
+        hint = self.tr.t("hint." + Toolbox.id(k))
+        if self.toolbox.move_pixels.changed():
+            hint = self.tr.t("hint.move_pending")
+        size = ""
+        selection = ""
+        zoom = 1.0
+        if d := self.doc():
+            size = f"{d.width} × {d.height}"
+            b = d.selection_bounds()
+            if preview := self.session.selection_preview:
+                b = preview.bounds
+            if not b.empty():
+                selection = f"{b.w} × {b.h}"
+            zoom = d.zoom
+        self.status.set_info(Toolbox.icon(k), hint, size, selection, self.pointer_text, zoom)
+
+    update_title():
+        name = Tr.app_name()
+        title = name
+        if d := self.doc():
+            mark = "*" if d.dirty() or self.toolbox.move_pixels.changed() or self.toolbox.line.pending() else ""
+            title = f"{self.doc_name(d)}{mark} - {name}"
+        if title != self.shown_title:
+            self.shown_title = title
+            self.window.set_title(title)

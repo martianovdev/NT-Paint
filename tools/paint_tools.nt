@@ -1,0 +1,200 @@
+# tools/paint_tools — the Paintbrush, Eraser, Pencil, Clone Stamp and
+# Recolor: a stroke follows the pointer as capsules of the brush's width
+# (dabs spaced by the toolbar's spacing when they would stand apart),
+# their coverage put onto the layer from what it was at the press.  The
+# left button paints with the primary colour, the right with the
+# secondary.  The clone stamp takes its source where Ctrl was clicked;
+# recolor replaces the secondary colour (the primary with the right
+# button) by the other.
+
+from graphics import Surface
+from window import Cursor
+from ui import Icon
+from tools.session import Session, ToolKind
+from tools.tool import Marks, Pointer, Tool
+
+Stroke(Tool):
+    which = ToolKind.brush
+    down = false
+    right = false
+    lx = 0.0
+    ly = 0.0
+    last_radius = 0.5
+    # where the pointer is (the brush's circle is drawn there)
+    hx = -1000.0
+    hy = -1000.0
+    # the clone stamp: its source, the offset from the stroke to it
+    src_x = 0.0
+    src_y = 0.0
+    has_src = false
+    off_x = 0.0
+    off_y = 0.0
+    # the stroke's distance not yet covered by a dab
+    carry = 0.0
+    orig = none(&Surface)
+
+    init(which = ToolKind.brush):
+        self.which = which
+
+    kind() -> ToolKind:
+        return self.which
+
+    radius(s = &Session) -> float:
+        if self.which == ToolKind.pencil:
+            return 0.5
+        return max(s.settings.width * 0.5, 0.5)
+
+    press(s = &Session, p = Pointer()):
+        if d := s.doc:
+            if self.which == ToolKind.clone and p.ctrl:
+                self.src_x = p.x
+                self.src_y = p.y
+                self.has_src = true
+                return
+            if self.which == ToolKind.clone and not self.has_src:
+                return
+            self.down = true
+            self.right = p.right
+            self.lx = p.x
+            self.ly = p.y
+            self.carry = 0.0
+            if self.which == ToolKind.pencil:
+                self.lx = floor(p.x) + 0.5
+                self.ly = floor(p.y) + 0.5
+            if self.which == ToolKind.clone:
+                self.off_x = self.src_x - p.x
+                self.off_y = self.src_y - p.y
+            s.painter.begin(d.layer().surface)
+            self.last_radius = self.pressure_radius(s, p)
+            self.segment(s, self.lx, self.ly, self.last_radius)
+
+    pressure_radius(s = &Session, p = Pointer()) -> float:
+        if self.which == ToolKind.pencil:
+            return self.radius(s)
+        return max(0.5, self.radius(s) * clamp(p.pressure, 0.0, 1.0))
+
+    drag(s = &Session, p = Pointer()):
+        self.hx = p.x
+        self.hy = p.y
+        if not self.down:
+            return
+        x = p.x
+        y = p.y
+        if self.which == ToolKind.pencil:
+            x = floor(p.x) + 0.5
+            y = floor(p.y) + 0.5
+        r = self.pressure_radius(s, p)
+        if x != self.lx or y != self.ly or r != self.last_radius:
+            self.segment(s, x, y, r)
+
+    # the stroke carried on to x, y and put onto the layer
+    segment(s = &Session, x = 0.0, y = 0.0, r = 0.5):
+        if d := s.doc:
+            st = s.settings
+            hard = 1.0 if self.which == ToolKind.pencil else st.hardness / 100.0
+            aa = st.antialias and self.which != ToolKind.pencil
+            step = st.spacing / 100.0 * r * 2.0
+            pt = s.painter
+            if step >= 2.0 and self.which != ToolKind.pencil:
+                # dabs that stand apart, the toolbar's spacing between
+                dx = x - self.lx
+                dy = y - self.ly
+                dist = sqrt(dx * dx + dy * dy)
+                if dist <= 0.0:
+                    pt.capsule(x, y, x, y, r, hard, aa)
+                t = max(0.0, step - self.carry)
+                while t <= dist:
+                    k = t / max(dist, 0.0001)
+                    cx = self.lx + dx * k
+                    cy = self.ly + dy * k
+                    rad = self.last_radius + (r - self.last_radius) * k
+                    pt.capsule(cx, cy, cx, cy, rad, hard, aa)
+                    t += step
+                self.carry = dist - (t - step)
+            else:
+                pt.capsule(self.lx, self.ly, x, y, self.last_radius, hard, aa, r)
+            self.lx = x
+            self.ly = y
+            self.last_radius = r
+            layer = d.layer().surface
+            sel = d.sel_texture()
+            primary = s.secondary if self.right else s.primary
+            other = s.primary if self.right else s.secondary
+            match self.which:
+                case ToolKind.eraser:
+                    pt.apply_erase(layer, sel)
+                case ToolKind.clone:
+                    pt.apply_clone(layer, pt.get_base().get_texture(), self.off_x, self.off_y, sel)
+                case ToolKind.recolor:
+                    pt.apply_recolor(layer, other, primary, s.settings.tolerance / 100.0, sel)
+                case _:
+                    pt.apply_color(layer, primary, st.mode, st.overwrite, sel)
+            d.touch()
+
+    release(s = &Session, p = Pointer()):
+        if not self.down:
+            return
+        self.down = false
+        if d := s.doc:
+            r = s.painter.end()
+            key = "history.paintbrush"
+            icon = Icon.tool_brush
+            match self.which:
+                case ToolKind.eraser:
+                    key = "history.eraser"
+                    icon = Icon.tool_eraser
+                case ToolKind.pencil:
+                    key = "history.pencil"
+                    icon = Icon.tool_pencil
+                case ToolKind.clone:
+                    key = "history.clone_stamp"
+                    icon = Icon.tool_clone
+                case ToolKind.recolor:
+                    key = "history.recolor"
+                    icon = Icon.tool_recolor
+                case _:
+                    pass
+            d.commit_pixels(s.painter.get_base(), key, icon, d.current, r)
+
+    hover(s = &Session, p = Pointer()):
+        self.hx = p.x
+        self.hy = p.y
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        pass
+
+    overlay(s = &Session):
+        if self.which != ToolKind.pencil:
+            Marks.brush(s, self.hx, self.hy, self.last_radius if self.down else self.radius(s))
+        if self.which == ToolKind.clone and self.has_src:
+            sx = self.src_x
+            sy = self.src_y
+            if self.down:
+                sx = self.lx + self.off_x
+                sy = self.ly + self.off_y
+            Marks.brush(s, sx, sy, self.radius(s))
+            cx, cy = s.view.to_screen(sx, sy)
+            s.ui.line(cx - 6.0, cy, cx + 6.0, cy, 0xFFFFFF)
+            s.ui.line(cx, cy - 6.0, cx, cy + 6.0, 0xFFFFFF)
+
+    busy() -> bool:
+        return self.down
+
+    cursor() -> Cursor:
+        return Cursor.crosshair
+
+    cancel(s = &Session) -> bool:
+        if not self.down:
+            return false
+        self.down = false
+        if d := s.doc:
+            r = s.painter.end()
+            s.gpu.copy(d.layer().surface, s.painter.get_base().get_texture(), r)
+            d.touch()
+        return true
+
+    recolor(s = &Session):
+        pass

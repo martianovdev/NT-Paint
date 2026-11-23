@@ -1,0 +1,67 @@
+# fill — the pixels like a seed: spans filled row by row from a stack
+# (contiguous), or every pixel of the picture compared (global).
+
+from raster import Fill, Mask
+
+extend Fill:
+    distance(a = 0, b = 0) -> float:
+        dr = float(((a >> 16) & 255) - ((b >> 16) & 255))
+        dg = float(((a >> 8) & 255) - ((b >> 8) & 255))
+        db = float((a & 255) - (b & 255))
+        da = float(((a >> 24) & 255) - ((b >> 24) & 255))
+        return sqrt(dr * dr + dg * dg + db * db + da * da) / 510.0
+
+    flood(src = Bitmap(), x = 0, y = 0, tolerance = 0.5, contiguous = true) -> Mask:
+        w = src.width
+        h = src.height
+        out = Mask(w, h)
+        if x < 0 or y < 0 or x >= w or y >= h:
+            return out
+        seed = src.get(x, y)
+        # which pixels are like the seed, decided once each
+        like = [u8]
+        px = src.pixels
+        tol = tolerance * tolerance
+        for p in range(w * h):
+            i = p * 4
+            dr = float(int(px[i]) - ((seed >> 16) & 255))
+            dg = float(int(px[i + 1]) - ((seed >> 8) & 255))
+            db = float(int(px[i + 2]) - (seed & 255))
+            da = float(int(px[i + 3]) - ((seed >> 24) & 255))
+            d2 = (dr * dr + dg * dg + db * db + da * da) / (510.0 * 510.0)
+            like.push(u8(1) if d2 <= tol else u8(0))
+        od = out.data
+        if not contiguous:
+            for p in range(w * h):
+                if like[p] != u8(0):
+                    od[p] = u8(255)
+            return out
+        stack = [int]
+        stack.push(y * w + x)
+        while len(stack) > 0:
+            p = stack.pop()
+            if od[p] != u8(0) or like[p] == u8(0):
+                continue
+            row = p / w
+            cx = p % w
+            l = cx
+            while l > 0 and like[row * w + l - 1] != u8(0) and od[row * w + l - 1] == u8(0):
+                l -= 1
+            r = cx
+            while r < w - 1 and like[row * w + r + 1] != u8(0) and od[row * w + r + 1] == u8(0):
+                r += 1
+            for k in range(l, r + 1):
+                od[row * w + k] = u8(255)
+            for ny in [row - 1, row + 1]:
+                if ny < 0 or ny >= h:
+                    continue
+                inside = false
+                for k in range(l, r + 1):
+                    q = ny * w + k
+                    ok = like[q] != u8(0) and od[q] == u8(0)
+                    if ok and not inside:
+                        stack.push(q)
+                        inside = true
+                    elif not ok:
+                        inside = false
+        return out

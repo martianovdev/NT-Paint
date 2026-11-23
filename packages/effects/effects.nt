@@ -1,0 +1,86 @@
+# effects — paint.net's Adjustments and Effects, each a shader (or a few
+# passes of shaders) on the GPU: named, placed in a menu, its parameters
+# described so a dialog can be built for it, and applied from a source
+# surface into a target one through a selection.
+#
+#   for info in Effects.catalog(): ...
+#   Effects.apply(gpu, layer, base, "gaussian_blur", [12.0], box, sel)
+#
+# Titles are keys for the program's translations: "fx.<id>" an effect,
+# "fx.menu.<menu>" a submenu, a parameter's own key.  Only auto level
+# needs the picture's histogram, which the CPU counts (Effects.levels_of).
+#
+# Inside: catalog (the list), run (passes and dispatch), shaders.
+
+package effects "0.1.0"
+
+requires graphics "0.1"
+requires raster "0.1"
+requires imaging "0.1"
+
+from graphics import Surface, Texture
+from raster import Bitmap, Rect
+from imaging import Gpu
+
+enum ParamKind:
+    # a number on a slider, min…max, with digits after the point
+    number
+    # an angle in degrees, -180…180
+    angle
+    # on or off (0 or 1)
+    toggle
+    # one of choices (its index); the choices are keys to translate
+    choice
+    # a seed: a number and a button that makes a new one
+    seed
+
+# a parameter of an effect: its key (translated), kind, range and first
+# value
+Param:
+    key = ""
+    kind = ParamKind.number
+    min = 0.0
+    max = 100.0
+    value = 0.0
+    digits = 0
+    choices = [str]
+
+    init(key = "", kind = ParamKind.number, min = 0.0, max = 100.0, value = 0.0, digits = 0, choices = [str]):
+        self.key = key
+        self.kind = kind
+        self.min = min
+        self.max = max
+        self.value = value
+        self.digits = digits
+        self.choices = choices
+
+# an effect: its id ("fx.<id>" its title), its menu ("adjust" for
+# Adjustments, else an Effects submenu), its shortcut and its parameters
+# (none: it applies at once, no dialog)
+EffectInfo:
+    id = ""
+    menu = ""
+    params = [Param]
+    # the shortcut as a menu shows it: "Ctrl+Shift+L", "" for none
+    shortcut = ""
+
+    init(id = "", menu = "", params = [Param], shortcut = ""):
+        self.id = id
+        self.menu = menu
+        self.params = params
+        self.shortcut = shortcut
+
+Effects in catalog, run:
+    # every adjustment and effect, in the order the menus list them
+    catalog() -> [EffectInfo]
+    find(id = "") -> none(EffectInfo)
+    # the Effects menu's submenus, in order (keys "fx.menu.<id>")
+    menus() -> [str]
+    # the effect applied: dst (in r) = src through it, mixed by how much
+    # sel selects (none: all); values in the order of its params (missing
+    # ones take their first value); primary and secondary the palette's
+    # colours (0xAARRGGBB)
+    apply(gpu = &Gpu, dst = &Surface, src = &Surface, id = "", values = [float], r = Rect(), sel = none(&Texture), primary = 0, secondary = 0)
+    # auto level's parameters from a picture's histogram: each channel's
+    # darkest and lightest per mille (r lo, r hi, g lo, g hi, b lo, b hi)
+    levels_of(b = Bitmap(), r = Rect()) -> [float]

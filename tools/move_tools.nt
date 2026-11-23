@@ -1,0 +1,293 @@
+# Move Selected Pixels keeps its source until the move is committed. The
+# layer shows a canvas-sized preview, while the source and handles can extend
+# beyond it. Move Selection still records each drag as a selection edit.
+
+from graphics import Surface, Texture
+from window import Cursor, Key
+from raster import Mask, Rect
+from imaging import Transforms
+from ui import Icon
+from document.document import Document
+from document.layer import LayerState
+from tools.session import Session, ToolKind
+from tools.tool import Marks, Pointer, Tool
+
+enum Grip:
+    none
+    move
+    scale
+    rotate
+
+Mover(Tool):
+    pixels = true
+    active = false
+    pasted = false
+    new_layer = false
+    grip = Grip.none
+    px = 0.0
+    py = 0.0
+    dx = 0.0
+    dy = 0.0
+    sx = 1.0
+    sy = 1.0
+    angle = 0.0
+    start = (0.0, 0.0, 1.0, 1.0, 0.0)
+    box = Rect()
+    cx = 0.0
+    cy = 0.0
+    hx = 0
+    hy = 0
+    before = Mask()
+    had = false
+    before_layers = [LayerState]
+    before_size = (0, 0)
+    before_index = 0
+    mask = Mask()
+    base = none(&Surface)
+    hole = none(&Surface)
+    source = none(&Surface)
+    source_rect = Rect()
+    sel = none(&Texture)
+
+    init(pixels = true):
+        self.pixels = pixels
+
+    kind() -> ToolKind:
+        return ToolKind.move_pixels if self.pixels else ToolKind.move_selection
+
+    begin(d = &Document, box = Rect()):
+        self.active = true
+        self.before = d.selection.copy()
+        self.had = d.has_selection
+        self.before_size = (d.width, d.height)
+        self.before_index = d.current
+        self.set_box(box)
+
+    set_box(box = Rect()):
+        self.box = box
+        self.cx = float(box.x) + float(box.w) * 0.5
+        self.cy = float(box.y) + float(box.h) * 0.5
+        self.dx = 0.0
+        self.dy = 0.0
+        self.sx = 1.0
+        self.sy = 1.0
+        self.angle = 0.0
+
+    paste(s = &Session, image = &Surface, mask = Mask(), x = 0, y = 0, enlarge = false, new_layer = false, name = ""):
+        if d := s.doc:
+            w = image.get_width()
+            h = image.get_height()
+            self.begin(d, Rect(x, y, w, h))
+            self.pasted = true
+            self.new_layer = new_layer
+            if enlarge or new_layer:
+                self.before_layers = d.states()
+            if enlarge:
+                d.canvas_size(max(w, d.width), max(h, d.height), record = false)
+            g = s.gpu
+            if new_layer:
+                blank = g.surface(d.width, d.height)
+                g.clear(blank, 0)
+                _ = d.insert_layer(blank, name)
+            base = g.duplicate(d.layer().surface)
+            self.base = base
+            self.hole = base
+            self.source = image
+            self.source_rect = self.box
+            self.mask = mask if mask.width == w and mask.height == h else Mask(w, h, 255)
+            self.show(s)
+
+    press(s = &Session, p = Pointer()):
+        if d := s.doc:
+            if not self.active:
+                if not self.pixels and not d.has_selection:
+                    return
+                self.begin(d, d.sel_bounds())
+                if self.pixels:
+                    g = s.gpu
+                    base = g.duplicate(d.layer().surface)
+                    tex = d.sel_texture().or(g.everything())
+                    hole = g.surface(d.width, d.height)
+                    Transforms.erase(g, hole, base.get_texture(), tex, d.bounds())
+                    self.base = base
+                    self.hole = hole
+                    self.source = base
+                    self.sel = tex
+            self.start = (self.dx, self.dy, self.sx, self.sy, self.angle)
+            self.px = p.x
+            self.py = p.y
+            self.grip = Grip.rotate if p.right else Grip.move
+            hx, hy = self.handle_at(s, p)
+            if not p.right and (hx != 0 or hy != 0):
+                self.grip = Grip.scale
+                self.hx = hx
+                self.hy = hy
+
+    turn(x = 0.0, y = 0.0, degrees = 0.0) -> (float, float):
+        a = degrees * 3.141592653589793 / 180.0
+        return x * cos(a) - y * sin(a), x * sin(a) + y * cos(a)
+
+    point(x = 0.0, y = 0.0) -> (float, float):
+        rx, ry = Mover.turn(x * float(self.box.w) * 0.5 * self.sx, y * float(self.box.h) * 0.5 * self.sy, self.angle)
+        return self.cx + self.dx + rx, self.cy + self.dy + ry
+
+    handle_at(s = &Session, p = Pointer()) -> (int, int):
+        for hy in [-1, 0, 1]:
+            for hx in [-1, 0, 1]:
+                if hx != 0 or hy != 0:
+                    x, y = self.point(float(hx), float(hy))
+                    sx, sy = s.view.to_screen(x, y)
+                    if abs(p.sx - sx) <= 6.0 and abs(p.sy - sy) <= 6.0:
+                        return hx, hy
+        return 0, 0
+
+    drag(s = &Session, p = Pointer()):
+        if self.grip == Grip.none:
+            return
+        previous = (self.dx, self.dy, self.sx, self.sy, self.angle)
+        dx, dy, _, _, angle = self.start
+        mx = p.x - self.px
+        my = p.y - self.py
+        match self.grip:
+            case Grip.move:
+                self.dx = dx + (mx if p.shift else floor(mx + 0.5))
+                self.dy = dy + (my if p.shift else floor(my + 0.5))
+            case Grip.scale:
+                self.scale(mx, my, p.shift, p.alt)
+            case Grip.rotate:
+                a0 = atan2(self.py - self.cy - dy, self.px - self.cx - dx)
+                a1 = atan2(p.y - self.cy - dy, p.x - self.cx - dx)
+                self.angle = angle + (a1 - a0) * 180.0 / 3.141592653589793
+                if p.shift:
+                    self.angle = floor(self.angle / 15.0 + 0.5) * 15.0
+            case _:
+                pass
+        if previous != (self.dx, self.dy, self.sx, self.sy, self.angle):
+            self.show(s)
+
+    scale(mx = 0.0, my = 0.0, proportional = false, centered = false):
+        dx, dy, sx, sy, angle = self.start
+        lx, ly = Mover.turn(mx, my, -angle)
+        hw = max(float(self.box.w) * 0.5, 0.5)
+        hh = max(float(self.box.h) * 0.5, 0.5)
+        divisor = 1.0 if centered else 2.0
+        self.sx = max(0.01, sx + lx * float(self.hx) / (hw * divisor))
+        self.sy = max(0.01, sy + ly * float(self.hy) / (hh * divisor))
+        if proportional:
+            kx = self.sx / sx if self.hx != 0 else 0.0
+            ky = self.sy / sy if self.hy != 0 else 0.0
+            k = max(kx, ky)
+            self.sx = max(0.01, sx * k)
+            self.sy = max(0.01, sy * k)
+        shift_x = 0.0 if centered else float(self.hx) * hw * (self.sx - sx)
+        shift_y = 0.0 if centered else float(self.hy) * hh * (self.sy - sy)
+        rx, ry = Mover.turn(shift_x, shift_y, angle)
+        self.dx = dx + rx
+        self.dy = dy + ry
+
+    changed() -> bool:
+        return self.active and (self.pasted or self.dx != 0.0 or self.dy != 0.0 or self.sx != 1.0 or self.sy != 1.0 or self.angle != 0.0)
+
+    show(s = &Session):
+        if d := s.doc:
+            if self.pasted:
+                x = float(self.box.x)
+                y = float(self.box.y)
+                target = Rect(-self.box.x, -self.box.y, d.width, d.height)
+                m = self.mask.transformed(self.cx - x, self.cy - y, self.dx, self.dy, self.sx, self.sy, self.angle, target)
+                d.show_selection(m, true)
+            elif self.had:
+                d.show_selection(self.before.transformed(self.cx, self.cy, self.dx, self.dy, self.sx, self.sy, self.angle), true)
+            if self.pixels:
+                if src := self.source:
+                    if under := self.hole:
+                        if self.changed():
+                            Transforms.place(s.gpu, d.layer().surface, under.get_texture(), src.get_texture(), self.sel, d.bounds(), self.cx, self.cy, self.dx, self.dy, self.sx, self.sy, self.angle, self.source_rect)
+                        else:
+                            s.gpu.copy(d.layer().surface, src.get_texture(), d.bounds())
+                d.touch()
+
+    release(s = &Session, p = Pointer()):
+        if self.grip == Grip.none:
+            return
+        self.drag(s, p)
+        self.grip = Grip.none
+        if not self.pixels or not self.changed():
+            self.commit(s)
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        if self.pixels and s.ui.window.input_get_key_pressed(Key.enter):
+            self.commit(s)
+
+    commit(s = &Session):
+        if not self.active:
+            return
+        if self.changed():
+            if d := s.doc:
+                if not self.pixels:
+                    d.set_selection(d.selection, "history.move_selection", Icon.tool_move_selection, self.before, self.had)
+                elif len(self.before_layers) > 0:
+                    title = "history.paste_new_layer" if self.new_layer else "history.paste"
+                    icon = Icon.layer_import if self.new_layer else Icon.act_paste
+                    d.push_state(title, icon, self.before_layers, self.before_size, self.before_index, self.before, self.had)
+                elif b := self.base:
+                    title = "history.paste" if self.pasted else "history.move_pixels"
+                    icon = Icon.act_paste if self.pasted else Icon.tool_move_pixels
+                    d.commit_pixels(b, title, icon, d.current, d.bounds(), self.before, self.had)
+        self.clear()
+
+    clear():
+        self.active = false
+        self.pasted = false
+        self.new_layer = false
+        self.grip = Grip.none
+        self.base = none
+        self.hole = none
+        self.source = none
+        self.source_rect = Rect()
+        self.sel = none
+        self.before = Mask()
+        self.mask = Mask()
+        self.before_layers = [LayerState]
+
+    overlay(s = &Session):
+        if d := s.doc:
+            if not self.active:
+                if not d.has_selection:
+                    return
+                self.set_box(d.sel_bounds())
+            pts = [(float, float)]
+            for c in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]:
+                x, y = c
+                px, py = self.point(x, y)
+                pts.push(s.view.to_screen(px, py))
+            for k in range(4):
+                ax, ay = pts[k]
+                bx, by = pts[(k + 1) % 4]
+                Marks.ants(s, ax, ay, bx, by)
+                Marks.handle(s, ax, ay)
+                Marks.handle(s, (ax + bx) * 0.5, (ay + by) * 0.5)
+
+    busy() -> bool:
+        return self.grip != Grip.none
+
+    cursor() -> Cursor:
+        return Cursor.move
+
+    cancel(s = &Session) -> bool:
+        if not self.active:
+            return false
+        if d := s.doc:
+            if len(self.before_layers) > 0:
+                d.restore(self.before_layers, self.before_size, self.before_index)
+            elif b := self.base:
+                s.gpu.copy(d.layer().surface, b.get_texture(), d.bounds())
+            d.show_selection(self.before, self.had)
+        self.clear()
+        return true
+
+    recolor(s = &Session):
+        pass

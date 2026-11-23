@@ -1,0 +1,368 @@
+# widgets/tabs — the strip is one view on the backdrop that draws every
+# tab and finds the one under a press itself; the open tab is the colour
+# of the body under it, its top corners round.  The body holds a page
+# per tab, the open one visible.  A tab held with the left button and
+# moved past drag_start is dragged along the strip: it takes the place
+# its left edge is nearest to, and the tabs it passes slide aside.
+
+from ui import Icon, Tabs
+from graphics import Align
+from window import Button, Cursor
+from view import Layout, View
+
+# a tab: the owner's key, its title, its icon, whether it has a cross,
+# its page; where along the strip it is drawn, easing toward its place
+Tab:
+    page = &View
+    key = 0
+    title = ""
+    closable = true
+    icon = Icon.none
+    x = 0.0
+    placed = false
+    init(page = &View, key = 0, title = "", closable = true, icon = Icon.none):
+        self.page = page
+        self.key = key
+        self.title = title
+        self.closable = closable
+        self.icon = icon
+
+    set_title(title = ""):
+        self.title = title
+
+    # drawn the share k of the way nearer to x; at x the first time and
+    # when nearly there
+    ease_to(x = 0.0, k = 1.0):
+        if not self.placed or abs(x - self.x) < 0.5:
+            self.x = x
+        else:
+            self.x += (x - self.x) * k
+        self.placed = true
+
+    # drawn at its place at once the next time, not eased from where it was
+    unplace():
+        self.placed = false
+
+extend Tabs:
+    tabs = [Tab]
+    # the index of the open tab, -1 for none
+    current = -1
+    empty = ""
+    # the tab held by the left button: where along the strip the press
+    # was and where the tab began; dragged once moved far enough, at
+    # drag_x
+    held = none(int)
+    held_from = 0.0
+    held_left = 0.0
+    dragging = false
+    drag_x = 0.0
+    # when the tabs last eased toward their places
+    slid_at = 0.0
+    # the group in front (of two side by side): its open tab is lit and
+    # joins the body; the other's is shown as any other tab
+    active = true
+
+    init(ui = &Ui, parent = &View, empty = ""):
+        self.ui = ui
+        self.empty = empty
+        self.root = ui.create(Layout.vertical, parent)
+        self.strip = ui.create(Layout.free, self.root)
+        self.body = ui.create(Layout.free, self.root)
+        self.root.set_expand(true)
+        self.body.set_expand(true)
+        self.strip.set_clip(true)
+        self.body.set_clip(true)
+        self.strip.set_min_size(0.0, ui.theme.tab)
+        on self.strip.draw():
+            self.draw_strip()
+        on self.strip.mouse_down():
+            self.press()
+        on self.body.draw():
+            t = self.ui.theme
+            x, y, w, h = self.ui.rect(self.body)
+            self.ui.fill_round(x, y, w, h, t.radius, t.chrome)
+            # the open tab joins the body: no round corner under it
+            if self.active and self.current >= 0 and self.tabs[self.current].x < t.radius:
+                self.ui.fill(x, y, t.radius * 2.0, t.radius * 2.0, t.chrome)
+            if len(self.tabs) == 0:
+                self.ui.text_wrapped(x, y, w, h, self.empty, t.ink_faint, Align.center + Align.middle)
+            self.body.render_children()
+
+    add(key = 0, title = "", closable = true, icon = Icon.none) -> &View:
+        page = self.ui.create(Layout.vertical, self.body)
+        page.set_expand(true)
+        page.set_visible(false)
+        self.tabs.push(Tab(page, key, title, closable, icon))
+        self.show(len(self.tabs) - 1)
+        return page
+
+    remove(key = 0):
+        at = self.index(key)
+        if at < 0:
+            return
+        gone = self.let_go(at)
+        gone.page.set_parent(none)
+
+    move_to(other = &Tabs, key = 0):
+        at = self.index(key)
+        if at < 0:
+            return
+        other.attach(self.let_go(at))
+
+    update():
+        self.follow_drag()
+        if self.dragging or not self.strip.get_hovered():
+            return
+        win = self.ui.window
+        right = win.input_get_mouse_button_pressed(Button.right)
+        # the right or middle button opens a tab as the left does
+        if right or win.input_get_mouse_button_pressed(Button.middle):
+            emit pressed()
+            at = self.tab_at()
+            if at >= 0:
+                key = self.tabs[at].key
+                if at != self.current:
+                    self.show(at)
+                emit selected(key)
+                if right:
+                    x, y = self.ui.pointer()
+                    emit context(key, x, y)
+
+    set_active(active = true):
+        self.active = active
+
+    # ─── Inside ───
+
+    # a tab from another group, its page with it, opened at the end
+    attach(tab = Tab):
+        tab.page.set_parent(self.body)
+        # where it was drawn is the other strip's: here it starts in place
+        t = tab
+        t.unplace()
+        self.tabs.push(t)
+        self.show(len(self.tabs) - 1, true)
+
+    # the tab at taken out, a neighbour opened when it was the open one
+    let_go(at = 0) -> Tab:
+        gone = self.tabs.remove_at(at)
+        was = self.current
+        if len(self.tabs) == 0:
+            self.current = -1
+            return gone
+        if at < was:
+            self.show(was - 1, true)
+        elif at > was:
+            self.show(was, true)
+        else:
+            # the open one went: the tab now in its place, or the last
+            self.show(min(at, len(self.tabs) - 1), true)
+            emit selected(self.tabs[self.current].key)
+        return gone
+
+    # the tab at put at to among the others, the open one still open
+    shift(at = 0, to = 0):
+        if at == to:
+            return
+        self.tabs.insert(to, self.tabs.remove_at(at))
+        if self.current == at:
+            self.current = to
+        elif at < self.current and self.current <= to:
+            self.current -= 1
+        elif to <= self.current and self.current < at:
+            self.current += 1
+
+    open(key = 0):
+        at = self.index(key)
+        if at >= 0:
+            self.show(at)
+
+    get_open() -> none(int):
+        if self.current >= 0:
+            return self.tabs[self.current].key
+        return none
+
+    get_count() -> int:
+        return len(self.tabs)
+
+    get_keys() -> [int]:
+        out = [int]
+        for t in self.tabs:
+            out.push(t.key)
+        return out
+
+    has(key = 0) -> bool:
+        return self.index(key) >= 0
+
+    set_title(key = 0, title = ""):
+        at = self.index(key)
+        if at >= 0:
+            self.tabs[at].set_title(title)
+
+    set_empty(text = ""):
+        self.empty = text
+
+    index(key = 0) -> int:
+        for i, t in self.tabs.enumerate():
+            if t.key == key:
+                return i
+        return -1
+
+    # the tab at shown, its page the one visible; forced: even when it is
+    # the current index already (the tab there changed)
+    show(at = 0, forced = false):
+        if at == self.current and not forced:
+            return
+        for i, t in self.tabs.enumerate():
+            t.page.set_visible(i == at)
+        self.current = at
+
+    # each tab's width: its padding, its icon, its title, its cross
+    widths() -> [float]:
+        th = self.ui.theme
+        out = [float]
+        for t in self.tabs:
+            w = th.tab_pad * 2.0 + self.ui.measure(t.title, th.size)
+            if t.icon != Icon.none:
+                w += 16.0 + 6.0
+            if t.closable:
+                w += th.tab_close
+            out.push(w)
+        return out
+
+    # the place of the tab at along the strip: its left edge and width
+    slot(at = 0) -> (float, float):
+        x = 0.0
+        for i, w in self.widths().enumerate():
+            if i == at:
+                return x, w
+            x += w
+        return x, 0.0
+
+    # the tab under the pointer, -1 for none
+    tab_at() -> int:
+        px, py = self.strip.get_pointer()
+        x = 0.0
+        for i, w in self.widths().enumerate():
+            if px >= x and px < x + w and py >= 0.0:
+                return i
+            x += w
+        return -1
+
+    # the index of the tab being dragged, -1 for none
+    dragged() -> int:
+        if self.dragging:
+            if key := self.held:
+                return self.index(key)
+        return -1
+
+    press():
+        emit pressed()
+        at = self.tab_at()
+        if at < 0:
+            return
+        th = self.ui.theme
+        px, _ = self.strip.get_pointer()
+        x, w = self.slot(at)
+        key = self.tabs[at].key
+        if self.tabs[at].closable and px >= x + w - th.tab_pad * 0.5 - th.tab_close:
+            emit close_asked(key)
+            return
+        if at != self.current:
+            self.show(at)
+            emit selected(key)
+        self.held = key
+        self.held_from = px
+        self.held_left = x
+        self.dragging = false
+
+    # The held tab carried by the pointer, read as a distance from the
+    # press so the drag holds once it leaves the strip; the tab stays
+    # inside it.  It takes the place its left edge is nearest to: a swap
+    # each time that edge crosses a neighbour's middle, either way.
+    follow_drag():
+        if key := self.held:
+            at = self.index(key)
+            if at < 0 or not self.ui.window.input_get_mouse_button_down(Button.left):
+                self.held = none
+                self.dragging = false
+                return
+            px, _ = self.strip.get_pointer()
+            moved = px - self.held_from
+            if not self.dragging:
+                if abs(moved) < self.ui.theme.drag_start:
+                    return
+                self.dragging = true
+            widths = self.widths()
+            total = 0.0
+            for w in widths:
+                total += w
+            self.drag_x = clamp(self.held_left + moved, 0.0, max(0.0, total - widths[at]))
+            to = 0
+            x = 0.0
+            for i, w in widths.enumerate():
+                if i == at:
+                    continue
+                if self.drag_x > x + w * 0.5:
+                    to += 1
+                x += w
+            self.shift(at, to)
+
+    # each tab eased toward its place by the time since the last frame,
+    # the dragged one where the pointer has carried it
+    slide(widths = [float], dragged = -1):
+        now = self.ui.time
+        k = 1.0 - exp(-(now - self.slid_at) * self.ui.theme.tab_slide)
+        self.slid_at = now
+        x = 0.0
+        for i, w in widths.enumerate():
+            if i == dragged:
+                self.tabs[i].ease_to(self.drag_x)
+            else:
+                self.tabs[i].ease_to(x, k)
+            x += w
+
+    draw_strip():
+        ui = self.ui
+        sx, sy, sw, sh = ui.rect(self.strip)
+        ui.fill(sx, sy, sw, sh, ui.theme.backdrop)
+        widths = self.widths()
+        dragged = self.dragged()
+        self.slide(widths, dragged)
+        for i, w in widths.enumerate():
+            if i != dragged:
+                self.draw_tab(i, sx + self.tabs[i].x, sy, w, sh, false)
+        # the dragged one last: over the tabs it passes
+        if dragged >= 0:
+            self.draw_tab(dragged, sx + self.tabs[dragged].x, sy, widths[dragged], sh, true)
+
+    draw_tab(at = 0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, held = false):
+        ui = self.ui
+        th = ui.theme
+        t = self.tabs[at]
+        px, py = ui.pointer()
+        under = self.strip.get_hovered() and px >= x and px < x + w and py >= y and py < y + h
+        over = held or (under and not self.dragging)
+        if over:
+            ui.want_cursor(Cursor.hand)
+        lit = at == self.current and self.active
+        if lit:
+            ui.fill_top_round(x, y, w, h, th.radius, th.chrome)
+        elif over:
+            ui.fill_top_round(x, y, w, h, th.radius, th.tab_hot)
+        # the dragged tab is marked along its top: it is the one to drop
+        if held:
+            ui.fill(x + th.radius, y, w - th.radius * 2.0, 1.0, th.accent)
+        left = x + th.tab_pad
+        if t.icon != Icon.none:
+            ui.icon(t.icon, left, y + (h - 16.0) * 0.5, 16.0)
+            left += 22.0
+        ink = th.ink if lit else (th.ink_soft if at == self.current else th.ink_muted)
+        ui.text(left, y, w, h, t.title, ink, Align.left + Align.middle, th.size)
+        if t.closable:
+            cx = x + w - th.tab_pad * 0.5 - th.tab_close * 0.5
+            cy = y + h * 0.5
+            hot = under and not self.dragging and px >= x + w - th.tab_pad * 0.5 - th.tab_close
+            if hot:
+                ui.fill_round(cx - 8.0, cy - 8.0, 16.0, 16.0, 3.0, th.hover)
+            cross = th.ink if hot else (th.ink_muted if lit else th.ink_faint)
+            ui.icon(Icon.cross, cx - 7.0, cy - 7.0, 14.0, cross)

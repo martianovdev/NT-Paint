@@ -1,0 +1,34 @@
+# i18n — the program's words in English, Russian and Chinese.  Every text
+# the program shows is looked up by a key; a key a language lacks falls
+# back to English, one English lacks shows as itself.
+#
+#   tr = &Tr(Lang.en)
+#   tr.t("menu.file")            # "File"
+#   tr.set_lang(Lang.ru)
+#   tr.t("menu.file")            # "Файл"
+#   tr.f("status.size", ["800", "600"])   # "{0} × {1}" filled in
+#
+# Inside: strings (the table, a row a key).
+
+package i18n "0.1.0"
+
+enum Lang:
+    en
+    ru
+    zh
+
+Tr in strings:
+    lang = Lang.en
+    init(lang = Lang.en)
+    app_name() -> str
+    set_lang(lang = Lang.en)
+    # the text of a key in the current language
+    t(key = "") -> str
+    # the text with {0}, {1}… replaced by args
+    f(key = "", args = [str]) -> str
+    # the languages as their own names call them, in the order of Lang
+    names() -> [str]
+    # the language's code: "en", "ru", "zh"
+    code() -> str
+    # a language by its code; English for one not known
+    by_code(code = "") -> Lang

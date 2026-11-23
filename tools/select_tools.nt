@@ -1,0 +1,300 @@
+# tools/select_tools — Rectangle Select, Ellipse Select, Lasso Select and
+# the Magic Wand.  A drag shows the selection it would make (joined to
+# the one there by the mode); letting go keeps it as a step.  A click
+# without a drag selects nothing.  Shift keeps a square or a circle.
+
+from window import Cursor
+from raster import Bitmap, Fill, Mask, Rect, SelectMode, Shapes
+from ui import Icon
+from document.document import Document
+from document.history import Step
+from tools.session import SelectionPreview, Session, ToolKind
+from tools.tool import Marks, Modes, Pointer, Tool
+
+ShapeSelect(Tool):
+    which = ToolKind.rect_select
+    down = false
+    moved = false
+    x0 = 0.0
+    y0 = 0.0
+    x1 = 0.0
+    y1 = 0.0
+    points = [float]
+    mode = SelectMode.replace
+    last_x = 0.0
+    last_y = 0.0
+
+    init(which = ToolKind.rect_select):
+        self.which = which
+
+    kind() -> ToolKind:
+        return self.which
+
+    press(s = &Session, p = Pointer()):
+        if s.doc != none:
+            self.down = true
+            self.moved = false
+            self.x0 = p.x
+            self.y0 = p.y
+            self.x1 = p.x
+            self.y1 = p.y
+            self.last_x = p.x
+            self.last_y = p.y
+            self.points = [p.x, p.y]
+            self.mode = Modes.select_mode(s, p)
+
+    update_shape(s = &Session, p = Pointer()) -> bool:
+        dx = p.x - self.last_x
+        dy = p.y - self.last_y
+        self.last_x = p.x
+        self.last_y = p.y
+        if p.both and self.moved:
+            self.x0 += dx
+            self.y0 += dy
+            self.x1 += dx
+            self.y1 += dy
+            for i in range(len(self.points) / 2):
+                self.points[i * 2] += dx
+                self.points[i * 2 + 1] += dy
+            return dx != 0.0 or dy != 0.0
+        previous = (self.x1, self.y1, self.moved, len(self.points))
+        if abs(p.x - self.x0) * s.view.zoom > 2.0 or abs(p.y - self.y0) * s.view.zoom > 2.0:
+            self.moved = true
+        self.x1 = p.x
+        self.y1 = p.y
+        if p.shift and self.which != ToolKind.lasso:
+            side = max(abs(self.x1 - self.x0), abs(self.y1 - self.y0))
+            self.x1 = self.x0 + (side if self.x1 >= self.x0 else -side)
+            self.y1 = self.y0 + (side if self.y1 >= self.y0 else -side)
+        if self.which == ToolKind.lasso:
+            n = len(self.points)
+            lx = self.points[n - 2]
+            ly = self.points[n - 1]
+            if abs(p.x - lx) + abs(p.y - ly) >= 1.0 / s.view.zoom:
+                self.points.push(p.x)
+                self.points.push(p.y)
+        return previous != (self.x1, self.y1, self.moved, len(self.points))
+
+    drag(s = &Session, p = Pointer()):
+        if not self.down:
+            return
+        changed = self.update_shape(s, p)
+        if not self.moved:
+            return
+        if d := s.doc:
+            if self.plain_rectangle(d):
+                if changed or s.selection_preview == none:
+                    preview = &SelectionPreview()
+                    preview.show_rect(self.rectangle().intersect(d.bounds()))
+                    s.set_selection_preview(preview)
+                return
+            area = s.visible_image
+            if area.empty():
+                if s.selection_preview == none or changed:
+                    s.set_selection_preview(&SelectionPreview())
+                return
+            # Use at most one sample per visible pixel, with a cap for large windows.
+            scale = min(1.0, min(s.view.zoom, 640.0 / float(max(area.w, area.h))))
+            w = max(1, int(ceil(float(area.w) * scale)))
+            h = max(1, int(ceil(float(area.h) * scale)))
+            if cached := s.selection_preview:
+                if cached.area == area and cached.width == w and cached.height == h:
+                    if changed:
+                        self.draw_preview(s, d, cached)
+                    return
+            base = Mask()
+            if d.has_selection and self.mode != SelectMode.replace:
+                base = d.selection.sample_region(area, w, h)
+            preview = &SelectionPreview(area, w, h, base)
+            self.draw_preview(s, d, preview)
+            s.set_selection_preview(preview)
+
+    draw_preview(s = &Session, d = &Document, preview = &SelectionPreview):
+        m = self.region(preview.area, preview.width, preview.height, s.settings.antialias)
+        preview.show(s.gpu, Modes.joined(preview.base, d.has_selection, m, self.mode))
+
+    release(s = &Session, p = Pointer()):
+        if not self.down:
+            return
+        _ = self.update_shape(s, p)
+        if not self.moved:
+            self.down = false
+            if d := s.doc:
+                d.deselect()
+            return
+        self.commit(s)
+
+    rectangle() -> Rect:
+        return Rect.around(floor(min(self.x0, self.x1) + 0.5), floor(min(self.y0, self.y1) + 0.5), floor(max(self.x0, self.x1) + 0.5), floor(max(self.y0, self.y1) + 0.5))
+
+    plain_rectangle(d = &Document) -> bool:
+        fresh = not d.has_selection and self.mode != SelectMode.exclude and self.mode != SelectMode.intersect
+        return self.which == ToolKind.rect_select and (fresh or self.mode == SelectMode.replace)
+
+    region(area = Rect(), w = 0, h = 0, aa = true) -> Mask:
+        m = Mask(w, h)
+        sx = float(w) / float(area.w)
+        sy = float(h) / float(area.h)
+        ox = float(area.x)
+        oy = float(area.y)
+        match self.which:
+            case ToolKind.ellipse_select:
+                Shapes.ellipse(&m, (self.x0 - ox) * sx, (self.y0 - oy) * sy, (self.x1 - ox) * sx, (self.y1 - oy) * sy, aa)
+            case ToolKind.lasso:
+                pts = [float]
+                for i in range(len(self.points) / 2):
+                    pts.push((self.points[i * 2] - ox) * sx)
+                    pts.push((self.points[i * 2 + 1] - oy) * sy)
+                Shapes.polygon(&m, pts, aa)
+            case _:
+                box = self.rectangle()
+                l = int(ceil((float(box.x) - ox) * sx - 0.5))
+                t = int(ceil((float(box.y) - oy) * sy - 0.5))
+                r = int(ceil((float(box.right()) - ox) * sx - 0.5))
+                b = int(ceil((float(box.bottom()) - oy) * sy - 0.5))
+                m.fill_rect(Rect(l, t, r - l, b - t))
+        return m
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        if not self.down:
+            return
+        self.down = false
+        s.set_selection_preview()
+        if not self.moved:
+            return
+        if d := s.doc:
+            m = Modes.joined(d.selection, d.has_selection, self.region(d.bounds(), d.width, d.height, s.settings.antialias), self.mode)
+            key = "history.rect_select"
+            if self.which == ToolKind.ellipse_select:
+                key = "history.ellipse_select"
+            elif self.which == ToolKind.lasso:
+                key = "history.lasso_select"
+            rect = none(Rect)
+            if self.plain_rectangle(d):
+                rect = self.rectangle().intersect(d.bounds())
+            d.set_selection(m, key, Modes.selection_icon(self.which), rect = rect)
+
+    overlay(s = &Session):
+        if not self.down or not self.moved:
+            return
+        v = s.view
+        if self.which == ToolKind.lasso:
+            n = len(self.points) / 2
+            for k in range(n - 1):
+                ax, ay = v.to_screen(self.points[k * 2], self.points[k * 2 + 1])
+                bx, by = v.to_screen(self.points[k * 2 + 2], self.points[k * 2 + 3])
+                Marks.ants(s, ax, ay, bx, by)
+            return
+        ax, ay = v.to_screen(self.x0, self.y0)
+        bx, by = v.to_screen(self.x1, self.y1)
+        Marks.box(s, ax, ay, bx, by)
+        for hx in [ax, (ax + bx) * 0.5, bx]:
+            for hy in [ay, (ay + by) * 0.5, by]:
+                if hx != (ax + bx) * 0.5 or hy != (ay + by) * 0.5:
+                    Marks.handle(s, hx, hy)
+
+    busy() -> bool:
+        return self.down
+
+    cursor() -> Cursor:
+        return Cursor.crosshair
+
+    cancel(s = &Session) -> bool:
+        if not self.down:
+            return false
+        self.down = false
+        s.set_selection_preview()
+        return true
+
+    recolor(s = &Session):
+        pass
+
+# the pixels like the one clicked, of the layer or the whole picture
+MagicWand(Tool):
+    # the click, the pixels it looked at, the selection before it and the
+    # step it made: redone while that step is the last one done, when an
+    # option changes (tolerance, flood mode, sampling, selection mode)
+    x = 0
+    y = 0
+    at = Pointer()
+    pixels = Bitmap()
+    sampled_image = false
+    before = Mask()
+    had = false
+    kept = none(&Document)
+    kept_step = none(&Step)
+
+    kind() -> ToolKind:
+        return ToolKind.magic_wand
+
+    press(s = &Session, p = Pointer()):
+        if d := s.doc:
+            x = int(floor(p.x))
+            y = int(floor(p.y))
+            if x < 0 or y < 0 or x >= d.width or y >= d.height:
+                return
+            self.x = x
+            self.y = y
+            self.at = p
+            self.pixels = d.flattened_pixels() if s.settings.sample_image else d.layer_pixels(d.current)
+            self.sampled_image = s.settings.sample_image
+            self.before = d.selection.copy()
+            self.had = d.has_selection
+            self.select(s)
+
+    select(s = &Session):
+        if d := s.doc:
+            st = s.settings
+            if st.sample_image != self.sampled_image:
+                self.pixels = d.flattened_pixels() if st.sample_image else d.layer_pixels(d.current)
+                self.sampled_image = st.sample_image
+            region = Fill.flood(self.pixels, self.x, self.y, st.tolerance / 100.0, not st.global_fill)
+            m = Modes.joined(self.before, self.had, region, Modes.select_mode(s, self.at))
+            d.set_selection(m, "history.magic_wand", Icon.tool_magic_wand, self.before, self.had)
+            h = d.history
+            self.kept = d
+            self.kept_step = none
+            if h.at > 0:
+                self.kept_step = h.steps[h.at - 1]
+
+    cancel(s = &Session) -> bool:
+        return false
+
+    recolor(s = &Session):
+        if d := s.doc:
+            if k := self.kept:
+                if step := self.kept_step:
+                    h = d.history
+                    if k is d and h.at == len(h.steps) and h.at > 0 and h.steps[h.at - 1] is step:
+                        d.undo()
+                        self.select(s)
+
+    drag(s = &Session, p = Pointer()):
+        pass
+
+    release(s = &Session, p = Pointer()):
+        pass
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        pass
+
+    overlay(s = &Session):
+        pass
+
+    busy() -> bool:
+        return false
+
+    cursor() -> Cursor:
+        return Cursor.crosshair

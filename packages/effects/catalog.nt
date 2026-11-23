@@ -1,0 +1,77 @@
+# catalog — what the Adjustments and Effects menus hold, in paint.net's
+# order; titles and parameter names are translation keys.
+
+from effects import EffectInfo, Effects, Param, ParamKind
+
+extend Effects:
+    menus() -> [str]:
+        return ["photo", "distort", "object", "blur", "stylize", "render", "artistic", "noise"]
+
+    catalog() -> [EffectInfo]:
+        out = [EffectInfo]
+        n = ParamKind.number
+        ang = ParamKind.angle
+        tog = ParamKind.toggle
+        # Adjustments
+        out.push(EffectInfo("auto_level", "adjust", [Param], "Ctrl+Shift+L"))
+        out.push(EffectInfo("invert_alpha", "adjust", [Param], "Ctrl+Alt+I"))
+        out.push(EffectInfo("invert_colors", "adjust", [Param], "Ctrl+Shift+I"))
+        out.push(EffectInfo("curves", "adjust", [Param("p.shadows", n, -100.0, 100.0, 0.0), Param("p.midtones", n, -100.0, 100.0, 0.0), Param("p.highlights", n, -100.0, 100.0, 0.0)], "Ctrl+Shift+M"))
+        out.push(EffectInfo("hue_saturation", "adjust", [Param("p.hue", n, -180.0, 180.0, 0.0), Param("p.saturation", n, 0.0, 200.0, 100.0), Param("p.lightness", n, -100.0, 100.0, 0.0)], "Ctrl+Shift+U"))
+        out.push(EffectInfo("posterize", "adjust", [Param("p.red", n, 2.0, 64.0, 16.0), Param("p.green", n, 2.0, 64.0, 16.0), Param("p.blue", n, 2.0, 64.0, 16.0)], "Ctrl+Shift+P"))
+        out.push(EffectInfo("shadows_highlights", "adjust", [Param("p.shadows", n, 0.0, 100.0, 30.0), Param("p.highlights", n, 0.0, 100.0, 0.0)]))
+        out.push(EffectInfo("black_white", "adjust", [Param], "Ctrl+Shift+G"))
+        out.push(EffectInfo("sepia", "adjust", [Param], "Ctrl+Shift+E"))
+        out.push(EffectInfo("temperature", "adjust", [Param("p.temperature", n, -100.0, 100.0, 0.0), Param("p.tint", n, -100.0, 100.0, 0.0)]))
+        out.push(EffectInfo("levels", "adjust", [Param("p.in_black", n, 0.0, 254.0, 0.0), Param("p.in_white", n, 1.0, 255.0, 255.0), Param("p.gamma", n, 0.1, 10.0, 1.0, 2), Param("p.out_black", n, 0.0, 254.0, 0.0), Param("p.out_white", n, 1.0, 255.0, 255.0)], "Ctrl+L"))
+        out.push(EffectInfo("exposure", "adjust", [Param("p.exposure", n, -5.0, 5.0, 0.0, 2)]))
+        out.push(EffectInfo("brightness_contrast", "adjust", [Param("p.brightness", n, -100.0, 100.0, 0.0), Param("p.contrast", n, -100.0, 100.0, 0.0)], "Ctrl+Shift+T"))
+        # Effects › Photo
+        out.push(EffectInfo("glow", "photo", [Param("p.radius", n, 1.0, 20.0, 6.0), Param("p.brightness", n, -100.0, 100.0, 10.0), Param("p.contrast", n, -100.0, 100.0, 10.0)]))
+        out.push(EffectInfo("sharpen", "photo", [Param("p.amount", n, 1.0, 20.0, 2.0)]))
+        out.push(EffectInfo("soften_portrait", "photo", [Param("p.softness", n, 0.0, 10.0, 5.0), Param("p.lighting", n, -20.0, 20.0, 0.0), Param("p.warmth", n, 0.0, 20.0, 10.0)]))
+        out.push(EffectInfo("vignette", "photo", [Param("p.radius", n, 10.0, 400.0, 50.0), Param("p.density", n, 0.0, 100.0, 100.0), Param("p.center_x", n, -1.0, 1.0, 0.0, 2), Param("p.center_y", n, -1.0, 1.0, 0.0, 2)]))
+        # Effects › Distort
+        out.push(EffectInfo("bulge", "distort", [Param("p.amount", n, -200.0, 100.0, 45.0), Param("p.center_x", n, -1.0, 1.0, 0.0, 2), Param("p.center_y", n, -1.0, 1.0, 0.0, 2)]))
+        out.push(EffectInfo("dents", "distort", [Param("p.scale", n, 2.0, 200.0, 25.0), Param("p.amount", n, 0.0, 10.0, 5.0)]))
+        out.push(EffectInfo("frosted_glass", "distort", [Param("p.amount", n, 1.0, 20.0, 3.0)]))
+        out.push(EffectInfo("pixelate", "distort", [Param("p.cell_size", n, 1.0, 100.0, 2.0)]))
+        out.push(EffectInfo("polar_inversion", "distort", [Param("p.amount", n, 0.0, 4.0, 1.0, 2), Param("p.center_x", n, -1.0, 1.0, 0.0, 2), Param("p.center_y", n, -1.0, 1.0, 0.0, 2)]))
+        out.push(EffectInfo("tile_reflection", "distort", [Param("p.tile_size", n, 2.0, 200.0, 40.0), Param("p.curvature", n, -10.0, 10.0, 8.0)]))
+        out.push(EffectInfo("twist", "distort", [Param("p.amount", n, -100.0, 100.0, 30.0), Param("p.center_x", n, -1.0, 1.0, 0.0, 2), Param("p.center_y", n, -1.0, 1.0, 0.0, 2)]))
+        # Effects › Object
+        out.push(EffectInfo("drop_shadow", "object", [Param("p.offset_x", n, -100.0, 100.0, 4.0), Param("p.offset_y", n, -100.0, 100.0, 4.0), Param("p.blur", n, 0.0, 50.0, 4.0), Param("p.opacity", n, 0.0, 100.0, 50.0)]))
+        out.push(EffectInfo("outline_object", "object", [Param("p.thickness", n, 1.0, 30.0, 3.0)]))
+        # Effects › Blurs
+        out.push(EffectInfo("fragment", "blur", [Param("p.fragments", n, 2.0, 50.0, 4.0), Param("p.distance", n, 0.0, 100.0, 8.0), Param("p.rotation", ang, -180.0, 180.0, 0.0)]))
+        out.push(EffectInfo("gaussian_blur", "blur", [Param("p.radius", n, 0.0, 200.0, 2.0)]))
+        out.push(EffectInfo("motion_blur", "blur", [Param("p.angle", ang, -180.0, 180.0, 25.0), Param("p.distance", n, 1.0, 200.0, 10.0), Param("p.centered", tog, 0.0, 1.0, 1.0)]))
+        out.push(EffectInfo("radial_blur", "blur", [Param("p.angle", n, 0.0, 360.0, 2.0), Param("p.center_x", n, -1.0, 1.0, 0.0, 2), Param("p.center_y", n, -1.0, 1.0, 0.0, 2)]))
+        out.push(EffectInfo("surface_blur", "blur", [Param("p.radius", n, 1.0, 25.0, 6.0), Param("p.threshold", n, 0.0, 100.0, 50.0)]))
+        out.push(EffectInfo("unfocus", "blur", [Param("p.radius", n, 1.0, 50.0, 4.0)]))
+        out.push(EffectInfo("zoom_blur", "blur", [Param("p.amount", n, 0.0, 100.0, 10.0), Param("p.center_x", n, -1.0, 1.0, 0.0, 2), Param("p.center_y", n, -1.0, 1.0, 0.0, 2)]))
+        # Effects › Stylize
+        out.push(EffectInfo("edge_detect", "stylize", [Param("p.angle", ang, -180.0, 180.0, 45.0)]))
+        out.push(EffectInfo("emboss", "stylize", [Param("p.angle", ang, -180.0, 180.0, 0.0)]))
+        out.push(EffectInfo("outline", "stylize", [Param("p.thickness", n, 1.0, 20.0, 3.0), Param("p.intensity", n, 0.0, 100.0, 50.0)]))
+        out.push(EffectInfo("relief", "stylize", [Param("p.angle", ang, -180.0, 180.0, 45.0)]))
+        # Effects › Render
+        out.push(EffectInfo("clouds", "render", [Param("p.scale", n, 2.0, 1000.0, 250.0), Param("p.roughness", n, 0.0, 100.0, 50.0), Param("p.seed", ParamKind.seed, 0.0, 9999.0, 0.0), Param("p.blend_mode", ParamKind.choice, 0.0, 13.0, 0.0, 0, ["blend.normal", "blend.multiply", "blend.additive", "blend.color_burn", "blend.color_dodge", "blend.reflect", "blend.glow", "blend.overlay", "blend.difference", "blend.negation", "blend.lighten", "blend.darken", "blend.screen", "blend.xor"])]))
+        out.push(EffectInfo("julia", "render", [Param("p.factor", n, 1.0, 10.0, 4.0), Param("p.zoom", n, 0.0, 50.0, 1.0), Param("p.quality", n, 1.0, 5.0, 2.0), Param("p.angle", ang, -180.0, 180.0, 0.0)]))
+        out.push(EffectInfo("mandelbrot", "render", [Param("p.factor", n, 1.0, 10.0, 1.0), Param("p.zoom", n, 0.0, 50.0, 10.0), Param("p.quality", n, 1.0, 5.0, 2.0), Param("p.angle", ang, -180.0, 180.0, 0.0)]))
+        # Effects › Artistic
+        out.push(EffectInfo("ink_sketch", "artistic", [Param("p.ink_outline", n, 0.0, 99.0, 50.0), Param("p.coloring", n, 0.0, 100.0, 50.0)]))
+        out.push(EffectInfo("oil_painting", "artistic", [Param("p.brush_size", n, 1.0, 8.0, 3.0), Param("p.coarseness", n, 3.0, 255.0, 50.0)]))
+        out.push(EffectInfo("pencil_sketch", "artistic", [Param("p.tip_size", n, 1.0, 20.0, 2.0), Param("p.range", n, -20.0, 20.0, 0.0)]))
+        # Effects › Noise
+        out.push(EffectInfo("add_noise", "noise", [Param("p.intensity", n, 0.0, 100.0, 64.0), Param("p.color_saturation", n, 0.0, 400.0, 100.0), Param("p.coverage", n, 0.0, 100.0, 100.0)]))
+        out.push(EffectInfo("median", "noise", [Param("p.radius", n, 1.0, 20.0, 4.0), Param("p.percentile", n, 0.0, 100.0, 50.0)]))
+        out.push(EffectInfo("reduce_noise", "noise", [Param("p.radius", n, 1.0, 20.0, 6.0), Param("p.strength", n, 0.0, 1.0, 0.4, 2)]))
+        _ = tog
+        return out
+
+    find(id = "") -> none(EffectInfo):
+        for e in Effects.catalog():
+            if e.id == id:
+                return e
+        return none

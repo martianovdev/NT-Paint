@@ -1,0 +1,180 @@
+# workspace/form — a dialog over everything, as paint.net's: the window
+# left as it is (an effect's preview shows behind), a panel in the middle with a title strip and a close cross, rows
+# of a name and its controls, and OK and Cancel at the bottom right.  The
+# owner fills body with rows (Form.row) each time it opens one; Enter
+# answers OK, Escape Cancel.  Its title strip drags it.
+
+from graphics import Align
+from window import Button as Mouse, Cursor, Key
+from view import Layout, View
+from ui import Button, Icon, Ui
+
+Form:
+    # the answer: true for OK
+    event answered(ok = true)
+    ui = &Ui
+    backdrop = &View
+    panel = &View
+    body = &View
+    buttons = &View
+    ok = &Button
+    cancel = &Button
+    spacer = &View
+    # the rows' views and what else the owner made in the body: kept while
+    # the dialog is open (a parent does not keep its children)
+    views = [&View]
+    title = ""
+    is_open = false
+    width = 420.0
+    strip = 28.0
+    # moved by its strip from the middle; held
+    mx = 0.0
+    my = 0.0
+    dragging = false
+
+    init(ui = &Ui):
+        self.ui = ui
+        self.backdrop = ui.create(Layout.free)
+        self.backdrop.set_expand(true)
+        self.panel = ui.create(Layout.vertical)
+        pad = ui.theme.dialog_inset
+        self.panel.set_padding(pad, self.strip + pad, pad, pad)
+        self.panel.set_gap(0.0, 12.0)
+        self.body = ui.create(Layout.vertical, self.panel)
+        self.body.set_gap(0.0, 6.0)
+        self.buttons = ui.create(Layout.horizontal, self.panel)
+        self.buttons.set_gap(8.0, 0.0)
+        self.spacer = ui.create(Layout.free, self.buttons)
+        self.spacer.set_expand(true)
+        self.ok = &Button(ui, self.buttons, "OK", true)
+        self.cancel = &Button(ui, self.buttons, "Cancel")
+        on self.ok.pressed():
+            self.answer(true)
+        on self.cancel.pressed():
+            self.answer(false)
+        # the backdrop only keeps the pointer from what is under it
+        on self.backdrop.draw():
+            pass
+        on self.panel.draw():
+            self.draw()
+            self.panel.render_children()
+        on self.panel.click():
+            if self.close_hot():
+                self.answer(false)
+        on self.panel.mouse_down():
+            _, py = self.panel.get_pointer()
+            if py < self.strip and not self.close_hot():
+                self.dragging = true
+
+    # the body emptied and the dialog shown; the caller then adds rows
+    open(title = "", width = 420.0, ok = "OK", cancel = "Cancel"):
+        self.title = title
+        self.width = width
+        self.ok.set_text(ok)
+        self.cancel.set_text(cancel)
+        old = self.body
+        old.set_parent(none)
+        self.views.clear()
+        self.body = self.ui.create(Layout.vertical)
+        self.body.set_gap(0.0, 6.0)
+        self.buttons.set_parent(none)
+        self.body.set_parent(self.panel)
+        self.buttons.set_parent(self.panel)
+        self.panel.set_min_size(width, 0.0)
+        self.panel.set_max_size(width, 4000.0)
+        self.backdrop.set_parent(self.ui.layer)
+        self.panel.set_parent(self.ui.layer)
+        self.ui.views.set_focus(none)
+        self.mx = 0.0
+        self.my = 0.0
+        self.dragging = false
+        self.is_open = true
+
+    # a view made for the dialog, kept while it is open
+    keep(v = &View) -> &View:
+        self.views.push(v)
+        return v
+
+    close():
+        if not self.is_open:
+            return
+        self.panel.set_parent(none)
+        self.backdrop.set_parent(none)
+        self.is_open = false
+
+    get_open() -> bool:
+        return self.is_open
+
+    # a row: the name on the left, a box for the controls after it
+    row(name = "", label = 130.0, height = 24.0) -> &View:
+        r = self.keep(self.ui.create(Layout.horizontal, self.body))
+        r.set_min_size(0.0, height)
+        r.set_gap(6.0, 0.0)
+        ui = self.ui
+        l = self.keep(ui.create(Layout.free, r))
+        l.set_min_size(label, height)
+        l.set_max_size(label, height)
+        on l.draw():
+            x, y, w, h = ui.rect(l)
+            ui.text(x, y, w, h, name, ui.theme.ink, Align.left + Align.middle, ui.theme.size)
+        return r
+
+    # a line of text across the body (a heading, a note)
+    note(text = "", rgb = -1):
+        ui = self.ui
+        v = self.keep(ui.create(Layout.free, self.body))
+        v.set_min_size(0.0, 20.0)
+        on v.draw():
+            x, y, w, h = ui.rect(v)
+            ui.text(x, y, w, h, text, rgb if rgb >= 0 else ui.theme.ink_muted, Align.left + Align.middle, ui.theme.size)
+
+    update():
+        if not self.is_open:
+            return
+        win = self.ui.window
+        # placed in the middle once laid out
+        _, _, lw, lh = self.ui.rect(self.ui.layer)
+        _, _, pw, ph = self.ui.rect(self.panel)
+        if self.dragging:
+            if win.input_get_mouse_button_down(Mouse.left):
+                self.mx += float(win.input_get_mouse_x_speed())
+                self.my += float(win.input_get_mouse_y_speed())
+            else:
+                self.dragging = false
+        x = clamp(floor((lw - pw) * 0.5 + self.mx), 0.0, max(lw - pw, 0.0))
+        y = clamp(floor((lh - ph) * 0.42 + self.my), 0.0, max(lh - ph, 0.0))
+        self.mx = x - floor((lw - pw) * 0.5)
+        self.my = y - floor((lh - ph) * 0.42)
+        self.panel.set_offset(x, y)
+        if self.ui.get_keys_held():
+            return
+        if win.input_get_key_pressed(Key.enter):
+            self.answer(true)
+        elif win.input_get_key_pressed(Key.escape):
+            self.answer(false)
+
+    answer(ok = true):
+        self.close()
+        emit answered(ok)
+
+    close_hot() -> bool:
+        px, py = self.panel.get_pointer()
+        _, _, w, _ = self.ui.rect(self.panel)
+        return px >= w - 26.0 and px < w - 6.0 and py >= 5.0 and py < 23.0
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.panel)
+        ui.fill_round(x + 2.0, y + 4.0, w, h, 8.0, 0x000000, 0.35)
+        ui.fill_round(x, y, w, h, 8.0, t.panel)
+        ui.fill_top_round(x, y, w, self.strip, 8.0, t.chrome)
+        ui.line(x + 1.0, y + self.strip, x + w - 1.0, y + self.strip, t.panel_edge)
+        ui.outline_round(x, y, w, h, 8.0, t.field_edge)
+        ui.text(x + 12.0, y, w - 40.0, self.strip, self.title, t.ink, Align.left + Align.middle, t.size)
+        hot = self.panel.get_hovered() and self.close_hot()
+        if hot:
+            ui.fill_round(x + w - 26.0, y + 5.0, 20.0, 18.0, 4.0, t.hover)
+        ui.icon(Icon.close_x, x + w - 22.0, y + 8.0, 12.0, t.ink if hot else t.close)
+        if hot:
+            ui.want_cursor(Cursor.hand)

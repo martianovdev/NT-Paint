@@ -1,0 +1,105 @@
+# widgets/status_badge — what is going on, on a soft plate over a box the
+# owner gives (a tab's page): in its bottom right corner, a margin in, a
+# turning circle and the text.  It fades in once the status has lasted a
+# moment (a short one shows nothing, so nothing flickers) and out when it
+# is over.  It is drawn over everything (the layer) and takes no pointer.
+# Times are the system clock's: a build may hold frames back.
+
+from ui import StatusBadge
+from graphics import Align
+from time import Time
+from view import Layout
+
+extend StatusBadge:
+    # as set, as shown (kept while it fades out), since when (seconds),
+    # how much it shows (0..1), when it was drawn last; the box
+    status = ""
+    shown = ""
+    since = 0.0
+    alpha = 0.0
+    drawn = -1.0
+    bx = 0.0
+    by = 0.0
+    bw = 0.0
+    bh = 0.0
+
+    init(ui = &Ui):
+        self.ui = ui
+        self.view = ui.create(Layout.free)
+        self.view.set_expand(true)
+        self.view.set_pickable(false)
+        on self.view.draw():
+            self.draw()
+
+    set_status(text = "", x = 0.0, y = 0.0, w = 0.0, h = 0.0):
+        if text != "" and self.status == "":
+            self.since = Clock.now()
+            self.drawn = -1.0
+        self.status = text
+        if text != "":
+            self.shown = text
+            self.bx = x
+            self.by = y
+            self.bw = w
+            self.bh = h
+            self.view.set_parent(self.ui.layer)
+
+    get_showing() -> bool:
+        return self.alpha > 0.0 or self.status != ""
+
+    # ─── Inside ───
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        now = Clock.now()
+        dt = 0.0 if self.drawn < 0.0 else clamp(now - self.drawn, 0.0, 0.1)
+        self.drawn = now
+        want = 1.0 if self.status != "" and now - self.since >= 0.3 else 0.0
+        step = dt * 5.0
+        if self.alpha < want:
+            self.alpha = min(want, self.alpha + step)
+        else:
+            self.alpha = max(want, self.alpha - step)
+        if self.alpha <= 0.0:
+            if self.status == "":
+                self.view.set_parent(none)
+            return
+        a = self.alpha
+        h = 26.0
+        margin = 12.0
+        tw = min(ui.measure(self.shown, t.small), max(self.bw - margin * 2.0 - h - 14.0, 40.0))
+        pw = tw + h + 14.0
+        px = self.bx + self.bw - margin - pw
+        # above the line of hints an editor writes along its bottom
+        py = self.by + self.bh - 36.0 - h
+        ui.fill_round(px, py, pw, h, h * 0.5, t.menu_panel, 0.85 * a)
+        # eight dots on a circle, the brightest going round
+        cx = px + h * 0.5 + 2.0
+        cy = py + h * 0.5
+        r = h * 0.22
+        turn = now * 1.6
+        turn = turn - floor(turn)
+        for k in range(8):
+            part = float(k) / 8.0
+            lag = turn - part
+            lag = lag - floor(lag)
+            angle = 6.2831853 * part
+            ui.circle(cx + cos(angle) * r, cy + sin(angle) * r, 1.6, t.accent, a * (0.2 + 0.8 * (1.0 - lag)))
+        ui.text(px + h + 4.0, py, tw + 4.0, h, self.shown, Fade.mix(t.menu_panel, t.ink_soft, a), Align.left + Align.middle, t.small)
+
+Clock:
+    # seconds by the system's clock
+    now() -> float:
+        return float(Time().millis()) / 1000.0
+
+Fade:
+    # the colour from a to b by f (0..1), as 0xRRGGBB
+    mix(a = 0, b = 0, f = 0.0) -> int:
+        out = 0
+        for shift in [16, 8, 0]:
+            ca = (a >> shift) & 255
+            cb = (b >> shift) & 255
+            c = int(float(ca) + (float(cb) - float(ca)) * clamp(f, 0.0, 1.0))
+            out = out | (c << shift)
+        return out

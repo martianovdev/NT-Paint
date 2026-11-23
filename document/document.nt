@@ -1,0 +1,629 @@
+# document/document — an open picture: its layers (GPU surfaces), the one
+# being worked on, the selection (a CPU mask, shown by its outline and
+# handed to shaders as a texture), its history, its file and how it is
+# viewed.  Every change goes through a method here that records a step.
+
+from graphics import Surface, Texture
+from raster import Bitmap, Mask, Rect
+from imaging import BlendMode, Compositor, Gpu, LayerInput, Transforms
+from ui import Icon
+from document.layer import Layer, LayerState
+from document.pdn import Pdn, PdnImage, PdnLayer
+from document.history import History, Step, StepKind
+
+Document:
+    # pixels, layers or the selection changed: drawn again, panels told
+    event changed()
+    gpu = &Gpu
+    width = 0
+    height = 0
+    layers = [&Layer]
+    current = 0
+    selection = Mask
+    has_selection = false
+    history = &History()
+    # the file it was read from or saved to; its name; "" for a new one
+    path = ""
+    name = ""
+    pdn_metadata = [(str, str)]
+    # the history's place when it was last saved
+    saved_at = 0
+    # every change counts: who shows it draws again when it moved
+    version = 0
+    # the view: zoom and where the picture's top left is in the canvas
+    zoom = 1.0
+    ox = 0.0
+    oy = 0.0
+    fitted = false
+    compositor = &Compositor
+    composed = -1
+    display_levels = [&Surface]
+    display_valid = 0
+    display_size = (0, 0)
+    sel_tex = none(&Texture)
+    selection_revision = 0
+    selection_rect = none(Rect)
+    sel_box = none(Rect)
+    # the step history counts from: "New Image" or "Open Image"
+    origin = ""
+    # each new layer's number, as paint.net names them "Layer 2"
+    next_layer = 2
+
+    init(gpu = &Gpu, width = 1, height = 1):
+        self.gpu = gpu
+        self.width = width
+        self.height = height
+        self.compositor = &Compositor(gpu)
+        self.selection = Mask(width, height)
+
+    # a picture of one background layer filled with a colour
+    blank(gpu = &Gpu, width = 800, height = 600, fill = 0xFFFFFFFF, background = "Background") -> &Document:
+        d = &Document(gpu, width, height)
+        s = gpu.surface(width, height)
+        gpu.clear(s, fill)
+        d.add_first(&Layer(s, background))
+        d.set_origin("history.new_image")
+        return d
+
+    # a picture of a bitmap read from a file
+    from_bitmap(gpu = &Gpu, b = Bitmap(), path = "", name = "", background = "Background") -> &Document:
+        d = &Document(gpu, b.width, b.height)
+        d.add_first(&Layer(gpu.upload(b), background))
+        d.set_file(path, name)
+        d.set_origin("history.open_image")
+        return d
+
+    from_pdn(gpu = &Gpu, image = PdnImage(), path = "", name = "") -> &Document:
+        d = &Document(gpu, image.width, image.height)
+        d.load_pdn_layers(image)
+        d.set_file(path, name)
+        d.set_origin("history.open_image")
+        return d
+
+    load_pdn_layers(image = PdnImage()):
+        for layer in image.layers:
+            mode = BlendMode.normal + i32(layer.mode)
+            self.layers.push(&Layer(self.gpu.upload(layer.bitmap), layer.name, layer.visible, layer.opacity, mode, layer.background, layer.metadata))
+        self.pdn_metadata = image.metadata
+        self.next_layer = len(self.layers) + 1
+
+    encode_pdn() -> none([u8]):
+        if not Pdn.valid_size(self.width, self.height, len(self.layers)):
+            return none
+        image = PdnImage(self.width, self.height, self.pdn_metadata)
+        for i, layer in self.layers.enumerate():
+            image.layers.push(PdnLayer(self.layer_pixels(i), layer.name, layer.visible, layer.pdn_background, layer.opacity, int(layer.mode), layer.pdn_metadata))
+        return Pdn.encode(image)
+
+    add_first(l = &Layer):
+        self.layers.push(l)
+        self.current = 0
+
+    set_origin(key = ""):
+        self.origin = key
+
+    set_file(path = "", name = ""):
+        self.path = path
+        self.name = name
+
+    # ─── State ───
+
+    layer() -> &Layer:
+        return self.layers[clamp(self.current, 0, len(self.layers) - 1)]
+
+    bounds() -> Rect:
+        return Rect(0, 0, self.width, self.height)
+
+    touch(pixels = true):
+        if not pixels and self.composed == self.version:
+            self.composed += 1
+        self.version += 1
+        emit changed()
+
+    dirty() -> bool:
+        return self.history.at != self.saved_at
+
+    mark_saved():
+        self.saved_at = self.history.at
+        self.touch()
+
+    set_view(zoom = 1.0, ox = 0.0, oy = 0.0):
+        self.zoom = zoom
+        self.ox = ox
+        self.oy = oy
+        self.fitted = true
+
+    # the layers blended, made again when anything changed
+    composite() -> &Texture:
+        if self.composed != self.version:
+            self.composed = self.version
+            self.display_valid = 0
+            if self.display_size != (self.width, self.height):
+                self.display_levels.clear()
+                self.display_size = (self.width, self.height)
+            inputs = [LayerInput]
+            for l in self.layers:
+                inputs.push(LayerInput(l.surface.get_texture(), l.visible, l.opacity, l.mode))
+            return self.compositor.compose(inputs, self.width, self.height)
+        if t := self.compositor.get_texture():
+            return t
+        self.composed = -1
+        return self.composite()
+
+    # Reuse reduced GPU images while zoom, pan, and selection change.
+    display_texture(zoom = 1.0) -> &Texture:
+        original = self.composite()
+        if zoom >= 0.5:
+            return original
+        if source := self.compositor.get_surface():
+            level = 0
+            scale = zoom
+            while scale < 0.5 and (source.get_width() > 1 or source.get_height() > 1):
+                if level == self.display_valid:
+                    if level < len(self.display_levels):
+                        Transforms.resize_into(self.gpu, source, self.display_levels[level])
+                    else:
+                        w = (source.get_width() + 1) / 2
+                        h = (source.get_height() + 1) / 2
+                        self.display_levels.push(Transforms.resized(self.gpu, source, w, h))
+                    self.display_valid += 1
+                source = self.display_levels[level]
+                level += 1
+                scale *= 2.0
+            return source.get_texture()
+        return original
+
+    # the picture as one bitmap (what earlier frames drew)
+    flattened_pixels() -> Bitmap:
+        _ = self.composite()
+        if s := self.compositor.get_surface():
+            return self.gpu.download(s)
+        return Bitmap(self.width, self.height)
+
+    layer_pixels(index = 0) -> Bitmap:
+        return self.gpu.download(self.layers[clamp(index, 0, len(self.layers) - 1)].surface)
+
+    # ─── Selection ───
+
+    # the selection as a texture for shaders; none when nothing is selected
+    sel_texture() -> none(&Texture):
+        if not self.has_selection:
+            return none
+        if t := self.sel_tex:
+            return t
+        t = self.gpu.mask_texture(self.selection)
+        self.sel_tex = t
+        return t
+
+    # what is selected, or the whole picture when nothing is
+    sel_bounds() -> Rect:
+        b = self.selection_bounds()
+        return self.bounds() if b.empty() else b
+
+    selection_bounds() -> Rect:
+        if not self.has_selection:
+            return Rect()
+        if b := self.sel_box:
+            return b
+        b = self.selection.bounds()
+        self.sel_box = b
+        return b
+
+    # the selection without a step (a tool showing it as it is dragged)
+    show_selection(m = Mask(), has = true, pixels = true, rect = none(Rect)):
+        self.selection = m
+        if box := rect:
+            self.has_selection = has and not box.empty()
+        else:
+            self.has_selection = has and not m.is_empty()
+        self.sel_tex = none
+        self.selection_rect = rect
+        self.sel_box = rect
+        self.selection_revision += 1
+        self.touch(pixels)
+
+    # the selection made m (a step of history titled by key)
+    set_selection(m = Mask(), title = "", icon = Icon.tool_rect_select, before = none(Mask), had_before = false, rect = none(Rect)):
+        old = before.or(self.selection.copy())
+        had = had_before if before != none else self.has_selection
+        self.show_selection(m, true, false, rect)
+        step = &Step(title, icon, StepKind.selection)
+        step.set_selection(old, had, self.selection.copy(), self.has_selection)
+        self.history.push(step)
+        self.touch(false)
+
+    select_all():
+        m = Mask(self.width, self.height, 255)
+        self.set_selection(m, "history.select_all", Icon.act_select_all, rect = self.bounds())
+
+    deselect():
+        if not self.has_selection:
+            return
+        self.set_selection(Mask(self.width, self.height), "history.deselect", Icon.act_deselect)
+        self.has_selection = false
+
+    invert_selection():
+        m = self.selection.copy()
+        if not self.has_selection:
+            m = Mask(self.width, self.height)
+        m.invert()
+        self.set_selection(m, "history.invert_selection", Icon.act_invert_selection)
+
+    # ─── Pixels ───
+
+    # a layer's rectangle changed from what base (the layer before, at
+    # its size) held: a step titled by key
+    commit_pixels(base = &Surface, title = "", icon = Icon.history_item, index = 0, r = Rect(), sel_before = none(Mask), had_sel = false):
+        c = r.clip(self.width, self.height)
+        if c.empty():
+            self.touch()
+            return
+        g = self.gpu
+        l = self.layers[index]
+        before = g.surface(c.w, c.h)
+        after = g.surface(c.w, c.h)
+        g.blit(before, base.get_texture(), self.width, self.height, c.x, c.y, 0, 0, c.w, c.h)
+        g.blit(after, l.surface.get_texture(), self.width, self.height, c.x, c.y, 0, 0, c.w, c.h)
+        step = &Step(title, icon, StepKind.pixels)
+        step.set_pixels(before, after, index, c)
+        if m := sel_before:
+            step.set_selection(m, had_sel, self.selection.copy(), self.has_selection)
+        self.history.push(step)
+        self.touch()
+
+    # ─── Layers and their states ───
+
+    states() -> [LayerState]:
+        out = [LayerState]
+        for l in self.layers:
+            out.push(l.state())
+        return out
+
+    restore(states = [LayerState], size = (0, 0), current = 0):
+        self.layers.clear()
+        for s in states:
+            if surf := s.surface:
+                self.layers.push(&Layer(surf, s.name, s.visible, s.opacity, s.mode, s.pdn_background, s.pdn_metadata))
+        w, h = size
+        if w != self.width or h != self.height:
+            self.width = w
+            self.height = h
+        self.current = clamp(current, 0, len(self.layers) - 1)
+
+    # a step of the layers' states from before (states, size, current) to
+    # now; with the selection when sel_before is given
+    push_state(title = "", icon = Icon.history_item, before = [LayerState], size = (0, 0), current = 0, sel_before = none(Mask), had_sel = false):
+        step = &Step(title, icon, StepKind.state)
+        step.set_states(before, self.states(), size, (self.width, self.height), current, self.current)
+        if m := sel_before:
+            step.set_selection(m, had_sel, self.selection.copy(), self.has_selection)
+        self.history.push(step)
+        self.touch()
+
+    set_current(index = 0):
+        self.current = clamp(index, 0, len(self.layers) - 1)
+        self.touch()
+
+    # a new see-through layer above the current one, named name with its
+    # number filled in for {0}
+    add_layer(name = "Layer {0}"):
+        before = self.states()
+        cur = self.current
+        s = self.gpu.surface(self.width, self.height)
+        self.gpu.clear(s, 0)
+        _ = self.insert_layer(s, name)
+        self.push_state("history.add_layer", Icon.layer_add, before, (self.width, self.height), cur)
+
+    # a layer of a bitmap's pixels (pasted or imported) above the current
+    # a new layer above the current one holding b, its top left at x, y
+    add_layer_of(b = Bitmap(), name = "", title = "history.paste_new_layer", x = 0, y = 0) -> &Layer:
+        before = self.states()
+        cur = self.current
+        s = self.gpu.surface(self.width, self.height)
+        self.gpu.clear(s, 0)
+        if b.width > 0:
+            up = self.gpu.upload(b)
+            dx = clamp(x, 0, max(self.width - b.width, 0))
+            dy = clamp(y, 0, max(self.height - b.height, 0))
+            self.gpu.blit(s, up.get_texture(), b.width, b.height, 0, 0, dx, dy, min(b.width, self.width - dx), min(b.height, self.height - dy))
+        l = self.insert_layer(s, name)
+        self.push_state(title, Icon.layer_import, before, (self.width, self.height), cur)
+        return l
+
+    insert_layer(surface = &Surface, name = "") -> &Layer:
+        n = name
+        n.replace("{0}", str(self.next_layer))
+        self.next_layer += 1
+        l = &Layer(surface, n)
+        self.layers.insert(self.current + 1, l)
+        self.current += 1
+        return l
+
+    delete_layer():
+        if len(self.layers) <= 1:
+            return
+        before = self.states()
+        cur = self.current
+        _ = self.layers.remove_at(self.current)
+        self.current = clamp(self.current - 1, 0, len(self.layers) - 1)
+        self.push_state("history.delete_layer", Icon.layer_delete, before, (self.width, self.height), cur)
+
+    # a copy of the current layer above it, named name with the layer's
+    # own name for {0}
+    duplicate_layer(name = "{0} copy"):
+        before = self.states()
+        cur = self.current
+        src = self.layer()
+        n = name
+        n.replace("{0}", src.name)
+        copy = &Layer(self.gpu.duplicate(src.surface), n, src.visible, src.opacity, src.mode, false, src.pdn_metadata)
+        self.layers.insert(self.current + 1, copy)
+        self.current += 1
+        self.push_state("history.duplicate_layer", Icon.layer_duplicate, before, (self.width, self.height), cur)
+
+    merge_down():
+        if self.current <= 0:
+            return
+        before = self.states()
+        cur = self.current
+        under = self.layers[self.current - 1]
+        top = self.layers[self.current]
+        c = &Compositor(self.gpu)
+        _ = c.compose([LayerInput(under.surface.get_texture(), true, 255, BlendMode.normal), LayerInput(top.surface.get_texture(), top.visible, top.opacity, top.mode)], self.width, self.height)
+        if s := c.get_surface():
+            merged = self.gpu.duplicate(s)
+            # the lower layer's own opacity and mode stay with it
+            l = under.with_surface(merged)
+            self.layers[self.current - 1] = l
+        _ = self.layers.remove_at(self.current)
+        self.current -= 1
+        self.push_state("history.merge_down", Icon.layer_merge, before, (self.width, self.height), cur)
+
+    # the current layer moved to index (clamped)
+    move_layer(to = 0):
+        t = clamp(to, 0, len(self.layers) - 1)
+        if t == self.current:
+            return
+        before = self.states()
+        cur = self.current
+        l = self.layers.remove_at(self.current)
+        self.layers.insert(t, l)
+        self.current = t
+        title = "history.move_layer_up" if t > cur else "history.move_layer_down"
+        self.push_state(title, Icon.layer_up if t > cur else Icon.layer_down, before, (self.width, self.height), cur)
+
+    set_layer_props(index = 0, name = "", visible = true, opacity = 255, mode = BlendMode.normal, title = "history.layer_properties"):
+        before = self.states()
+        cur = self.current
+        l = self.layers[index]
+        if l.name == name and l.visible == visible and l.opacity == opacity and l.mode == mode:
+            return
+        l.set_name(name)
+        l.set_visible(visible)
+        l.set_opacity(opacity)
+        l.set_mode(mode)
+        self.push_state(title, Icon.layer_properties, before, (self.width, self.height), cur)
+
+    # the layer's properties shown without a step (a dialog's preview)
+    preview_layer_props(index = 0, name = "", visible = true, opacity = 255, mode = BlendMode.normal):
+        l = self.layers[index]
+        l.set_name(name)
+        l.set_visible(visible)
+        l.set_opacity(opacity)
+        l.set_mode(mode)
+        self.touch()
+
+    # every layer's surface made anew by a transform; the size may change
+    # and the selection with it
+    transform_layers(title = "", icon = Icon.history_item, kind = 0, a = 0, b = 0, c = 0, d = 0, fill = 0, only_current = false, record = true):
+        before = self.states() if record else [LayerState]
+        cur = self.current
+        size = (self.width, self.height)
+        sel_before = self.selection.copy()
+        had = self.has_selection
+        nw = self.width
+        nh = self.height
+        g = self.gpu
+        for i, l in self.layers.enumerate():
+            if only_current and i != self.current:
+                continue
+            s = l.surface
+            made = s
+            match kind:
+                case 0:
+                    made = Transforms.flipped(g, s, true)
+                case 1:
+                    made = Transforms.flipped(g, s, false)
+                case 2:
+                    made = Transforms.rotated(g, s, a)
+                case 3:
+                    made = Transforms.resized(g, s, a, b)
+                case 4:
+                    # canvas: the bottom layer's new pixels take fill
+                    made = Transforms.canvas(g, s, a, b, c, d, fill if i == 0 else 0)
+                case _:
+                    pass
+            nw = made.get_width()
+            nh = made.get_height()
+            self.layers[i] = l.with_surface(made)
+        if not only_current:
+            self.width = nw
+            self.height = nh
+            m = self.selection
+            match kind:
+                case 0:
+                    m = m.flipped_h()
+                case 1:
+                    m = m.flipped_v()
+                case 2:
+                    t = ((a % 4) + 4) % 4
+                    if t == 1:
+                        m = m.rotated_cw()
+                    elif t == 2:
+                        m = m.rotated_180()
+                    elif t == 3:
+                        m = m.rotated_ccw()
+                case 3:
+                    m = m.resized(nw, nh)
+                case 4:
+                    m = m.canvas(nw, nh, c, d)
+                case _:
+                    pass
+            self.show_selection(m, self.has_selection)
+        elif self.has_selection:
+            m = self.selection
+            if kind == 0:
+                m = m.flipped_h()
+            elif kind == 1:
+                m = m.flipped_v()
+            elif kind == 2:
+                m = m.rotated_180()
+            self.show_selection(m, true)
+        if record:
+            self.push_state(title, icon, before, size, cur, sel_before, had)
+
+    flip_image(horizontal = true):
+        self.transform_layers("history.flip_horizontal" if horizontal else "history.flip_vertical", Icon.img_flip_h if horizontal else Icon.img_flip_v, 0 if horizontal else 1)
+
+    rotate_image(turns = 1):
+        key = "history.rotate_180"
+        icon = Icon.img_rotate_180
+        if turns == 1:
+            key = "history.rotate_cw"
+            icon = Icon.img_rotate_cw
+        elif turns == 3:
+            key = "history.rotate_ccw"
+            icon = Icon.img_rotate_ccw
+        self.transform_layers(key, icon, 2, turns)
+
+    resize(w = 0, h = 0):
+        if w <= 0 or h <= 0 or (w == self.width and h == self.height):
+            return
+        self.transform_layers("history.resize_image", Icon.img_resize, 3, w, h)
+
+    canvas_size(w = 0, h = 0, ox = 0, oy = 0, fill = 0, record = true):
+        if w <= 0 or h <= 0 or (w == self.width and h == self.height and ox == 0 and oy == 0):
+            return
+        self.transform_layers("history.canvas_size", Icon.img_canvas, 4, w, h, ox, oy, fill, false, record)
+
+    flip_layer(horizontal = true):
+        self.transform_layers("history.flip_layer_horizontal" if horizontal else "history.flip_layer_vertical", Icon.img_flip_h if horizontal else Icon.img_flip_v, 0 if horizontal else 1, 0, 0, 0, 0, 0, true)
+
+    rotate_layer_180():
+        self.transform_layers("history.rotate_layer_180", Icon.img_rotate_180, 2, 2, 0, 0, 0, 0, true)
+
+    crop_to_selection():
+        if not self.has_selection:
+            return
+        r = self.selection.bounds()
+        if r.empty():
+            return
+        before = self.states()
+        cur = self.current
+        size = (self.width, self.height)
+        sel_before = self.selection.copy()
+        g = self.gpu
+        # the selection, cut to the new size, limits what stays
+        cropped = self.selection.canvas(r.w, r.h, -r.x, -r.y)
+        tex = g.mask_texture(cropped)
+        rect_only = true
+        for v in cropped.data:
+            if v != u8(255):
+                rect_only = false
+                break
+        for i, l in self.layers.enumerate():
+            made = Transforms.canvas(g, l.surface, r.w, r.h, -r.x, -r.y, 0)
+            if not rect_only:
+                cut = g.surface(r.w, r.h)
+                Transforms.cut(g, cut, made.get_texture(), tex, Rect(0, 0, r.w, r.h))
+                made = cut
+            self.layers[i] = l.with_surface(made)
+        self.width = r.w
+        self.height = r.h
+        self.show_selection(Mask(r.w, r.h), false)
+        self.push_state("history.crop_to_selection", Icon.act_crop, before, size, cur, sel_before, true)
+
+    flatten(background = "Background"):
+        if len(self.layers) <= 1:
+            return
+        before = self.states()
+        cur = self.current
+        _ = self.composite()
+        if s := self.compositor.get_surface():
+            flat = self.gpu.duplicate(s)
+            self.layers.clear()
+            self.layers.push(&Layer(flat, background))
+            self.current = 0
+        self.push_state("history.flatten", Icon.img_flatten, before, (self.width, self.height), cur)
+
+    # what the selection holds made see-through (Delete)
+    erase_selection():
+        if not self.has_selection:
+            return
+        g = self.gpu
+        l = self.layer()
+        base = g.duplicate(l.surface)
+        r = self.selection.bounds()
+        if tex := self.sel_texture():
+            Transforms.erase(g, l.surface, base.get_texture(), tex, r)
+        self.commit_pixels(base, "history.erase_selection", Icon.act_erase_selection, self.current, r)
+
+    # the selection filled with a colour (Backspace)
+    fill_selection(c = 0):
+        g = self.gpu
+        l = self.layer()
+        base = g.duplicate(l.surface)
+        r = self.sel_bounds()
+        tex = self.sel_texture().or(g.everything())
+        Transforms.fill(g, l.surface, base.get_texture(), tex, r, c)
+        self.commit_pixels(base, "history.fill_selection", Icon.act_fill_selection, self.current, r)
+
+    # ─── Undo ───
+
+    undo():
+        if step := self.history.back():
+            self.unapply(step)
+            self.touch()
+
+    redo():
+        if step := self.history.forward():
+            self.reapply(step)
+            self.touch()
+
+    # undone or redone until at steps are done
+    go_to(at = 0):
+        while self.history.at > at and self.history.can_undo():
+            self.undo()
+        while self.history.at < at and self.history.can_redo():
+            self.redo()
+
+    unapply(step = &Step):
+        match step.kind:
+            case StepKind.pixels:
+                self.put_patch(step, true)
+            case StepKind.state:
+                self.restore(step.states_before, step.size_before, step.current_before)
+            case _:
+                pass
+        if step.sel_kept:
+            self.show_selection(step.sel_before.copy(), step.had_sel_before)
+
+    reapply(step = &Step):
+        match step.kind:
+            case StepKind.pixels:
+                self.put_patch(step, false)
+            case StepKind.state:
+                self.restore(step.states_after, step.size_after, step.current_after)
+            case _:
+                pass
+        if step.sel_kept:
+            self.show_selection(step.sel_after.copy(), step.had_sel_after)
+
+    put_patch(step = &Step, before = true):
+        if step.layer >= len(self.layers):
+            return
+        patch = step.before if before else step.after
+        if p := patch:
+            l = self.layers[step.layer]
+            r = step.rect
+            self.gpu.blit(l.surface, p.get_texture(), r.w, r.h, 0, 0, r.x, r.y, r.w, r.h)

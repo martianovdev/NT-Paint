@@ -1,0 +1,96 @@
+# buffer — TextBuffer: the lines, and the edits made on them.
+
+from text import Pos, TextBuffer
+
+extend TextBuffer:
+    # the first line changed since take_changed, a big number for none
+    changed = 0
+
+    init(text = ""):
+        self.set_text(text)
+
+    set_text(text = ""):
+        t = text
+        t.replace("\r\n", "\n")
+        t.replace("\r", "\n")
+        self.lines = t.split("\n")
+        if len(self.lines) == 0:
+            self.lines.push("")
+        self.touch(0)
+
+    get_text() -> str:
+        return "\n".join(self.lines)
+
+    get_line_count() -> int:
+        return len(self.lines)
+
+    get_line(line = 0) -> str:
+        if line < 0 or line >= len(self.lines):
+            return ""
+        return self.lines[line]
+
+    get_length(line = 0) -> int:
+        return len(self.get_line(line))
+
+    clamp(at = Pos()) -> Pos:
+        line = clamp(at.line, 0, len(self.lines) - 1)
+        return Pos(line, clamp(at.col, 0, len(self.lines[line])))
+
+    get_range(a = Pos(), b = Pos()) -> str:
+        a = self.clamp(a)
+        b = self.clamp(b)
+        if a.line == b.line:
+            return self.lines[a.line].slice(a.col, b.col)
+        parts = [self.lines[a.line].slice(a.col, len(self.lines[a.line]))]
+        for l in range(a.line + 1, b.line):
+            parts.push(self.lines[l])
+        parts.push(self.lines[b.line].slice(0, b.col))
+        return "\n".join(parts)
+
+    insert(at = Pos(), text = "") -> Pos:
+        at = self.clamp(at)
+        t = text
+        t.replace("\r\n", "\n")
+        t.replace("\r", "\n")
+        pieces = t.split("\n")
+        line = self.lines[at.line]
+        head = line.slice(0, at.col)
+        tail = line.slice(at.col, len(line))
+        if len(pieces) == 1:
+            self.lines[at.line] = head + pieces[0] + tail
+            self.touch(at.line)
+            return Pos(at.line, at.col + len(pieces[0]))
+        self.lines[at.line] = head + pieces[0]
+        for i in range(1, len(pieces) - 1):
+            self.lines.insert(at.line + i, pieces[i])
+        last = pieces[len(pieces) - 1]
+        self.lines.insert(at.line + len(pieces) - 1, last + tail)
+        self.touch(at.line)
+        return Pos(at.line + len(pieces) - 1, len(last))
+
+    remove(a = Pos(), b = Pos()) -> str:
+        a = self.clamp(a)
+        b = self.clamp(b)
+        if b.before(a):
+            a, b = b, a
+        out = self.get_range(a, b)
+        head = self.lines[a.line].slice(0, a.col)
+        tail = self.lines[b.line].slice(b.col, len(self.lines[b.line]))
+        self.lines[a.line] = head + tail
+        for _ in range(b.line - a.line):
+            self.lines.remove_at(a.line + 1)
+        self.touch(a.line)
+        return out
+
+    take_changed() -> int:
+        if self.changed >= 1 << 40:
+            return -1
+        out = self.changed
+        self.changed = 1 << 40
+        return out
+
+    # ─── Inside ───
+
+    touch(line = 0):
+        self.revision += 1
+        self.changed = min(self.changed, line)

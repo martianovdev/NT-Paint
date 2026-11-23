@@ -1,0 +1,175 @@
+# widgets/dialog — a question over everything: the window dimmed, a panel
+# in its middle with a title, what is asked (a line each "\n"), and the
+# answers as buttons along its bottom, right to left as given, the
+# primary one in the accent.  Enter answers the primary, Escape the
+# cancel one (when there is one); a click answers its button.  Nothing
+# under it takes the pointer or the keys while it is open.
+
+from ui import Dialog
+from graphics import Align
+from window import Cursor, Key
+from view import Layout, View
+
+extend Dialog:
+    backdrop = &View
+    panel = &View
+    is_open = false
+    title = ""
+    lines = [str]
+    answers = [str]
+    primary = 0
+    cancel = -1
+    strip = 26.0
+    button_gap = 22.0
+    preview_height = 0.0
+    preview_room = 0.0
+    width = 0.0
+    host_size = (-1.0, -1.0)
+    stacked = false
+
+    init(ui = &Ui):
+        self.ui = ui
+        self.backdrop = ui.create(Layout.free)
+        self.backdrop.set_expand(true)
+        self.panel = ui.create(Layout.free)
+        on self.backdrop.draw():
+            x, y, w, h = self.ui.rect(self.backdrop)
+            self.ui.fill(x, y, w, h, 0x000000, 0.45)
+        on self.panel.draw():
+            self.draw()
+        on self.panel.click():
+            at = self.answer_at()
+            if at >= 0:
+                self.answer(at)
+
+    open(title = "", text = "", answers = [str], primary = 0, cancel = -1, preview_height = 0.0):
+        ui = self.ui
+        self.title = title
+        self.lines = text.split("\n")
+        self.answers = answers
+        self.primary = primary
+        self.cancel = cancel
+        self.preview_height = preview_height
+        self.host_size = (-1.0, -1.0)
+        self.layout()
+        self.backdrop.set_parent(ui.layer)
+        self.panel.set_parent(ui.layer)
+        ui.views.set_focus(none)
+        self.is_open = true
+
+    layout():
+        ui = self.ui
+        t = ui.theme
+        _, _, lw, lh = ui.rect(ui.layer)
+        if (lw, lh) == self.host_size:
+            return
+        self.host_size = (lw, lh)
+        pad = t.dialog_inset
+        row_width = 2.0 * pad
+        for i, label in self.answers.enumerate():
+            row_width += self.button_width(label) + (8.0 if i > 0 else 0.0)
+        width = 440.0
+        for l in self.lines:
+            width = max(width, ui.measure(l, t.size - 1.0) + 2.0 * pad)
+        width = min(max(width, row_width), 720.0, max(1.0, lw - 16.0))
+        self.width = width
+        self.stacked = row_width > width
+        height = self.strip + 2.0 * pad + float(len(self.lines)) * 22.0 + self.button_gap + self.footer_height()
+        self.preview_room = min(self.preview_height, max(0.0, lh - height - 24.0))
+        if self.preview_room > 0.0:
+            height += self.preview_room + 8.0
+        self.panel.set_min_size(width, height)
+        self.panel.set_max_size(width, height)
+        self.panel.set_offset(floor((lw - width) * 0.5), max(0.0, floor((lh - height) * 0.42)))
+
+    close():
+        if not self.is_open:
+            return
+        self.panel.set_parent(none)
+        self.backdrop.set_parent(none)
+        self.is_open = false
+
+    get_open() -> bool:
+        return self.is_open
+
+    update():
+        if not self.is_open:
+            return
+        self.layout()
+        ui = self.ui
+        win = ui.window
+        ui.hold_keys()
+        if win.input_get_key_pressed(Key.enter):
+            self.answer(self.primary)
+        elif win.input_get_key_pressed(Key.escape) and self.cancel >= 0:
+            self.answer(self.cancel)
+
+    # ─── Inside ───
+
+    answer(index = 0):
+        self.close()
+        emit chosen(index)
+
+    button_width(label = "") -> float:
+        return max(96.0, self.ui.measure(label, self.ui.theme.size - 1.0) + 32.0)
+
+    footer_height() -> float:
+        h = self.ui.theme.field_height
+        return h + float(max(0, len(self.answers) - 1)) * (h + 8.0) if self.stacked else h
+
+    # Each button's offset from the panel's left and the footer's top.
+    buttons() -> [(float, float, float)]:
+        t = self.ui.theme
+        out = [(float, float, float)]
+        right = self.width - t.dialog_inset
+        for i, label in self.answers.enumerate():
+            if self.stacked:
+                out.push((t.dialog_inset, float(i) * (t.field_height + 8.0), max(1.0, self.width - 2.0 * t.dialog_inset)))
+                continue
+            bw = self.button_width(label)
+            out.push((right - bw, 0.0, bw))
+            right -= bw + 8.0
+        return out
+
+    buttons_top() -> float:
+        _, _, _, h = self.ui.rect(self.panel)
+        t = self.ui.theme
+        return h - t.dialog_inset - self.footer_height()
+
+    answer_at() -> int:
+        px, py = self.panel.get_pointer()
+        top = self.buttons_top()
+        for i, b in self.buttons().enumerate():
+            bx, by, bw = b
+            if px >= bx and px < bx + bw and py >= top + by and py < top + by + self.ui.theme.field_height:
+                return i
+        return -1
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.panel)
+        ui.fill_round(x, y, w, h, 6.0, t.chrome)
+        ui.outline_round(x, y, w, h, 6.0, t.field_edge)
+        pad = t.dialog_inset
+        ui.text(x + 12.0, y, w - 24.0, self.strip, self.title, t.ink, Align.left + Align.middle, t.size + 1.0)
+        ly = y + self.strip + pad
+        if self.preview_room > 0.0 and w > 2.0 * pad:
+            emit preview(x + pad, ly, w - 2.0 * pad, self.preview_room)
+        if self.preview_room > 0.0:
+            ly += self.preview_room + 8.0
+        for l in self.lines:
+            ui.text(x + pad, ly, w - 2.0 * pad, 22.0, l, t.ink_soft, Align.left + Align.middle, t.size - 1.0)
+            ly += 22.0
+        top = y + self.buttons_top()
+        under = self.answer_at() if self.panel.get_hovered() else -1
+        for i, b in self.buttons().enumerate():
+            bx, by, bw = b
+            accent = i == self.primary
+            fill = t.accent if accent else (t.button_hot if i == under else t.button)
+            ui.fill_round(x + bx, top + by, bw, t.field_height, t.radius, fill)
+            if accent and i == under:
+                ui.outline_round(x + bx, top + by, bw, t.field_height, t.radius, t.ink, 1.0)
+            ui.text(x + bx, top + by, bw, t.field_height, self.answers[i], t.accent_ink if accent else t.ink, Align.center + Align.middle, t.size - 1.0)
+            if i == under:
+                ui.want_cursor(Cursor.hand)

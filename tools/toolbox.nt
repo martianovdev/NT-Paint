@@ -1,0 +1,230 @@
+# tools/toolbox — every tool, the one in hand, and what each is called,
+# shown by and chosen with: paint.net's order, icons and keys (a key
+# pressed again goes on to the next tool sharing it).
+
+from window import Cursor, Key
+from ui import Icon
+from tools.session import Session, ToolKind
+from tools.tool import Pointer, Tool
+from tools.select_tools import MagicWand, ShapeSelect
+from tools.move_tools import Mover
+from tools.paint_tools import Stroke
+from tools.other_tools import Bucket, GradientTool, PanTool, Picker, ZoomTool
+from tools.draw_tools import ShapeTool, TextTool
+
+Toolbox:
+    tools = [Tool]
+    current = ToolKind.brush
+    move_pixels = &Mover(true)
+    line = &ShapeTool(ToolKind.line)
+
+    init():
+        for k in ToolKind:
+            if k == ToolKind.move_pixels:
+                self.tools.push(self.move_pixels)
+            elif k == ToolKind.line:
+                self.tools.push(self.line)
+            else:
+                self.tools.push(Toolbox.make(k))
+
+    make(k = ToolKind.brush) -> Tool:
+        match k:
+            case ToolKind.rect_select, ToolKind.lasso, ToolKind.ellipse_select:
+                return ShapeSelect(k)
+            case ToolKind.move_selection:
+                return Mover(false)
+            case ToolKind.zoom:
+                return ZoomTool()
+            case ToolKind.magic_wand:
+                return MagicWand()
+            case ToolKind.pan:
+                return PanTool()
+            case ToolKind.bucket:
+                return Bucket()
+            case ToolKind.gradient:
+                return GradientTool()
+            case ToolKind.picker:
+                return Picker()
+            case ToolKind.text:
+                return TextTool()
+            case ToolKind.line, ToolKind.shapes:
+                return ShapeTool(k)
+            case _:
+                return Stroke(k)
+
+    tool() -> Tool:
+        return self.tools[int(self.current)]
+
+    # another tool in hand: the one before finishes what it holds
+    choose(s = &Session, k = ToolKind.brush):
+        if k == self.current:
+            return
+        self.tool().commit(s)
+        if k == ToolKind.picker:
+            s.set_previous(self.current)
+        self.current = k
+
+    press(s = &Session, p = Pointer()):
+        self.tool().press(s, p)
+
+    drag(s = &Session, p = Pointer()):
+        self.tool().drag(s, p)
+
+    release(s = &Session, p = Pointer()):
+        self.tool().release(s, p)
+
+    hover(s = &Session, p = Pointer()):
+        self.tool().hover(s, p)
+
+    key(s = &Session):
+        self.tool().key(s)
+
+    commit(s = &Session):
+        self.tool().commit(s)
+
+    overlay(s = &Session):
+        self.tool().overlay(s)
+
+    recolor(s = &Session):
+        self.tool().recolor(s)
+
+    cancel(s = &Session) -> bool:
+        return self.tool().cancel(s)
+
+    busy() -> bool:
+        return self.tool().busy()
+
+    cursor() -> Cursor:
+        return self.tool().cursor()
+
+    # ─── What each is ───
+
+    icon(k = ToolKind.brush) -> Icon:
+        match k:
+            case ToolKind.rect_select:
+                return Icon.tool_rect_select
+            case ToolKind.move_pixels:
+                return Icon.tool_move_pixels
+            case ToolKind.lasso:
+                return Icon.tool_lasso
+            case ToolKind.move_selection:
+                return Icon.tool_move_selection
+            case ToolKind.ellipse_select:
+                return Icon.tool_ellipse_select
+            case ToolKind.zoom:
+                return Icon.tool_zoom
+            case ToolKind.magic_wand:
+                return Icon.tool_magic_wand
+            case ToolKind.pan:
+                return Icon.tool_pan
+            case ToolKind.bucket:
+                return Icon.tool_bucket
+            case ToolKind.gradient:
+                return Icon.tool_gradient
+            case ToolKind.brush:
+                return Icon.tool_brush
+            case ToolKind.eraser:
+                return Icon.tool_eraser
+            case ToolKind.pencil:
+                return Icon.tool_pencil
+            case ToolKind.picker:
+                return Icon.tool_picker
+            case ToolKind.clone:
+                return Icon.tool_clone
+            case ToolKind.recolor:
+                return Icon.tool_recolor
+            case ToolKind.text:
+                return Icon.tool_text
+            case ToolKind.line:
+                return Icon.tool_line
+            case _:
+                return Icon.tool_shapes
+
+    # the translation key of its name: "tool.<id>"; its help: "hint.<id>"
+    id(k = ToolKind.brush) -> str:
+        match k:
+            case ToolKind.rect_select:
+                return "rect_select"
+            case ToolKind.move_pixels:
+                return "move_pixels"
+            case ToolKind.lasso:
+                return "lasso"
+            case ToolKind.move_selection:
+                return "move_selection"
+            case ToolKind.ellipse_select:
+                return "ellipse_select"
+            case ToolKind.zoom:
+                return "zoom"
+            case ToolKind.magic_wand:
+                return "magic_wand"
+            case ToolKind.pan:
+                return "pan"
+            case ToolKind.bucket:
+                return "bucket"
+            case ToolKind.gradient:
+                return "gradient"
+            case ToolKind.brush:
+                return "brush"
+            case ToolKind.eraser:
+                return "eraser"
+            case ToolKind.pencil:
+                return "pencil"
+            case ToolKind.picker:
+                return "picker"
+            case ToolKind.clone:
+                return "clone"
+            case ToolKind.recolor:
+                return "recolor"
+            case ToolKind.text:
+                return "text"
+            case ToolKind.line:
+                return "line"
+            case _:
+                return "shapes"
+
+    # its key in paint.net
+    key_of(k = ToolKind.brush) -> Key:
+        match k:
+            case ToolKind.rect_select, ToolKind.lasso, ToolKind.ellipse_select, ToolKind.magic_wand:
+                return Key.s
+            case ToolKind.move_pixels, ToolKind.move_selection:
+                return Key.m
+            case ToolKind.zoom:
+                return Key.z
+            case ToolKind.pan:
+                return Key.h
+            case ToolKind.bucket:
+                return Key.f
+            case ToolKind.gradient:
+                return Key.g
+            case ToolKind.brush:
+                return Key.b
+            case ToolKind.eraser:
+                return Key.e
+            case ToolKind.pencil:
+                return Key.p
+            case ToolKind.picker:
+                return Key.k
+            case ToolKind.clone:
+                return Key.l
+            case ToolKind.recolor:
+                return Key.r
+            case ToolKind.text:
+                return Key.t
+            case _:
+                return Key.o
+
+    # the tool a key chooses: the next after the current among those
+    # sharing it
+    by_key(key = Key.unknown, reverse = false) -> none(ToolKind):
+        cycle = [ToolKind]
+        for k in [ToolKind.rect_select, ToolKind.lasso, ToolKind.ellipse_select, ToolKind.magic_wand, ToolKind.move_pixels, ToolKind.move_selection, ToolKind.zoom, ToolKind.pan, ToolKind.bucket, ToolKind.gradient, ToolKind.brush, ToolKind.eraser, ToolKind.pencil, ToolKind.picker, ToolKind.clone, ToolKind.recolor, ToolKind.text, ToolKind.line, ToolKind.shapes]:
+            if Toolbox.key_of(k) == key:
+                cycle.push(k)
+        if len(cycle) == 0:
+            return none
+        for i, k in cycle.enumerate():
+            if k == self.current:
+                step = -1 if reverse else 1
+                return cycle[(i + len(cycle) + step) % len(cycle)]
+        return cycle[len(cycle) - 1] if reverse else cycle[0]

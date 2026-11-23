@@ -1,0 +1,373 @@
+# workspace/panels — paint.net's floating windows of Tools, History and
+# Layers.  Each is a FloatPanel over the workspace; what it shows comes
+# from the document in front, what it does goes through the commands or
+# events to the editor.
+
+from graphics import Align
+from window import Button, Cursor
+from view import Layout, View
+from ui import FloatPanel, Icon, ScrollView, ToolButton, Ui
+from i18n import Tr
+from imaging import Display, Gpu
+from document.document import Document
+from document.layer import Layer
+from tools.session import ToolKind
+from workspace.actions import Actions
+
+# the tools wrap to the panel's width, the one in hand held
+ToolsPanel:
+    ui = &Ui
+    panel = &FloatPanel
+    scroll = &ScrollView
+    grid = &View
+    columns = 2
+    buttons = [&ToolButton]
+
+    init(ui = &Ui, parent = &View, actions = &Actions):
+        self.ui = ui
+        self.panel = &FloatPanel(ui, parent, "", 68.0, 294.0)
+        self.panel.set_min_size(56.0, 62.0)
+        self.scroll = &ScrollView(ui, self.panel.body)
+        self.grid = ui.create(Layout.grid, self.scroll.body)
+        grid = self.grid
+        grid.set_columns(2)
+        grid.set_gap(2.0, 2.0)
+        for c in actions.tools:
+            self.buttons.push(&ToolButton(ui, grid, c))
+
+    set_current(k = ToolKind.brush):
+        for i, b in self.buttons.enumerate():
+            b.set_on(i == int(k))
+
+    retitle(tr = &Tr):
+        self.panel.set_title(tr.t("win.tools"))
+
+    update():
+        self.panel.update()
+        if self.panel.get_visible():
+            count = len(self.buttons)
+            width, height = self.panel.client_size()
+            columns = clamp(int(floor((width + 2.0) / 28.0)), 1, count)
+            rows = (count + columns - 1) / columns
+            if float(rows) * 26.0 - 2.0 > height:
+                columns = clamp(int(floor((width + 2.0 - 14.0) / 28.0)), 1, count)
+            if columns != self.columns:
+                self.columns = columns
+                self.grid.set_columns(columns)
+            self.scroll.update()
+            for b in self.buttons:
+                b.feedback()
+
+# the steps of the document's history: the first is how it began; the
+# undone ones are faded; a click goes back or forth to a step
+HistoryPanel:
+    event navigating()
+    ui = &Ui
+    tr = &Tr
+    panel = &FloatPanel
+    list = &View
+    doc = none(&Document)
+    scroll = 0.0
+    history_revision = -1
+    foot = &View
+    undo = &ToolButton
+    redo = &ToolButton
+
+    init(ui = &Ui, parent = &View, tr = &Tr, actions = &Actions):
+        self.ui = ui
+        self.tr = tr
+        self.panel = &FloatPanel(ui, parent, "", 190.0, 210.0)
+        self.panel.set_min_size(112.0, 85.0)
+        self.list = ui.create(Layout.free, self.panel.body)
+        self.list.set_expand(true)
+        self.list.set_clip(true)
+        self.foot = ui.create(Layout.horizontal, self.panel.body)
+        foot = self.foot
+        foot.set_min_size(0.0, 24.0)
+        foot.set_gap(2.0, 0.0)
+        self.undo = &ToolButton(ui, foot, actions.undo)
+        self.redo = &ToolButton(ui, foot, actions.redo)
+        on self.list.draw():
+            self.draw()
+        on self.list.click():
+            at = self.row_at()
+            if d := self.doc:
+                if at >= 0 and at <= len(d.history.steps):
+                    emit navigating()
+                    d.go_to(at)
+
+    set_doc(doc = none(&Document)):
+        self.doc = doc
+        self.history_revision = -1
+        self.list.render_once()
+
+    retitle():
+        self.panel.set_title(self.tr.t("win.history"))
+        self.list.render_once()
+
+    row_at() -> int:
+        _, py = self.list.get_pointer()
+        return int(floor((py + self.scroll) / 20.0))
+
+    update():
+        self.panel.update()
+        self.undo.feedback()
+        self.redo.feedback()
+        if d := self.doc:
+            n = len(d.history.steps) + 1
+            old_scroll = self.scroll
+            over = self.list.get_hovered()
+            if over:
+                self.scroll -= self.ui.window.input_get_wheel_y() * 40.0
+            _, _, _, h = self.list.get_rect()
+            self.scroll = clamp(self.scroll, 0.0, max(0.0, float(n) * 20.0 - h))
+            if old_scroll != self.scroll or self.history_revision != d.history.revision:
+                self.history_revision = d.history.revision
+                self.list.render_once()
+            if over and self.row_at() >= 0 and self.row_at() < n:
+                self.ui.want_cursor(Cursor.hand)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.list)
+        ui.fill(x, y, w, h, t.panel)
+        if d := self.doc:
+            n = len(d.history.steps) + 1
+            hot = self.row_at() if self.list.get_hovered() else -1
+            for i in range(n):
+                ry = y + float(i) * 20.0 - self.scroll
+                if ry + 20.0 < y or ry > y + h:
+                    continue
+                title = self.tr.t(d.origin)
+                icon = Icon.history_item
+                if i > 0:
+                    step = d.history.steps[i - 1]
+                    title = self.tr.t(step.title)
+                    icon = step.icon
+                done = i <= d.history.at
+                if i == d.history.at:
+                    ui.fill_round(x + 3.0, ry + 1.0, w - 6.0, 18.0, 4.0, t.row_on)
+                elif i == hot:
+                    ui.fill_round(x + 3.0, ry + 1.0, w - 6.0, 18.0, 4.0, t.row_hot)
+                ui.icon(icon, x + 4.0, ry + 2.0, 16.0, -1 if done else 0x606060)
+                ui.text(x + 24.0, ry, w - 28.0, 20.0, title, t.ink if done else t.ink_faint, Align.left + Align.middle, t.size)
+
+# the layers, the top one first: each a thumbnail, its name and whether
+# it shows; the current one lit.  A click chooses a layer, its box shows
+# or hides it, a double click opens its properties, the right button its
+# menu; a layer dragged up or down the list moves there.
+LayersPanel:
+    event selecting()
+    event properties_asked()
+    event menu_asked(x = 0.0, y = 0.0)
+    # the visibility box: the layer at index shown or hidden
+    event visibility(index = 0, visible = true)
+    ui = &Ui
+    tr = &Tr
+    gpu = &Gpu
+    panel = &FloatPanel
+    list = &View
+    rows = [(&Layer, &View, &View)]
+    doc = none(&Document)
+    scroll = 0.0
+    row = 48.0
+    # the layer pressed (-1 none), where, and whether it is being dragged
+    drag_from = -1
+    press_y = 0.0
+    dragging = false
+    foot = &View
+    buttons = [&ToolButton]
+    displayed = (-1, -1)
+
+    init(ui = &Ui, parent = &View, tr = &Tr, gpu = &Gpu, actions = &Actions):
+        self.ui = ui
+        self.tr = tr
+        self.gpu = gpu
+        self.panel = &FloatPanel(ui, parent, "", 196.0, 210.0)
+        self.panel.set_min_size(196.0, 101.0)
+        self.list = ui.create(Layout.free, self.panel.body)
+        self.list.set_expand(true)
+        self.list.set_clip(true)
+        self.foot = ui.create(Layout.horizontal, self.panel.body)
+        foot = self.foot
+        foot.set_min_size(0.0, 24.0)
+        foot.set_gap(0.0, 0.0)
+        for c in [actions.add_layer, actions.delete_layer, actions.duplicate_layer, actions.merge_down, actions.move_up, actions.move_down, actions.layer_properties]:
+            self.buttons.push(&ToolButton(ui, foot, c))
+        on self.list.draw():
+            self.draw()
+            self.list.render_children()
+        on self.list.arrange():
+            self.layout_rows()
+
+    set_doc(doc = none(&Document)):
+        self.doc = doc
+        self.displayed = (-1, -1)
+        self.list.render_once()
+        self.sync_rows()
+
+    retitle():
+        self.panel.set_title(self.tr.t("win.layers"))
+
+    sync_rows():
+        if d := self.doc:
+            if len(self.rows) == len(d.layers):
+                same = true
+                for i, views in self.rows.enumerate():
+                    layer, _, _ = views
+                    if layer is not d.layers[i]:
+                        same = false
+                        break
+                if same:
+                    return
+        self.rows.clear()
+        if d := self.doc:
+            for i, layer in d.layers.enumerate():
+                # Siblings have separate click targets. The list handles
+                # neither click, so the checkbox cannot open properties.
+                item = self.ui.create(Layout.free, self.list)
+                check = self.ui.create(Layout.free, self.list)
+                index = i
+                on item.mouse_down():
+                    self.press(index)
+                on item.double_click():
+                    emit properties_asked()
+                on check.click():
+                    if doc := self.doc:
+                        if index < len(doc.layers) and doc.layers[index] is layer:
+                            emit visibility(index, not layer.visible)
+                self.rows.push((layer, item, check))
+        self.layout_rows()
+
+    layout_rows():
+        _, _, w, h = self.ui.rect(self.list)
+        n = len(self.rows)
+        self.scroll = clamp(self.scroll, 0.0, max(0.0, float(n) * self.row - h))
+        if w <= 26.0:
+            return
+        for i, views in self.rows.enumerate():
+            _, item, check = views
+            y = float(n - 1 - i) * self.row - self.scroll
+            item.set_min_size(w - 26.0, self.row)
+            item.set_max_size(w - 26.0, self.row)
+            item.set_offset(0.0, y)
+            check.set_min_size(26.0, self.row)
+            check.set_max_size(26.0, self.row)
+            check.set_offset(w - 26.0, y)
+
+    # the layer under the pointer (its index in the document), -1 for none
+    index_at() -> int:
+        if d := self.doc:
+            _, py = self.list.get_pointer()
+            r = int(floor((py + self.scroll) / self.row))
+            if r >= 0 and r < len(d.layers):
+                return len(d.layers) - 1 - r
+        return -1
+
+    press(index = 0):
+        if d := self.doc:
+            emit selecting()
+            d.set_current(index)
+            _, py = self.list.get_pointer()
+            self.drag_from = index
+            self.press_y = py
+            self.dragging = false
+
+    # the place among the layers the pointer is over, while dragging
+    drop_index() -> int:
+        if d := self.doc:
+            _, py = self.list.get_pointer()
+            r = clamp(int(floor((py + self.scroll) / self.row)), 0, len(d.layers) - 1)
+            return len(d.layers) - 1 - r
+        return -1
+
+    update():
+        self.panel.update()
+        for b in self.buttons:
+            b.feedback()
+        win = self.ui.window
+        if self.drag_from >= 0:
+            _, py = self.list.get_pointer()
+            if win.input_get_mouse_button_down(Button.left):
+                if abs(py - self.press_y) > 4.0:
+                    self.dragging = true
+                if self.dragging:
+                    self.ui.want_cursor(Cursor.move)
+            else:
+                if self.dragging:
+                    if d := self.doc:
+                        to = self.drop_index()
+                        if to >= 0 and to != self.drag_from and self.drag_from == d.current:
+                            d.move_layer(to)
+                self.drag_from = -1
+                self.dragging = false
+        self.sync_rows()
+        if d := self.doc:
+            next = (d.history.revision, d.current)
+            if next != self.displayed:
+                self.displayed = next
+                self.list.render_once()
+        for views in self.rows:
+            _, _, check = views
+            if check.get_hovered():
+                self.ui.tip(self.tr.t("cmd.toggle_layer"))
+        if self.list.get_hovered():
+            wheel = win.input_get_wheel_y()
+            if wheel != 0.0:
+                self.scroll -= wheel * 40.0
+                self.layout_rows()
+            if win.input_get_mouse_button_pressed(Button.right):
+                i = self.index_at()
+                if d := self.doc:
+                    if i >= 0:
+                        emit selecting()
+                        d.set_current(i)
+                px, py = self.ui.pointer()
+                emit menu_asked(px, py)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.list)
+        ui.fill(x, y, w, h, t.panel)
+        if d := self.doc:
+            n = len(d.layers)
+            hot = self.index_at() if self.list.get_hovered() else -1
+            for r in range(n):
+                i = n - 1 - r
+                l = d.layers[i]
+                ry = y + float(r) * self.row - self.scroll
+                if ry + self.row < y or ry > y + h:
+                    continue
+                if i == d.current:
+                    ui.fill_round(x + 3.0, ry + 3.0, w - 6.0, self.row - 6.0, 5.0, t.row_on)
+                elif i == hot:
+                    ui.fill_round(x + 3.0, ry + 3.0, w - 6.0, self.row - 6.0, 5.0, t.row_hot)
+                # the thumbnail, its sides as the picture's
+                tw = 52.0
+                th = self.row - 10.0
+                k = min(tw / float(d.width), th / float(d.height))
+                iw = max(1.0, float(d.width) * k)
+                ih = max(1.0, float(d.height) * k)
+                tx = x + 6.0 + (tw - iw) * 0.5
+                ty = ry + 5.0 + (th - ih) * 0.5
+                Display.draw(self.gpu, l.surface.get_texture(), d.width, d.height, tx, ty, iw, ih, false, true)
+                ui.outline(tx - 1.0, ty - 1.0, iw + 2.0, ih + 2.0, t.line)
+                ui.text(x + 64.0, ry, w - 96.0, self.row, l.name, t.ink, Align.left + Align.middle, t.size)
+                # the visibility box
+                bx = x + w - 22.0
+                by = ry + (self.row - 14.0) * 0.5
+                ui.fill_round(bx, by, 14.0, 14.0, 3.0, t.field)
+                ui.outline_round(bx, by, 14.0, 14.0, 3.0, t.field_edge)
+                if l.visible:
+                    ui.icon(Icon.check, bx + 1.0, by + 1.0, 12.0, t.ink)
+            # where a dragged layer would go: a line on that side of the row
+            if self.dragging:
+                to = self.drop_index()
+                if to >= 0 and to != self.drag_from:
+                    r = n - 1 - to
+                    ly = y + float(r) * self.row - self.scroll
+                    if to < self.drag_from:
+                        ly += self.row
+                    ui.fill(x + 2.0, clamp(ly - 1.5, y, y + h - 3.0), w - 4.0, 3.0, t.accent)

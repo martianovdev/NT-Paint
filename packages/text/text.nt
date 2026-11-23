@@ -1,0 +1,235 @@
+# text — text as an editor keeps it, knowing nothing of drawing: a buffer
+# of lines, an editor over it (the caret and the selection, every edit a
+# keyboard makes, undo and redo), and what colours a line of code.
+#
+#   buffer = &TextBuffer(source)
+#   editor = &TextEditor(buffer)
+#   editor.set_language(Languages.for_path("main.nt"))
+#   editor.type("x = 1")
+#   editor.newline()                # indented as the line above
+#   editor.undo()
+#   spans = editor.highlight.spans(0)
+#
+# A place is a line and a column, both from 0, the column counting
+# characters (code points).  Lines are kept without their end; a text's
+# CRLF reads as LF.  Tabs are characters like any other: how wide one is
+# drawn is the view's.
+#
+# Inside: buffer (TextBuffer), history (the steps undo walks), editor
+# (TextEditor), highlight (languages and the colouring of lines).
+
+package text "0.1.0"
+
+# a place in a text: line and column from 0
+Pos:
+    line = 0
+    col = 0
+
+    init(line = 0, col = 0):
+        self.line = line
+        self.col = col
+
+    before(o = Pos()) -> bool:
+        return self.line < o.line or (self.line == o.line and self.col < o.col)
+
+    same(o = Pos()) -> bool:
+        return self.line == o.line and self.col == o.col
+
+# The lines of a text.  Every change moves the revision and remembers the
+# first line it touched, so what reads the lines (the colouring) knows
+# where to look again
+TextBuffer in buffer:
+    lines = [str]
+    revision = 0
+    init(text = "")
+    set_text(text = "")
+    get_text() -> str
+    get_line_count() -> int
+    get_line(line = 0) -> str
+    # characters in the line
+    get_length(line = 0) -> int
+    # the place moved into the text
+    clamp(at = Pos()) -> Pos
+    # the text between a and b (a before b)
+    get_range(a = Pos(), b = Pos()) -> str
+    # text put in at a place: where it ends
+    insert(at = Pos(), text = "") -> Pos
+    # the text between a and b taken out: what it was
+    remove(a = Pos(), b = Pos()) -> str
+    # the first line changed since the last call, -1 for none
+    take_changed() -> int
+
+# what colours a token
+enum TokenKind:
+    plain
+    keyword
+    type
+    function
+    number
+    string
+    comment
+    directive
+    punctuation
+    property
+    invalid
+    # what an analysis of the code says a name is (Highlight.set_words)
+    variable
+    parameter
+    method
+    member
+    module
+    constant
+    interface_
+    enum_
+
+# a run of a line in one colour: columns start to end
+Span:
+    start = 0
+    end = 0
+    kind = TokenKind.plain
+
+    init(start = 0, end = 0, kind = TokenKind.plain):
+        self.start = start
+        self.end = end
+        self.kind = kind
+
+# a word of a line as an analysis of the code says it is: drawn in its
+# kind's colour while the line still holds that text there
+Word:
+    start = 0
+    end = 0
+    kind = TokenKind.plain
+    text = ""
+
+    init(start = 0, end = 0, kind = TokenKind.plain, text = ""):
+        self.start = start
+        self.end = end
+        self.kind = kind
+        self.text = text
+
+# a problem an analysis found: on line, columns start to end
+Mark:
+    line = 0
+    start = 0
+    end = 0
+    error = true
+    message = ""
+
+    init(line = 0, start = 0, end = 0, error = true, message = ""):
+        self.line = line
+        self.start = start
+        self.end = end
+        self.error = error
+        self.message = message
+
+# A language as the editor sees it: what colours its lines, how a line
+# comment begins, what opens a block (a line ending in it indents the
+# next)
+Language in highlight:
+    name = ""
+    comment = ""
+    opens = ""
+    # 0 natiny, 1 C-like (NSL), 2 JSON, 3 plain
+    style = 3
+    keywords = [str: bool]
+    directives = [str: bool]
+    types = [str: bool]
+    init(name = "", style = 3, comment = "", opens = "")
+    # a line's runs, from the state the line before left; and the state it
+    # leaves (inside a string or a comment that goes on)
+    scan(line = "", state = 0) -> ([Span], int)
+
+Languages in highlight:
+    natiny() -> Language
+    nsl() -> Language
+    json() -> Language
+    plain() -> Language
+    # by the file's extension
+    for_path(path = "") -> Language
+
+# The lines of a buffer coloured, each scanned once and again only when
+# it or a line above it changed
+Highlight in highlight:
+    language = Language
+    init(language = Language())
+    set_language(language = Language())
+    # the runs of a line; lines above it are scanned first if they must be.
+    # A name the words of an analysis give, the line still saying it there,
+    # is in their kind
+    spans(buffer = &TextBuffer, line = 0) -> [Span]
+    # the words of an analysis, by line (none: the scanner's colours alone)
+    set_words(words = [int: [Word]])
+
+# The caret and the selection over a buffer, and every edit a keyboard
+# makes, each one a step of the history (typing in a row is one)
+TextEditor in editor, history:
+    buffer = &TextBuffer
+    highlight = &Highlight
+    caret = Pos()
+    # the other end of the selection: the caret when nothing is selected
+    anchor = Pos()
+    # spaces a tab and an indent are
+    tab = 4
+    # the problems an analysis found
+    marks = [Mark]
+    init(buffer = &TextBuffer)
+    set_marks(marks = [Mark])
+    # the marks at a place, a message a line
+    marks_at(at = Pos()) -> str
+    set_language(language = Language())
+    get_language() -> Language
+
+    # Selection
+    has_selection() -> bool
+    # its ends in order
+    get_selection() -> (Pos, Pos)
+    get_selected_text() -> str
+    # the caret to a place; extend keeps the anchor (Shift)
+    set_caret(at = Pos(), extend = false)
+    select_all()
+    # the word (or the run of spaces, or the character) at a place
+    select_word(at = Pos())
+    select_line(line = 0)
+
+    # Moving; word moves by words, extend keeps the anchor
+    move_left(word = false, extend = false)
+    move_right(word = false, extend = false)
+    move_up(lines = 1, extend = false)
+    move_down(lines = 1, extend = false)
+    # to the first character that is not a space, or the line's start when
+    # there already
+    move_home(extend = false)
+    move_end(extend = false)
+    move_start(extend = false)
+    move_finish(extend = false)
+
+    # Editing
+    # text typed: in place of the selection
+    type(text = "")
+    # Enter: a new line indented as this one, one more after a line that
+    # opens a block
+    newline()
+    backspace(word = false, smart = true)
+    delete(word = false)
+    # Tab: the selected lines indented, or spaces to the next stop
+    indent()
+    outdent()
+    toggle_comment()
+    duplicate_lines()
+    # the selected lines up (-1) or down (1)
+    move_lines(dir = 1)
+    # the selection taken out, or the caret's line when none: its text
+    cut() -> str
+    # what Ctrl+C copies: the selection, or the caret's line and its end
+    copy() -> str
+    paste(text = "")
+
+    # History
+    undo() -> bool
+    redo() -> bool
+    get_can_undo() -> bool
+    get_can_redo() -> bool
+    # what the history is at: compared with what it was when saved
+    get_state() -> int
+    # the text in place of what it held, its history let go
+    reset(text = "")

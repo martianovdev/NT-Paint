@@ -1,0 +1,54 @@
+# widgets/text_box — text in a dark field, with an icon before it, or a
+# swatch: the field filled with a colour and its text over it in black or
+# white, whichever reads.
+
+from ui import Icon, TextBox
+from graphics import Align
+from view import Layout
+
+extend TextBox:
+    icon = Icon.none
+    swatch = -1
+
+    init(ui = &Ui, parent = &View, text = "", icon = Icon.none):
+        self.ui = ui
+        self.text = text
+        self.icon = icon
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_min_size(40.0, ui.theme.field_height)
+        self.view.set_clip(true)
+        on self.view.draw():
+            self.draw()
+
+    set_text(text = ""):
+        self.text = text
+
+    set_swatch(rgb = -1):
+        self.swatch = rgb
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        edge = t.field_edge if self.view.get_hovered() else t.line
+        if self.swatch >= 0:
+            ui.fill_round(x, y, w, h, t.radius, self.swatch)
+            r = (self.swatch >> 16) & 0xFF
+            g = (self.swatch >> 8) & 0xFF
+            b = self.swatch & 0xFF
+            light = r * 299 + g * 587 + b * 114 > 140000
+            ui.text(x, y, w, h, self.text, 0x141414 if light else 0xF2F2F2, Align.center + Align.middle, t.small)
+            ui.outline_round(x, y, w, h, t.radius, edge)
+            return
+        ui.fill_round(x, y, w, h, t.radius, t.field)
+        ui.outline_round(x, y, w, h, t.radius, edge)
+        left = x + t.text_pad
+        ink = t.ink
+        # what names a file: its icon, the name softer, "None" faint
+        if self.icon != Icon.none:
+            empty = self.text == "None"
+            ui.icon(self.icon, x + t.text_pad - 2.0, y + (h - 16.0) * 0.5, 16.0)
+            left += 18.0
+            ink = t.ink_faint if empty else t.ink_soft
+        ui.text(left, y, w - (left - x) - t.text_pad, h, self.text, ink, Align.left + Align.middle, t.size)

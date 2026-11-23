@@ -1,0 +1,73 @@
+# widgets/color_field — a colour as natiny's editor shows one: a swatch
+# filling the field (over a checker when it is see-through) with its hex
+# on it in black or white, whichever reads; a press opens the colour
+# panel under it, and what the panel hands over is told.
+
+from ui import ColorField, ColorPicker
+from graphics import Align
+from window import Button, Cursor
+from view import Layout
+
+extend ColorField:
+    picker = &ColorPicker
+    rgb = 0xFFFFFF
+    alpha = 1.0
+
+    init(ui = &Ui, parent = &View):
+        self.ui = ui
+        self.picker = &ColorPicker(ui)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_min_size(40.0, ui.theme.field_height)
+        on self.view.draw():
+            self.draw()
+        on self.picker.changed(rgb = 0, alpha = 1.0):
+            self.rgb = rgb
+            self.alpha = alpha
+            emit changed(rgb, alpha)
+
+    set_color(rgb = 0, alpha = 1.0):
+        self.rgb = rgb
+        self.alpha = alpha
+
+    get_open() -> bool:
+        return self.picker.get_open()
+
+    update():
+        ui = self.ui
+        self.picker.update()
+        if not self.picker.get_open() and ui.window.input_get_mouse_button_pressed(Button.left) and self.view.get_hovered():
+            x, y, _, h = ui.rect(self.view)
+            self.picker.open(x, y, h, self.rgb, self.alpha)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        hot = self.view.get_hovered() or self.picker.get_open()
+        if self.view.get_hovered():
+            ui.want_cursor(Cursor.hand)
+        ui.gradient(3, x, y, w, h, 0.0, ui.color(self.rgb, self.alpha), t.radius)
+        r = (self.rgb >> 16) & 255
+        g = (self.rgb >> 8) & 255
+        b = self.rgb & 255
+        light = r * 299 + g * 587 + b * 114 > 140000 or self.alpha < 0.5
+        ui.text(x, y, w, h, Hex.of(self.rgb, self.alpha), 0x141414 if light else 0xF2F2F2, Align.center + Align.middle, t.small)
+        ui.outline_round(x, y, w, h, t.radius, t.field_edge if hot else t.line)
+
+Hex:
+    of(rgb = 0, alpha = 1.0) -> str:
+        digits = "0123456789ABCDEF"
+        a = int(clamp(round(alpha * 255.0), 0.0, 255.0))
+        value = rgb
+        count = 6
+        if a < 255:
+            value = (rgb << 8) | a
+            count = 8
+        out = "#"
+        k = count - 1
+        while k >= 0:
+            d = (value >> (k * 4)) & 15
+            out += digits.slice(d, d + 1)
+            k -= 1
+        return out

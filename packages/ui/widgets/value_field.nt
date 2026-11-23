@@ -1,0 +1,173 @@
+# widgets/value_field — a number dragged across or typed: the field
+# remembers the value and the pointer where the press began, and once the
+# pointer has gone 3 units every frame of the drag sets value = start +
+# travel × step.  A press let go of without a drag types the number, all
+# of it selected: Enter, Tab or the focus gone keeps it (when it reads as
+# a number), Escape lets it go.  Drawn as natiny's: a dark field, the axis
+# letter small in its colour, the number after it.
+
+from ui import LineEdit, ValueField
+from graphics import Align
+from window import Button, Cursor, Key
+from view import Layout
+
+extend ValueField:
+    rgb = 0
+    enabled = true
+    dragging = false
+    grab_pointer = 0.0
+    grab_value = 0.0
+    # a press not yet a drag; the number being typed
+    pressing = false
+    line = none(&LineEdit)
+
+    init(ui = &Ui, parent = &View, label = "", rgb = -1, step = 0.1):
+        self.ui = ui
+        self.label = label
+        self.rgb = rgb if rgb >= 0 else ui.theme.ink_muted
+        self.step = step
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_min_size(32.0, ui.theme.field_height)
+        self.view.set_clip(true)
+        on self.view.draw():
+            self.draw()
+
+    set_value(value = 0.0):
+        self.value = value
+
+    set_enabled(enabled = true):
+        self.enabled = enabled
+        if not enabled:
+            self.dragging = false
+            self.pressing = false
+
+    get_editing() -> bool:
+        return self.line != none
+
+    update():
+        ui = self.ui
+        views = ui.views
+        px, _ = self.view.get_pointer()
+        if l := self.line:
+            self.typing(l)
+            return
+        if self.enabled and self.view.get_hovered() and not self.dragging:
+            wheel = ui.wheel_steps()
+            if wheel != 0:
+                self.value += self.step * float(wheel)
+                emit changed(self.value)
+                emit committed()
+                return
+        if self.enabled and self.view.get_pressed():
+            if not self.pressing and not self.dragging:
+                self.pressing = true
+                self.grab_pointer = px
+                self.grab_value = self.value
+            if self.pressing and abs(px - self.grab_pointer) > 3.0:
+                self.pressing = false
+                self.dragging = true
+                self.grab_pointer = px
+            if self.dragging:
+                value = self.grab_value + (px - self.grab_pointer) * self.step
+                if value != self.value:
+                    self.value = value
+                    emit changed(value)
+        elif self.dragging:
+            self.dragging = false
+            if self.value != self.grab_value:
+                emit committed()
+        elif self.pressing:
+            # a click: the number typed
+            self.pressing = false
+            self.view.set_focusable(true)
+            views.set_focus(self.view)
+            l = &LineEdit(ui)
+            l.begin(Format.number(self.value))
+            self.line = l
+
+    # ─── Inside ───
+
+    typing(l = &LineEdit):
+        ui = self.ui
+        views = ui.views
+        win = ui.window
+        ui.hold_keys()
+        if self.view.get_hovered():
+            wheel = ui.wheel_steps()
+            if wheel != 0:
+                value = self.typed_value(l) + self.step * float(wheel)
+                if value != self.value:
+                    self.value = value
+                    emit changed(value)
+                    emit committed()
+                l.begin(Format.number(self.value))
+                return
+        keep = 0
+        if not self.view.get_focused() or win.input_get_key_pressed(Key.tab) or (win.input_get_mouse_button_pressed(Button.left) and not self.view.get_hovered()):
+            keep = 1
+        else:
+            _, _, w, _ = ui.rect(self.view)
+            left = self.text_left()
+            l.pointer(self.view, left - 4.0, w - left + 3.0)
+            keep = l.update()
+        if keep == 0:
+            return
+        self.line = none
+        if self.view.get_focused():
+            views.set_focus(none)
+        if keep == 1:
+            v = self.typed_value(l)
+            if v != self.value:
+                self.value = v
+                emit changed(v)
+                emit committed()
+
+    typed_value(l = &LineEdit) -> float:
+        typed = l.get_text().strip()
+        typed.replace(",", ".")
+        if v := typed.to_float():
+            if v == v:
+                return v
+        return self.value
+
+    # where the number starts, from the field's left
+    text_left() -> float:
+        t = self.ui.theme
+        return (6.0 + t.value_label) if self.label != "" else t.text_pad
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        hot = self.enabled and (self.view.get_hovered() or self.dragging)
+        # dragged left and right
+        if hot and self.line == none:
+            ui.want_cursor(Cursor.resize_ew)
+        ui.fill_round(x, y, w, h, t.radius, t.field_hot if hot else t.field)
+        ui.outline_round(x, y, w, h, t.radius, t.field_edge if hot else t.line)
+        left = x + t.text_pad
+        if self.label != "":
+            left = x + 6.0
+            ui.text(left, y, t.value_label, h, self.label, self.rgb if self.enabled else t.ink_faint, Align.left + Align.middle, t.small)
+            left += t.value_label
+        ink = t.ink if self.enabled else t.ink_faint
+        if l := self.line:
+            # LineEdit pads its text by 4
+            l.draw(left - 4.0, y + 1.0, w - (left - x) + 3.0, h - 2.0, t.size)
+            return
+        ui.text(left, y, w - (left - x) - 4.0, h, Format.number(self.value), ink, Align.left + Align.middle, t.size)
+
+Format:
+    # three decimals at most, the zeros after the point dropped
+    number(value = 0.0) -> str:
+        scaled = int(value * 1000.0 + (0.5 if value >= 0.0 else -0.5))
+        sign = "-" if scaled < 0 else ""
+        whole = abs(scaled) / 1000
+        part = abs(scaled) % 1000
+        if part == 0:
+            return f"{sign}{whole}"
+        digits = f"{part + 1000}".slice(1, 4)
+        while digits.ends_with("0"):
+            digits.truncate(len(digits) - 1)
+        return f"{sign}{whole}.{digits}"

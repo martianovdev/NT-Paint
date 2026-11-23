@@ -1,0 +1,254 @@
+# gpu — the context: shaders made once by name, passes over rectangles
+# of surfaces with blending off, pictures up from bitmaps and back.
+
+from imaging import Gpu
+from graphics import Blend, Color, Filter, Material, MaterialState, Picture, Texture
+from raster import Bitmap, Rect
+
+extend Gpu:
+    materials = [str: &Material]
+    white = none(&Texture)
+
+    init(graphics = &Graphics):
+        self.graphics = graphics
+
+    material(name = "", body = "", sel = false, blend = false) -> &Material:
+        if m := self.materials.get(name):
+            return m
+        src = Shaders.head()
+        if sel:
+            src += Shaders.selection()
+        if blend:
+            src += Shaders.blend()
+        src += body
+        g = self.graphics
+        made = g.material_create(g.shader_load(src))
+        made.set_state(MaterialState(Blend.replace))
+        self.materials[name] = made
+        return made
+
+    surface(w = 0, h = 0) -> &Surface:
+        return self.graphics.surface_create(max(w, 1), max(h, 1))
+
+    run(target = &Surface, m = &Material, x = 0.0, y = 0.0, w = 0.0, h = 0.0):
+        if w <= 0.0 or h <= 0.0:
+            return
+        g = self.graphics
+        m.set_constant("rect", x, y, w, h)
+        m.set_constant("size", float(target.get_width()), float(target.get_height()), 0.0, 0.0)
+        g.surface_bind(target)
+        g.material_bind(m)
+        g.render_set_color(Color(1.0, 1.0, 1.0, 1.0))
+        g.render_rectangle(x, y, w, h)
+        g.material_unbind()
+        g.surface_unbind()
+
+    clear(target = &Surface, c = 0):
+        self.fill(target, Rect(0, 0, target.get_width(), target.get_height()), c)
+
+    fill(target = &Surface, r = Rect(), c = 0):
+        m = self.material("fill", Shaders.fill())
+        m.set_constant("paint", Shaders.channel(c, 16), Shaders.channel(c, 8), Shaders.channel(c, 0), Shaders.channel(c, 24))
+        self.run(target, m, float(r.x), float(r.y), float(r.w), float(r.h))
+
+    copy(dst = &Surface, src = &Texture, r = Rect()):
+        c = r.clip(dst.get_width(), dst.get_height())
+        if c.empty():
+            return
+        m = self.material("copy", Shaders.copy())
+        m.set_texture("src", src, Filter.nearest, Filter.nearest)
+        self.run(dst, m, float(c.x), float(c.y), float(c.w), float(c.h))
+
+    blit(dst = &Surface, src = &Texture, src_w = 0, src_h = 0, sx = 0, sy = 0, dx = 0, dy = 0, w = 0, h = 0):
+        if w <= 0 or h <= 0:
+            return
+        m = self.material("blit", Shaders.blit())
+        m.set_texture("src", src, Filter.nearest, Filter.nearest)
+        m.set_constant("map", float(sx - dx), float(sy - dy), float(src_w), float(src_h))
+        self.run(dst, m, float(dx), float(dy), float(w), float(h))
+
+    upload(b = Bitmap()) -> &Surface:
+        s = self.surface(b.width, b.height)
+        self.upload_into(s, b)
+        return s
+
+    upload_into(dst = &Surface, b = Bitmap()):
+        if b.width <= 0 or b.height <= 0:
+            return
+        tex = self.graphics.texture_layers_create(b.width, b.height, 1, false)
+        tex.set_layer(0, Picture(b.width, b.height, b.pixels))
+        m = self.material("upload", Shaders.upload())
+        m.set_texture("pic", tex, Filter.nearest, Filter.nearest)
+        self.run(dst, m, 0.0, 0.0, float(b.width), float(b.height))
+
+    download(s = &Surface) -> Bitmap:
+        p = self.graphics.surface_read(s)
+        return Bitmap.adopt(p.width, p.height, p.pixels)
+
+    mask_texture(m = Mask(), reuse = none(&Texture)) -> &Texture:
+        w = max(m.width, 1)
+        h = max(m.height, 1)
+        tex = reuse
+        if existing := tex:
+            if existing.get_width() != w or existing.get_height() != h:
+                tex = none
+        if tex == none:
+            tex = self.graphics.texture_layers_create(w, h, 1, false)
+        out = tex.expect("mask texture")
+        if m.width > 0 and m.height > 0:
+            px = [u8]
+            for v in m.data:
+                px.push(v)
+                px.push(v)
+                px.push(v)
+                px.push(u8(255))
+            out.set_layer(0, Picture(m.width, m.height, px))
+        return out
+
+    everything() -> &Texture:
+        if t := self.white:
+            return t
+        tex = self.graphics.texture_layers_create(1, 1, 1, false)
+        tex.set_layer(0, Picture(1, 1, [u8(255), u8(255), u8(255), u8(255)]))
+        self.white = tex
+        return tex
+
+    duplicate(s = &Surface) -> &Surface:
+        out = self.surface(s.get_width(), s.get_height())
+        self.copy(out, s.get_texture(), Rect(0, 0, s.get_width(), s.get_height()))
+        return out
+
+# The shaders' shared text.  A pass draws a rectangle: uv runs 0…1 across
+# it, px() is the target pixel it is at (rect: the rectangle in the
+# target's pixels), tuv() a pixel's place in a texture of the target's
+# size (size).
+Shaders:
+    channel(c = 0, shift = 0) -> float:
+        return float((c >> shift) & 255) / 255.0
+
+    head() -> str:
+        return """
+attribute vec3 position;
+attribute vec2 texcoord0;
+attribute vec4 color0;
+varying vec2 uv;
+uniform mat4 mtx_worldviewproj;
+uniform vec4 rect;
+uniform vec4 size;
+
+void vertex()
+{
+    uv = texcoord0;
+    POSITION = mtx_worldviewproj * vec4(position, 1.0);
+}
+
+vec2 px()
+{
+    return rect.xy + uv * rect.zw;
+}
+
+vec2 tuv(vec2 p)
+{
+    return p / size.xy;
+}
+"""
+
+    # how much a pixel is selected: sel's red (a texture of one layer)
+    selection() -> str:
+        return """
+uniform sampler2DArray sel;
+
+float selk(vec2 t)
+{
+    return texture(sel, vec3(t, 0.0)).r;
+}
+"""
+
+    # paint.net's blend modes on straight colours: blendf mixes where both
+    # are, over() composites top over bottom
+    blend() -> str:
+        return """
+float bch(float m, float t, float b)
+{
+    if (m < 0.5) { return t; }
+    if (m < 1.5) { return t * b; }
+    if (m < 2.5) { return min(1.0, t + b); }
+    if (m < 3.5) { return t <= 0.0 ? 0.0 : max(0.0, 1.0 - (1.0 - b) / t); }
+    if (m < 4.5) { return t >= 1.0 ? 1.0 : min(1.0, b / (1.0 - t)); }
+    if (m < 5.5) { return t >= 1.0 ? 1.0 : min(1.0, b * b / (1.0 - t)); }
+    if (m < 6.5) { return b >= 1.0 ? 1.0 : min(1.0, t * t / (1.0 - b)); }
+    if (m < 7.5) { return b < 0.5 ? 2.0 * b * t : 1.0 - 2.0 * (1.0 - b) * (1.0 - t); }
+    if (m < 8.5) { return abs(b - t); }
+    if (m < 9.5) { return 1.0 - abs(1.0 - b - t); }
+    if (m < 10.5) { return max(b, t); }
+    if (m < 11.5) { return min(b, t); }
+    if (m < 12.5) { return 1.0 - (1.0 - b) * (1.0 - t); }
+    float ti = floor(t * 255.0 + 0.5);
+    float bi = floor(b * 255.0 + 0.5);
+    float x = 0.0;
+    float p = 1.0;
+    for (int i = 0; i < 8; i++)
+    {
+        float tb = mod(floor(ti / p), 2.0);
+        float bb = mod(floor(bi / p), 2.0);
+        if (tb != bb) { x += p; }
+        p *= 2.0;
+    }
+    return x / 255.0;
+}
+
+vec3 blendf(float m, vec3 t, vec3 b)
+{
+    return vec3(bch(m, t.r, b.r), bch(m, t.g, b.g), bch(m, t.b, b.b));
+}
+
+vec4 over(vec4 top, vec4 bot, float m)
+{
+    float sa = top.a;
+    float da = bot.a;
+    float oa = sa + da * (1.0 - sa);
+    if (oa <= 0.0) { return vec4(0.0, 0.0, 0.0, 0.0); }
+    vec3 f = blendf(m, top.rgb, bot.rgb);
+    vec3 c = (top.rgb * sa * (1.0 - da) + bot.rgb * da * (1.0 - sa) + f * sa * da) / oa;
+    return vec4(clamp(c, 0.0, 1.0), oa);
+}
+"""
+
+    fill() -> str:
+        return """
+uniform vec4 paint;
+void fragment()
+{
+    COLOR = paint;
+}
+"""
+
+    copy() -> str:
+        return """
+uniform sampler2D src;
+void fragment()
+{
+    COLOR = texture(src, tuv(px()));
+}
+"""
+
+    # map: the offset from the target's pixel to the source's, and the
+    # source's size
+    blit() -> str:
+        return """
+uniform sampler2D src;
+uniform vec4 map;
+void fragment()
+{
+    COLOR = texture(src, (px() + map.xy) / map.zw);
+}
+"""
+
+    upload() -> str:
+        return """
+uniform sampler2DArray pic;
+void fragment()
+{
+    COLOR = texture(pic, vec3(tuv(px()), 0.0));
+}
+"""

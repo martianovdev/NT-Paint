@@ -1,0 +1,83 @@
+# widgets/scroll_view — what is laid out taller than its box, scrolled:
+# the box clips, its body (vertical, as wide as the box) is moved up by
+# the scroll; the wheel over the box scrolls, and the scroll bar along the
+# right edge, in a column of its own beside the body, is dragged.  The body's width and place are set as
+# the tree is laid out (arrange), the box's width known: a resize lays the
+# body out again in the same frame, edge to edge, not a frame late.
+
+from ui import ScrollBar, ScrollView
+from view import Layout
+
+extend ScrollView:
+    bar = &ScrollBar
+    scroll = 0.0
+    # the width the body was given last: given again only when it changes
+    width = -1.0
+    # the body's right padding: the bar takes its place, 2 from the content
+    right = 0.0
+
+    init(ui = &Ui, parent = &View):
+        self.ui = ui
+        self.bar = &ScrollBar(ui, true)
+        self.bar.set_beside(true)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_clip(true)
+        self.body = ui.create(Layout.vertical, self.view)
+        on self.view.arrange():
+            self.fit()
+        on self.view.draw():
+            self.view.render_children()
+            x, y, w, h = self.ui.rect(self.view)
+            self.bar.draw(x, y, w, h, self.content(), h, self.scroll)
+
+    set_padding(left = 0.0, top = 0.0, right = 0.0, bottom = 0.0):
+        self.right = right
+        self.body.set_padding(left, top, right, bottom)
+
+    get_scroll() -> float:
+        return self.scroll
+
+    set_scroll(scroll = 0.0):
+        self.scroll = scroll
+
+    reveal(top = 0.0, h = 0.0):
+        _, _, _, vh = self.ui.rect(self.view)
+        if top < self.scroll:
+            self.scroll = top
+        elif top + h > self.scroll + vh:
+            self.scroll = top + h - vh
+
+    update():
+        ui = self.ui
+        x, y, w, h = ui.rect(self.view)
+        over = self.view.get_hovered()
+        if over and self.content() > h + 0.5:
+            wheel = ui.take_wheel()
+            if wheel != 0.0:
+                self.scroll -= wheel * 34.0
+                self.bar.wake()
+        if over or self.bar.get_dragging():
+            self.scroll = self.bar.update(x, y, w, h, self.content(), h, self.scroll)
+        self.fit()
+
+    # ─── Inside ───
+
+    # the body as wide as the box, moved up by the scroll (kept within what
+    # the body has to show)
+    fit():
+        ui = self.ui
+        _, _, box_w, h = ui.rect(self.view)
+        # left of the bar's column while there is anything to scroll
+        room = self.bar.room(self.content(), h)
+        w = box_w if room == 0.0 else box_w - room - 2.0 + self.right
+        if w != self.width:
+            self.width = w
+            self.body.set_min_size(w, 0.0)
+            self.body.set_max_size(w, 0.0)
+        self.scroll = clamp(self.scroll, 0.0, max(0.0, self.content() - h))
+        self.body.set_offset(0.0, -self.scroll)
+
+    content() -> float:
+        _, _, _, ch = self.ui.rect(self.body)
+        return ch

@@ -1,0 +1,446 @@
+# workspace/colors — paint.net's Colors window: the primary and secondary
+# colours (the one being edited outlined; a click on the other edits it),
+# the arrow that swaps them and the black-and-white reset, the colour
+# wheel (hue around, saturation outwards), the palette's swatches (left
+# click the primary, right the secondary), and - while it is "More" - the
+# R G B, hex, H S V and alpha of the colour, each a bar with a number.
+
+from graphics import Align, Color
+from window import Button, Cursor
+from view import Layout, View
+from ui import FloatPanel, Icon, ScrollView, SpinField, TextField, Ui
+from i18n import Tr
+from raster import Pixel
+from tools.session import Session
+
+ColorsPanel:
+    ui = &Ui
+    tr = &Tr
+    session = &Session
+    panel = &FloatPanel
+    scroll = &ScrollView
+    body = &View
+    more_hot = false
+    artwork_state = (0.0, 0.0, 0.0)
+    more = true
+    compact_w = 228.0
+    expanded_w = 416.0
+    channels_w = 176.0
+    field_w = 64.0
+    field_h = 22.0
+    row_step = 26.0
+    hex_y = 106.0
+    slider_x = 18.0
+    slider_w = 82.0
+    # editing the secondary colour (else the primary)
+    secondary = false
+    # what is being dragged: 0 nothing, 1 the wheel, 10 + k bar k
+    drag = 0
+    # the colour edited, as hue, saturation, value (kept apart from its
+    # RGB so a grey keeps its hue)
+    h = 0.0
+    s = 0.0
+    v = 0.0
+    shown = 0
+    spins = [&SpinField]
+    hex = &TextField
+    palette = [int]
+
+    init(ui = &Ui, parent = &View, tr = &Tr, session = &Session):
+        self.ui = ui
+        self.tr = tr
+        self.session = session
+        self.panel = &FloatPanel(ui, parent, "", self.expanded_w, 331.0)
+        self.panel.set_min_size(self.expanded_w, 86.0)
+        self.scroll = &ScrollView(ui, self.panel.body)
+        self.body = ui.create(Layout.free, self.scroll.body)
+        self.body.set_expand(true)
+        self.body.set_min_size(0.0, 300.0)
+        self.hex = &TextField(ui, self.body, "000000")
+        on session.colors_changed():
+            self.body.render_once()
+        ranges = [255, 255, 255, 360, 100, 100, 255]
+        for i in range(7):
+            sp = &SpinField(ui, self.body, 0, 0, ranges[i], self.field_w)
+            k = i
+            on sp.changed(value = 0):
+                self.typed(k, value)
+            self.spins.push(sp)
+        on self.body.draw():
+            self.draw()
+            self.body.render_children()
+        on self.body.mouse_down():
+            self.press()
+        self.hex.view.set_expand(false)
+        self.hex.view.set_min_size(self.field_w, self.field_h)
+        self.hex.view.set_max_size(self.field_w, self.field_h)
+        on self.body.arrange():
+            field_x = self.channels_left() + self.channels_w - self.field_w
+            self.hex.view.set_offset(field_x, self.hex_y)
+            for i, sp in self.spins.enumerate():
+                sp.view.set_offset(field_x, self.row_y(i))
+        on self.hex.committed(text = ""):
+            if c := Pixel.parse_hex(text, Pixel.alpha(self.color())):
+                self.set_color(c)
+        self.palette = ColorsPanel.default_palette()
+        self.take()
+
+    retitle():
+        self.panel.set_title(self.tr.t("win.colors"))
+        self.body.render_once()
+
+    # The sliders and inputs share the same row tops.
+    row_y(i = 0) -> float:
+        if i < 3:
+            return self.hex_y - float(3 - i) * self.row_step
+        if i < 6:
+            return 158.0 + float(i - 3) * self.row_step
+        return 264.0
+
+    default_palette() -> [int]:
+        out = [int]
+        hues = [0.0, 30.0, 45.0, 60.0, 90.0, 120.0, 150.0, 180.0, 200.0, 225.0, 255.0, 285.0, 315.0, 340.0]
+        greys = [0x000000, 0x404040, 0xFFFFFF, 0x808080, 0xA0A0A0, 0x303030]
+        rows = [(100.0, 100.0), (100.0, 55.0), (45.0, 100.0), (60.0, 75.0), (100.0, 100.0), (25.0, 100.0)]
+        for r, row in rows.enumerate():
+            sat, val = row
+            out.push(Pixel.rgb(greys[r]))
+            out.push(Pixel.rgb(greys[(r + 3) % 6]))
+            for hue in hues:
+                a = 255 if r < 4 else 128
+                out.push(Pixel.from_hsv(hue, sat, val, a))
+        return out
+
+    color() -> int:
+        return self.session.secondary if self.secondary else self.session.primary
+
+    set_color(c = 0):
+        if self.secondary:
+            self.session.set_secondary(c)
+        else:
+            self.session.set_primary(c)
+        self.take()
+
+    # the colour edited taken into hue, saturation, value and the fields
+    take():
+        c = self.color()
+        h, s, v = Pixel.to_hsv(c)
+        if s > 0.0 and v > 0.0:
+            self.h = h
+        if v > 0.0:
+            self.s = s
+        self.v = v
+        self.shown = c
+        vals = [Pixel.red(c), Pixel.green(c), Pixel.blue(c), int(round(self.h)), int(round(self.s)), int(round(self.v)), Pixel.alpha(c)]
+        for i, sp in self.spins.enumerate():
+            if not sp.get_editing():
+                sp.set_value(vals[i])
+        if not self.hex.get_editing():
+            self.hex.set_text(Pixel.hex(c))
+
+    # a field typed into: its channel set
+    typed(k = 0, value = 0):
+        c = self.color()
+        r = Pixel.red(c)
+        g = Pixel.green(c)
+        b = Pixel.blue(c)
+        a = Pixel.alpha(c)
+        match k:
+            case 0:
+                self.set_color(Pixel.pack(value, g, b, a))
+            case 1:
+                self.set_color(Pixel.pack(r, value, b, a))
+            case 2:
+                self.set_color(Pixel.pack(r, g, value, a))
+            case 3:
+                self.h = float(value)
+                self.set_hsv()
+            case 4:
+                self.s = float(value)
+                self.set_hsv()
+            case 5:
+                self.v = float(value)
+                self.set_hsv()
+            case _:
+                self.set_color(Pixel.with_alpha(c, value))
+
+    set_hsv():
+        c = Pixel.from_hsv(self.h, self.s, self.v, Pixel.alpha(self.color()))
+        if self.secondary:
+            self.session.set_secondary(c)
+        else:
+            self.session.set_primary(c)
+        self.shown = c
+        h = self.h
+        s = self.s
+        v = self.v
+        self.take()
+        self.h = h
+        self.s = s
+        self.v = v
+
+    set_more(more = true):
+        self.more = more
+        self.body.render_once()
+        width = self.expanded_w if more else self.compact_w
+        change = self.expanded_w - self.compact_w
+        self.panel.set_min_size(width, 86.0)
+        _, _, available, _ = self.ui.rect(self.panel.root.get_parent().expect("parent"))
+        wanted = self.panel.w + (change if more else -change)
+        self.panel.set_size(clamp(wanted, width, max(width, available)), self.panel.h)
+        for sp in self.spins:
+            sp.view.set_visible(more)
+        self.hex.view.set_visible(more)
+
+    # ─── Input ───
+
+    wheel_box() -> (float, float, float):
+        return 80.0, 126.0, 68.0
+
+    press():
+        px, py = self.body.get_pointer()
+        win = self.ui.window
+        right = win.input_get_mouse_button_pressed(Button.right)
+        _ = right
+        # the swatches
+        if px >= 10.0 and px < 42.0 and py >= 10.0 and py < 42.0:
+            self.secondary = false
+            self.body.render_once()
+            self.take()
+            return
+        if px >= 28.0 and px < 60.0 and py >= 26.0 and py < 58.0:
+            self.secondary = true
+            self.body.render_once()
+            self.take()
+            return
+        if px >= 62.0 and px < 78.0 and py >= 6.0 and py < 22.0:
+            self.session.swap_colors()
+            self.take()
+            return
+        if px >= 6.0 and px < 22.0 and py >= 60.0 and py < 76.0:
+            self.session.reset_colors()
+            self.take()
+            return
+        # Less / More
+        if px >= 120.0 and px < 204.0 and py >= 8.0 and py < 28.0:
+            self.set_more(not self.more)
+            return
+        cx, cy, r = self.wheel_box()
+        if (px - cx) * (px - cx) + (py - cy) * (py - cy) <= (r + 4.0) * (r + 4.0):
+            self.drag = 1
+            return
+        # add to the palette
+        if px >= 10.0 and px < 26.0 and py >= 200.0 and py < 216.0:
+            self.palette.insert(0, self.color())
+            _ = self.palette.pop()
+            self.body.render_once()
+            return
+        cell = self.cell_at(px, py)
+        if cell >= 0:
+            self.set_color(self.palette[cell])
+            return
+        if self.more:
+            bx = self.channels_left() + self.slider_x
+            for i in range(7):
+                ry = self.row_y(i)
+                if px >= bx - 4.0 and px < bx + self.slider_w + 4.0 and py >= ry and py < ry + self.field_h:
+                    self.drag = 10 + i
+                    return
+
+    channels_left() -> float:
+        _, _, w, _ = self.ui.rect(self.body)
+        return w - self.channels_w - 2.0
+
+    palette_columns() -> int:
+        _, _, w, _ = self.ui.rect(self.body)
+        right = self.channels_w + 8.0 if self.more else 0.0
+        return max(1, int(floor((w - right - 10.0) / 12.0)))
+
+    cell_at(px = 0.0, py = 0.0) -> int:
+        if px < 10.0 or py < 222.0:
+            return -1
+        columns = self.palette_columns()
+        col = int(floor((px - 10.0) / 12.0))
+        row = int(floor((py - 222.0) / 12.0))
+        if col >= columns:
+            return -1
+        i = row * columns + col
+        return i if i < len(self.palette) else -1
+
+    update():
+        self.panel.update()
+        for sp in self.spins:
+            sp.update()
+        self.hex.update()
+        if self.panel.get_visible():
+            self.scroll.update()
+        ui = self.ui
+        win = ui.window
+        # the right button on a swatch takes it as the secondary
+        if self.body.get_hovered() and win.input_get_mouse_button_pressed(Button.right):
+            px, py = self.body.get_pointer()
+            cell = self.cell_at(px, py)
+            if cell >= 0:
+                self.session.set_secondary(self.palette[cell])
+                self.take()
+        if self.shown != self.color() and self.drag == 0:
+            self.take()
+        self.update_drag()
+        state = (self.h, self.s, self.v)
+        if state != self.artwork_state:
+            self.artwork_state = state
+            self.body.render_once()
+        self.feedback()
+
+    update_drag():
+        win = self.ui.window
+        if self.drag == 0:
+            return
+        if not win.input_get_mouse_button_down(Button.left):
+            self.drag = 0
+            return
+        px, py = self.body.get_pointer()
+        if self.drag == 1:
+            cx, cy, r = self.wheel_box()
+            dx = px - cx
+            dy = py - cy
+            self.h = atan2(dy, dx) * 180.0 / 3.141592653589793
+            if self.h < 0.0:
+                self.h += 360.0
+            self.s = clamp(sqrt(dx * dx + dy * dy) / r, 0.0, 1.0) * 100.0
+            if self.v <= 0.0:
+                self.v = 100.0
+            self.set_hsv()
+            return
+        k = self.drag - 10
+        t = clamp((px - self.channels_left() - self.slider_x) / self.slider_w, 0.0, 1.0)
+        maxes = [255.0, 255.0, 255.0, 360.0, 100.0, 100.0, 255.0]
+        self.typed(k, int(round(t * maxes[k])))
+
+    feedback():
+        px, py = self.body.get_pointer()
+        over = self.panel.get_visible() and self.body.get_hovered()
+        hot = over and px >= 120.0 and px < 204.0 and py >= 8.0 and py < 28.0
+        if self.more_hot != hot:
+            self.more_hot = hot
+            self.body.render_once()
+        if not over:
+            return
+        ui = self.ui
+        tr = self.tr
+        if px >= 10.0 and px < 42.0 and py >= 10.0 and py < 42.0:
+            ui.tip(tr.t("colors.primary"))
+            ui.want_cursor(Cursor.hand)
+        elif px >= 28.0 and px < 60.0 and py >= 26.0 and py < 58.0:
+            ui.tip(tr.t("colors.secondary"))
+            ui.want_cursor(Cursor.hand)
+        elif px >= 62.0 and px < 78.0 and py >= 6.0 and py < 22.0:
+            ui.tip(tr.t("colors.swap"))
+        elif px >= 6.0 and px < 22.0 and py >= 60.0 and py < 76.0:
+            ui.tip(tr.t("colors.reset"))
+        elif px >= 10.0 and px < 26.0 and py >= 200.0 and py < 216.0:
+            ui.tip(tr.t("colors.add"))
+        elif self.cell_at(px, py) >= 0:
+            ui.want_cursor(Cursor.hand)
+
+    # ─── Drawing ───
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.body)
+        ui.fill(x, y, w, h, t.panel)
+        tr = self.tr
+        p = self.session.primary
+        s = self.session.secondary
+        # the secondary under the primary, each on the checker
+        self.swatch(x + 28.0, y + 26.0, 32.0, 32.0, s, self.secondary)
+        self.swatch(x + 10.0, y + 10.0, 32.0, 32.0, p, not self.secondary)
+        ui.icon(Icon.swap_colors, x + 62.0, y + 6.0, 16.0, -1)
+        ui.icon(Icon.reset_colors, x + 6.0, y + 60.0, 16.0, -1)
+        # Less / More
+        ui.fill_round(x + 120.0, y + 8.0, 84.0, 20.0, t.radius, t.button_hot if self.more_hot else t.button)
+        ui.text(x + 120.0, y + 8.0, 84.0, 20.0, tr.t("colors.less") if self.more else tr.t("colors.more"), t.ink, Align.center + Align.middle, t.size)
+        # the wheel, a ring around the picked colour
+        cx, cy, r = self.wheel_box()
+        ui.gradient(4, x + cx - r, y + cy - r, r * 2.0, r * 2.0, 1.0)
+        a = self.h * 3.141592653589793 / 180.0
+        mx = x + cx + cos(a) * self.s / 100.0 * r
+        my = y + cy + sin(a) * self.s / 100.0 * r
+        ui.graphics.render_set_color(ui.color(0x000000))
+        ui.graphics.render_circle_outline(mx, my, 4.5, 1.5)
+        ui.graphics.render_set_color(ui.color(0xFFFFFF))
+        ui.graphics.render_circle_outline(mx, my, 3.0, 1.0)
+        # the palette
+        ui.icon(Icon.add_palette, x + 10.0, y + 200.0, 16.0, -1)
+        ui.icon(Icon.palette_menu, x + 32.0, y + 200.0, 16.0, -1)
+        columns = self.palette_columns()
+        for i, c in self.palette.enumerate():
+            col = i % columns
+            row = i / columns
+            self.swatch(x + 10.0 + float(col) * 12.0, y + 222.0 + float(row) * 12.0, 12.0, 12.0, c, false)
+        if not self.more:
+            return
+        # the fields' bars
+        x += self.channels_left()
+        bx = x + self.slider_x
+        c = self.color()
+        rr = Pixel.red(c)
+        gg = Pixel.green(c)
+        bb = Pixel.blue(c)
+        ui.text(x, y + 6.0, 60.0, 16.0, "RGB", t.ink, Align.left + Align.middle, t.size)
+        ui.line(x + 30.0, y + 14.0, x + self.channels_w, y + 14.0, t.line)
+        names = ["R:", "G:", "B:", "H:", "S:", "V:"]
+        for i in range(6):
+            ry = y + self.row_y(i)
+            ui.text(x, ry, self.slider_x, self.field_h, names[i], t.ink, Align.left + Align.middle, t.size)
+            ry += 4.0
+            match i:
+                case 0:
+                    self.bar(bx, ry, Pixel.pack(0, gg, bb), Pixel.pack(255, gg, bb), float(rr) / 255.0)
+                case 1:
+                    self.bar(bx, ry, Pixel.pack(rr, 0, bb), Pixel.pack(rr, 255, bb), float(gg) / 255.0)
+                case 2:
+                    self.bar(bx, ry, Pixel.pack(rr, gg, 0), Pixel.pack(rr, gg, 255), float(bb) / 255.0)
+                case 3:
+                    ui.gradient(1, bx, ry, self.slider_w, 12.0)
+                    self.marker(bx, ry, self.h / 360.0)
+                case 4:
+                    self.bar(bx, ry, Pixel.from_hsv(self.h, 0.0, self.v), Pixel.from_hsv(self.h, 100.0, self.v), self.s / 100.0)
+                case _:
+                    self.bar(bx, ry, 0xFF000000, Pixel.from_hsv(self.h, self.s, 100.0), self.v / 100.0)
+        ui.text(x, y + self.hex_y, 60.0, self.field_h, "HEX", t.ink, Align.left + Align.middle, t.size)
+        ui.text(x, y + 136.0, 60.0, 16.0, "HSV", t.ink, Align.left + Align.middle, t.size)
+        ui.line(x + 30.0, y + 144.0, x + self.channels_w, y + 144.0, t.line)
+        ui.text(x, y + 242.0, self.channels_w, 16.0, tr.t("colors.alpha"), t.ink, Align.left + Align.middle, t.size)
+        ay = y + self.row_y(6) + 4.0
+        col = ui.color(Pixel.opaque(c))
+        ui.gradient(2, bx, ay, self.slider_w, 12.0, 0.0, Color(col.r, col.g, col.b, 1.0))
+        self.marker(bx, ay, float(Pixel.alpha(c)) / 255.0)
+
+    bar(x = 0.0, y = 0.0, a = 0, b = 0, t = 0.0):
+        ui = self.ui
+        ca = ui.color(Pixel.opaque(a))
+        cb = ui.color(Pixel.opaque(b))
+        ui.graphics.render_set_color(Color(1.0, 1.0, 1.0, 1.0))
+        ui.graphics.render_rectangle_gradient(x, y, self.slider_w, 12.0, ca, cb, cb, ca)
+        self.marker(x, y, t)
+
+    # the triangle under a bar at t
+    marker(x = 0.0, y = 0.0, t = 0.0):
+        ui = self.ui
+        mx = x + clamp(t, 0.0, 1.0) * self.slider_w
+        ui.graphics.render_set_color(ui.color(0xFFFFFF))
+        ui.graphics.render_polygon([mx, y + 10.0, mx + 5.0, y + 17.0, mx - 5.0, y + 17.0])
+        ui.graphics.render_set_color(ui.color(0x000000))
+        ui.graphics.render_polygon_outline([mx, y + 10.0, mx + 5.0, y + 17.0, mx - 5.0, y + 17.0], 1.0)
+
+    # a colour on the checker, outlined (lit when it is the one edited)
+    swatch(x = 0.0, y = 0.0, w = 0.0, h = 0.0, c = 0, on = false):
+        ui = self.ui
+        col = ui.color(Pixel.opaque(c))
+        ui.gradient(3, x, y, w, h, 0.0, Color(col.r, col.g, col.b, float(Pixel.alpha(c)) / 255.0))
+        if w > 20.0:
+            ui.outline(x - 1.0, y - 1.0, w + 2.0, h + 2.0, 0xFFFFFF if on else 0x000000, 1.0)
+            if on:
+                ui.outline(x - 2.0, y - 2.0, w + 4.0, h + 4.0, 0x000000, 1.0)

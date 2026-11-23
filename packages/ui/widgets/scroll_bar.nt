@@ -1,0 +1,129 @@
+# widgets/scroll_bar — a scroll bar as VS Code draws one: a thin track
+# along the right (or bottom) edge of a box, over what it scrolls, its
+# thumb as long as the part in sight is of the whole.  It shows while the
+# pointer is over the box, while it is held and for a moment after a
+# scroll, and fades out; with all in sight it is not there.  The thumb is
+# dragged; a press on the track brings the thumb under the pointer and
+# holds it.  A mark (the caret's line) is a short line across the track.
+#
+# Over the content (code, as VS Code), or beside it (a panel's): then the
+# owner gives it a column of its own along the right edge (room) and lays
+# its content out left of it, and it shows while there is anything to
+# scroll, a little in from the column's edges.
+#
+# No view of its own: its owner hands it its box each frame (update),
+# draws it last (draw), and asks hit before taking a press as its own.
+
+from ui import ScrollBar
+from window import Button
+
+extend ScrollBar:
+    dragging = false
+    # where on the thumb it was taken, along the bar
+    grab = 0.0
+    # the last time it moved or was over: it shows until a while after
+    woke = -10.0
+    beside = false
+
+    init(ui = &Ui, vertical = true):
+        self.ui = ui
+        self.vertical = vertical
+
+    # in a column of its own right of the content, always shown
+    set_beside(beside = true):
+        self.beside = beside
+
+    # the width (height) its column takes off the content: none over it,
+    # none with all in sight
+    room(content = 0.0, visible = 0.0) -> float:
+        if not self.beside or content <= visible + 0.5:
+            return 0.0
+        return 12.0
+
+    get_dragging() -> bool:
+        return self.dragging
+
+    wake():
+        self.woke = self.ui.time
+
+    hit(px = 0.0, py = 0.0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, content = 0.0, visible = 0.0) -> bool:
+        if content <= visible + 0.5:
+            return false
+        tx, ty, tw, th = self.track(x, y, w, h)
+        return px >= tx and px < tx + tw and py >= ty and py < ty + th
+
+    update(x = 0.0, y = 0.0, w = 0.0, h = 0.0, content = 0.0, visible = 0.0, scroll = 0.0) -> float:
+        ui = self.ui
+        win = ui.window
+        px, py = ui.pointer()
+        if px >= x and px < x + w and py >= y and py < y + h:
+            self.woke = ui.time
+        if content <= visible + 0.5:
+            self.dragging = false
+            return scroll
+        tx, ty, tw, th = self.track(x, y, w, h)
+        start, length = self.thumb(tx, ty, tw, th, content, visible, scroll)
+        along = py if self.vertical else px
+        if win.input_get_mouse_button_pressed(Button.left) and self.hit(px, py, x, y, w, h, content, visible):
+            self.dragging = true
+            self.grab = along - start if along >= start and along < start + length else length * 0.5
+        if not self.dragging:
+            return scroll
+        if not win.input_get_mouse_button_down(Button.left):
+            self.dragging = false
+            return scroll
+        self.woke = ui.time
+        room = (th if self.vertical else tw) - length
+        origin = ty if self.vertical else tx
+        if room <= 0.0:
+            return scroll
+        part = clamp((along - self.grab - origin) / room, 0.0, 1.0)
+        return part * (content - visible)
+
+    draw(x = 0.0, y = 0.0, w = 0.0, h = 0.0, content = 0.0, visible = 0.0, scroll = 0.0, mark = -1.0):
+        ui = self.ui
+        if content <= visible + 0.5:
+            return
+        since = ui.time - self.woke
+        a = 1.0 if self.dragging or self.beside else clamp(1.0 - (since - 0.8) / 0.4, 0.0, 1.0)
+        if a <= 0.0:
+            return
+        tx, ty, tw, th = self.track(x, y, w, h)
+        px, py = ui.pointer()
+        over = px >= tx and px < tx + tw and py >= ty and py < ty + th
+        if not self.beside:
+            ui.fill(tx, ty, tw, th, 0x000000, 0.12 * a)
+        if mark >= 0.0:
+            at = mark / content
+            if self.vertical:
+                ui.fill(tx, ty + at * th - 1.0, tw, 2.0, ui.theme.ink_muted, 0.8 * a)
+            else:
+                ui.fill(tx + at * tw - 1.0, ty, 2.0, th, ui.theme.ink_muted, 0.8 * a)
+        start, length = self.thumb(tx, ty, tw, th, content, visible, scroll)
+        shade = 0.85 if self.dragging else (0.65 if over else (0.35 if self.beside else 0.45))
+        if self.vertical:
+            ui.fill_round(tx + 2.0, start, tw - 4.0, length, 3.0, 0x9A9A9A, shade * a)
+        else:
+            ui.fill_round(start, ty + 2.0, length, th - 4.0, 3.0, 0x9A9A9A, shade * a)
+
+    # ─── Inside ───
+
+    # the track: 12 wide along the right edge, or 12 high along the bottom;
+    # beside the content, 10 wide at the left of its column of 12, 3 in
+    # from its ends
+    track(x = 0.0, y = 0.0, w = 0.0, h = 0.0) -> (float, float, float, float):
+        if self.beside:
+            if self.vertical:
+                return x + w - 12.0, y + 3.0, 10.0, max(h - 6.0, 0.0)
+            return x + 3.0, y + h - 12.0, max(w - 6.0, 0.0), 10.0
+        if self.vertical:
+            return x + w - 12.0, y, 12.0, h
+        return x, y + h - 12.0, w, 12.0
+
+    # where the thumb starts along the track and how long it is (20 at least)
+    thumb(tx = 0.0, ty = 0.0, tw = 0.0, th = 0.0, content = 0.0, visible = 0.0, scroll = 0.0) -> (float, float):
+        size = th if self.vertical else tw
+        length = min(size, max(20.0, size * visible / content))
+        room = size - length
+        part = clamp(scroll / max(content - visible, 1.0), 0.0, 1.0)
+        return (ty if self.vertical else tx) + part * room, length

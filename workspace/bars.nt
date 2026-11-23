@@ -1,0 +1,609 @@
+# workspace/bars — the strips across the window: the open pictures'
+# thumbnails beside the menus, the toolbar of common commands, the tool's
+# options and the status bar with the zoom.
+
+from graphics import Align
+from window import Button, Cursor, Key
+from view import Layout, View
+from ui import ChoiceField, Command, DropButton, Icon, Menu, NumberBox, SliderBar, ToolButton, Ui
+from i18n import Tr
+from imaging import BlendMode, Display, GradientKind, Gpu
+from raster import SelectMode
+from document.document import Document
+from tools.session import Session, ShapeKind, ShapeStyle, ToolKind
+from tools.toolbox import Toolbox
+from workspace.actions import Actions
+
+# the open pictures as thumbnails; the one in front lit; a click brings
+# one to the front, the right button opens its menu, the cross on the one
+# under the pointer closes it
+ImageStrip:
+    event chosen(index = 0)
+    event close_asked(index = 0)
+    event menu_asked(index = 0, x = 0.0, y = 0.0)
+    ui = &Ui
+    gpu = &Gpu
+    view = &View
+    docs = [&Document]
+    snapshots = [(int, bool)]
+    current = 0
+
+    init(ui = &Ui, parent = &View, gpu = &Gpu):
+        self.ui = ui
+        self.gpu = gpu
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_clip(true)
+        ui.cache(self.view)
+        on self.view.draw():
+            self.draw()
+        on self.view.mouse_down():
+            i = self.index_at()
+            if i < 0:
+                return
+            if self.close_hot(i):
+                emit close_asked(i)
+            else:
+                emit chosen(i)
+
+    set_docs(docs = [&Document], current = 0):
+        dirty = self.current != current or len(self.docs) != len(docs)
+        next = [(int, bool)]
+        for i, d in docs.enumerate():
+            state = (d.history.revision, d.dirty())
+            next.push(state)
+            if not dirty:
+                dirty = d is not self.docs[i] or state != self.snapshots[i]
+        if dirty:
+            self.view.render_once()
+        self.snapshots = next
+        self.docs = docs
+        self.current = current
+
+    slot() -> float:
+        return 76.0
+
+    index_at() -> int:
+        px, _ = self.view.get_pointer()
+        i = int(floor(px / self.slot()))
+        return i if i >= 0 and i < len(self.docs) else -1
+
+    close_hot(i = 0) -> bool:
+        px, py = self.view.get_pointer()
+        lx = px - float(i) * self.slot()
+        return lx >= self.slot() - 18.0 and py < 16.0
+
+    update():
+        win = self.ui.window
+        if self.view.get_hovered():
+            i = self.index_at()
+            if i >= 0:
+                d = self.docs[i]
+                self.ui.want_cursor(Cursor.hand)
+                self.ui.tip(d.path if d.path != "" else d.name)
+                if win.input_get_mouse_button_pressed(Button.right):
+                    px, py = self.ui.pointer()
+                    emit menu_asked(i, px, py)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, _, h = ui.rect(self.view)
+        hot = self.index_at() if self.view.get_hovered() else -1
+        for i, d in self.docs.enumerate():
+            sx = x + float(i) * self.slot()
+            if i == self.current:
+                ui.fill_round(sx, y + 2.0, self.slot() - 2.0, h - 4.0, 6.0, t.row_on)
+                ui.outline_round(sx, y + 2.0, self.slot() - 2.0, h - 4.0, 6.0, t.field_edge)
+            elif i == hot:
+                ui.fill_round(sx, y + 2.0, self.slot() - 2.0, h - 4.0, 6.0, t.hover)
+            bw = self.slot() - 12.0
+            bh = h - 10.0
+            k = min(bw / float(d.width), bh / float(d.height))
+            iw = max(1.0, float(d.width) * k)
+            ih = max(1.0, float(d.height) * k)
+            tx = sx + 5.0 + (bw - iw) * 0.5
+            ty = y + 5.0 + (bh - ih) * 0.5
+            Display.draw(self.gpu, d.composite(), d.width, d.height, tx, ty, iw, ih, false, true)
+            if d.dirty():
+                ui.circle(sx + 10.0, y + 10.0, 3.0, t.ink_soft)
+            if i == hot:
+                cx = sx + self.slot() - 18.0
+                on_close = self.close_hot(i)
+                ui.fill_round(cx, y + 3.0, 15.0, 15.0, 4.0, t.button_hot if on_close else t.button, 0.9)
+                ui.icon(Icon.close_x, cx + 2.0, y + 5.0, 11.0, t.ink if on_close else t.close)
+
+# the common commands: New, Open, Save, Cut, Copy, Paste, Crop,
+# Deselect, Undo, Redo, Grid, Rulers
+MainToolbar:
+    view = &View
+    buttons = [&ToolButton]
+    grid = &ToolButton
+    rulers = &ToolButton
+    gaps = &Gaps()
+
+    init(ui = &Ui, parent = &View, a = &Actions):
+        self.view = ui.create(Layout.horizontal, parent)
+        self.view.set_min_size(0.0, 28.0)
+        self.view.set_padding(4.0, 2.0, 4.0, 2.0)
+        self.view.set_gap(1.0, 0.0)
+        ui.cache(self.view)
+        groups = [[a.new, a.open, a.save], [a.cut, a.copy, a.paste, a.crop, a.deselect], [a.undo, a.redo]]
+        for gi, group in groups.enumerate():
+            if gi > 0:
+                self.gaps.separator(ui, self.view)
+            for c in group:
+                self.buttons.push(&ToolButton(ui, self.view, c))
+        self.gaps.separator(ui, self.view)
+        self.grid = &ToolButton(ui, self.view, a.grid)
+        self.rulers = &ToolButton(ui, self.view, a.rulers)
+        on self.view.draw():
+            x, y, w, h = ui.rect(self.view)
+            ui.fill(x, y, w, h, ui.theme.backdrop)
+            self.view.render_children()
+
+    set_toggles(grid = false, rulers = false):
+        self.grid.set_on(grid)
+        self.rulers.set_on(rulers)
+
+    feedback():
+        for b in self.buttons:
+            b.feedback()
+        self.grid.feedback()
+        self.rulers.feedback()
+
+# the small views between controls; they live while it is kept (a parent
+# does not keep its children)
+Gaps:
+    views = [&View]
+
+    keep(v = &View) -> &View:
+        self.views.push(v)
+        return v
+
+    separator(ui = &Ui, parent = &View):
+        v = self.keep(ui.create(Layout.free, parent))
+        v.set_min_size(9.0, 20.0)
+        v.set_max_size(9.0, 24.0)
+        on v.draw():
+            x, y, _, h = ui.rect(v)
+            ui.line(x + 4.5, y + 3.0, x + 4.5, y + h - 3.0, ui.theme.line)
+
+    label(ui = &Ui, parent = &View, text = "") -> &View:
+        v = self.keep(ui.create(Layout.free, parent))
+        w = ui.measure(text) + 8.0
+        v.set_min_size(w, 22.0)
+        v.set_max_size(w, 24.0)
+        on v.draw():
+            x, y, w2, h = ui.rect(v)
+            ui.text(x + 2.0, y, w2 - 2.0, h, text, ui.theme.ink, Align.left + Align.middle, ui.theme.size)
+        return v
+
+# the tool's options, made again when the tool or the language changes:
+# Tool [icon ▾], then what the tool in hand has
+OptionsBar:
+    event tool_menu(x = 0.0, y = 0.0)
+    ui = &Ui
+    tr = &Tr
+    session = &Session
+    view = &View
+    row = none(&View)
+    gaps = &Gaps()
+    kind = ToolKind.brush
+    menu = none(&Menu)
+    commands = [&Command]
+    # the options made again before the next frame (a choice changed them)
+    stale = false
+    # the settings as last seen, to tell when one changed
+    seen = ""
+    numbers = [&NumberBox]
+    sliders = [&SliderBar]
+    choices = [&ChoiceField]
+    drops = [&DropButton]
+    wheel_choices = [(&DropButton, int, int, int)]
+    toggles = [&ToolButton]
+
+    init(ui = &Ui, parent = &View, tr = &Tr, session = &Session):
+        self.ui = ui
+        self.tr = tr
+        self.session = session
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_min_size(0.0, 30.0)
+        ui.cache(self.view)
+        on self.view.draw():
+            x, y, w, h = ui.rect(self.view)
+            ui.fill(x, y, w, h, ui.theme.chrome)
+            ui.line(x, y + 0.5, x + w, y + 0.5, ui.theme.backdrop)
+            self.view.render_children()
+
+    # the options of a tool made anew
+    build(kind = ToolKind.brush):
+        self.kind = kind
+        ui = self.ui
+        tr = self.tr
+        st = self.session.settings
+        self.numbers.clear()
+        self.sliders.clear()
+        self.choices.clear()
+        self.drops.clear()
+        self.wheel_choices.clear()
+        self.toggles.clear()
+        self.commands.clear()
+        if old := self.row:
+            old.set_parent(none)
+        self.gaps = &Gaps()
+        row = ui.create(Layout.horizontal, self.view)
+        row.set_expand(true)
+        row.set_padding(6.0, 3.0, 6.0, 3.0)
+        row.set_gap(4.0, 0.0)
+        self.row = row
+        _ = self.gaps.label(ui, row, tr.t("opt.tool"))
+        tool = &DropButton(ui, row, Toolbox.icon(kind))
+        tool.set_hint(tr.t("tool." + Toolbox.id(kind)))
+        on tool.pressed(x = 0.0, y = 0.0):
+            emit tool_menu(x, y)
+        self.drops.push(tool)
+        self.gaps.separator(ui, row)
+        brushy = kind == ToolKind.brush or kind == ToolKind.eraser or kind == ToolKind.clone or kind == ToolKind.recolor
+        if brushy or kind == ToolKind.line or kind == ToolKind.shapes:
+            self.width_box(row)
+        if brushy:
+            _ = self.gaps.label(ui, row, tr.t("opt.hardness"))
+            h = &SliderBar(ui, row, 0.0, 100.0, st.hardness, "%", 150.0)
+            on h.changed(value = 0.0):
+                self.session.settings.set_hardness(value)
+            self.sliders.push(h)
+        if kind == ToolKind.brush:
+            _ = self.gaps.label(ui, row, tr.t("opt.spacing"))
+            sp = &SliderBar(ui, row, 1.0, 100.0, st.spacing, "%", 150.0)
+            on sp.changed(value = 0.0):
+                self.session.settings.set_spacing(value)
+            self.sliders.push(sp)
+        if kind == ToolKind.rect_select or kind == ToolKind.lasso or kind == ToolKind.ellipse_select or kind == ToolKind.magic_wand:
+            self.select_mode(row)
+        if kind == ToolKind.magic_wand or kind == ToolKind.bucket:
+            self.flood(row)
+        if kind == ToolKind.recolor:
+            _ = self.gaps.label(ui, row, tr.t("opt.tolerance"))
+            tl = &SliderBar(ui, row, 0.0, 100.0, st.tolerance, "%", 150.0)
+            on tl.changed(value = 0.0):
+                self.session.settings.set_tolerance(value)
+            self.sliders.push(tl)
+        if kind == ToolKind.picker or kind == ToolKind.magic_wand or kind == ToolKind.bucket:
+            self.sampling(row)
+        if kind == ToolKind.picker:
+            self.picker_back(row)
+        if kind == ToolKind.gradient:
+            self.gradient(row)
+        if kind == ToolKind.shapes:
+            self.shapes(row)
+        if kind == ToolKind.text:
+            self.text(row)
+        painting = brushy or kind == ToolKind.pencil or kind == ToolKind.bucket or kind == ToolKind.gradient or kind == ToolKind.line or kind == ToolKind.shapes or kind == ToolKind.text
+        smooth = brushy or kind == ToolKind.line or kind == ToolKind.shapes or kind == ToolKind.lasso or kind == ToolKind.ellipse_select
+        if smooth or painting:
+            self.gaps.separator(ui, row)
+        if smooth:
+            self.antialias(row)
+        if painting and kind != ToolKind.eraser:
+            self.blend(row)
+
+    width_box(row = &View):
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.width"))
+        presets = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 70.0, 80.0, 90.0, 100.0, 125.0, 150.0, 175.0, 200.0, 250.0, 300.0, 400.0, 500.0, 750.0, 1000.0]
+        n = &NumberBox(self.ui, row, self.session.settings.width, 1.0, 2000.0, presets, 100.0)
+        on n.changed(value = 0.0):
+            self.session.settings.set_width(value)
+        self.numbers.push(n)
+
+    # a drop button that opens a menu of choices, each a command; the
+    # chosen one's icon shown
+    choice_drop(row = &View, icons = [Icon], keys = [str], current = 0, which = 0):
+        tr = self.tr
+        d = &DropButton(self.ui, row, icons[clamp(current, 0, len(icons) - 1)], tr.t(keys[clamp(current, 0, len(keys) - 1)]))
+        m = &Menu(self.ui)
+        for i, k in keys.enumerate():
+            c = &Command(tr.t(k), Key0.none(), false, false, icons[i])
+            c.set_checked(i == current)
+            index = i
+            on c.run():
+                self.picked(which, index)
+            m.add(c)
+            self.commands.push(c)
+        on d.pressed(x = 0.0, y = 0.0):
+            self.menu = m
+            m.open(x, y)
+        self.drops.push(d)
+        self.wheel_choices.push((d, which, current, len(keys)))
+
+    # a choice of a drop button made: which says whose
+    picked(which = 0, index = 0):
+        st = self.session.settings
+        match which:
+            case 0:
+                st.set_select_mode(SelectMode.replace + i32(index))
+            case 1:
+                st.set_global_fill(index == 1)
+            case 2:
+                st.set_sample_image(index == 1)
+            case 3:
+                st.set_antialias(index == 0)
+            case 4:
+                if index == 0:
+                    st.set_mode(BlendMode.normal, true)
+                else:
+                    st.set_mode(BlendMode.normal + i32(index - 1), false)
+            case 5:
+                st.set_shape(ShapeKind.rectangle + i32(index))
+            case 6:
+                st.set_style(ShapeStyle.outline + i32(index))
+            case 7:
+                st.set_picker_back(index == 1)
+            case _:
+                pass
+        self.stale = true
+
+    select_mode(row = &View):
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.selection_mode"))
+        self.choice_drop(row, [Icon.sel_replace, Icon.sel_union, Icon.sel_exclude, Icon.sel_intersect, Icon.sel_xor], ["opt.sel.replace", "opt.sel.union", "opt.sel.exclude", "opt.sel.intersect", "opt.sel.xor"], int(self.session.settings.select_mode), 0)
+
+    flood(row = &View):
+        st = self.session.settings
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.flood_mode"))
+        self.choice_drop(row, [Icon.flood_contiguous, Icon.flood_global], ["opt.flood.contiguous", "opt.flood.global"], 1 if st.global_fill else 0, 1)
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.tolerance"))
+        tl = &SliderBar(self.ui, row, 0.0, 100.0, st.tolerance, "%", 150.0)
+        on tl.changed(value = 0.0):
+            self.session.settings.set_tolerance(value)
+        self.sliders.push(tl)
+
+    sampling(row = &View):
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.sampling"))
+        self.choice_drop(row, [Icon.sampling_layer, Icon.sampling_image], ["opt.sample.layer", "opt.sample.image"], 1 if self.session.settings.sample_image else 0, 2)
+
+    picker_back(row = &View):
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.after_click"))
+        self.choice_drop(row, [Icon.tool_picker, Icon.tool_brush], ["opt.after.nothing", "opt.after.previous"], 1 if self.session.settings.picker_back else 0, 7)
+
+    antialias(row = &View):
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.antialiasing"))
+        self.choice_drop(row, [Icon.aa_on, Icon.aa_off], ["opt.aa.on", "opt.aa.off"], 0 if self.session.settings.antialias else 1, 3)
+
+    blend(row = &View):
+        st = self.session.settings
+        icons = [Icon.blend_overwrite]
+        keys = ["blend.overwrite"]
+        for m in ["normal", "multiply", "additive", "color_burn", "color_dodge", "reflect", "glow", "overlay", "difference", "negation", "lighten", "darken", "screen", "xor"]:
+            icons.push(Icon.blend_normal)
+            keys.push("blend." + m)
+        current = 0 if st.overwrite else int(st.mode) + 1
+        self.choice_drop(row, icons, keys, current, 4)
+
+    gradient(row = &View):
+        st = self.session.settings
+        icons = [Icon.grad_linear, Icon.grad_reflected, Icon.grad_diamond, Icon.grad_radial, Icon.grad_conical]
+        for i, icon in icons.enumerate():
+            c = &Command(self.tr.t(["opt.grad.linear", "opt.grad.reflected", "opt.grad.diamond", "opt.grad.radial", "opt.grad.conical"][i]), Key0.none(), false, false, icon)
+            index = i
+            on c.run():
+                self.session.settings.set_gradient(GradientKind.linear + i32(index))
+                self.stale = true
+            b = &ToolButton(self.ui, row, c)
+            b.set_on(int(st.gradient) == i)
+            self.commands.push(c)
+            self.toggles.push(b)
+        self.gaps.separator(self.ui, row)
+        for i, icon in [Icon.grad_color, Icon.grad_alpha].enumerate():
+            c = &Command(self.tr.t(["opt.grad.color_mode", "opt.grad.alpha_mode"][i]), Key0.none(), false, false, icon)
+            alpha = i == 1
+            on c.run():
+                self.session.settings.set_gradient_alpha(alpha)
+                self.stale = true
+            b = &ToolButton(self.ui, row, c)
+            b.set_on(st.gradient_alpha == alpha)
+            self.commands.push(c)
+            self.toggles.push(b)
+
+    shapes(row = &View):
+        st = self.session.settings
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.shape"))
+        self.choice_drop(row, [Icon.shape_rect, Icon.shape_rounded, Icon.shape_ellipse, Icon.shape_triangle, Icon.shape_diamond, Icon.shape_hexagon, Icon.shape_star, Icon.shape_arrow], ["shape.rectangle", "shape.rounded", "shape.ellipse", "shape.triangle", "shape.diamond", "shape.hexagon", "shape.star", "shape.arrow"], int(st.shape), 5)
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.style"))
+        self.choice_drop(row, [Icon.shape_outline, Icon.shape_fill, Icon.shape_both], ["opt.style.outline", "opt.style.fill", "opt.style.both"], int(st.style), 6)
+        if st.shape == ShapeKind.rounded:
+            _ = self.gaps.label(self.ui, row, self.tr.t("opt.radius"))
+            n = &NumberBox(self.ui, row, st.radius, 0.0, 500.0, [2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0], 90.0)
+            on n.changed(value = 0.0):
+                self.session.settings.set_radius(value)
+            self.numbers.push(n)
+
+    text(row = &View):
+        st = self.session.settings
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.font"))
+        holder = self.gaps.keep(self.ui.create(Layout.free, row))
+        holder.set_min_size(160.0, 22.0)
+        holder.set_max_size(160.0, 24.0)
+        f = &ChoiceField(self.ui, holder, self.session.fonts.names())
+        f.set_current(st.font)
+        on f.chosen(index = 0):
+            self.session.settings.set_font(index)
+        self.choices.push(f)
+        _ = self.gaps.label(self.ui, row, self.tr.t("opt.size"))
+        n = &NumberBox(self.ui, row, st.font_size, 4.0, 1000.0, [8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 36.0, 48.0, 72.0, 96.0, 144.0], 90.0, false)
+        on n.changed(value = 0.0):
+            self.session.settings.set_font_size(value)
+        self.numbers.push(n)
+        for i, icon in [Icon.font_bold, Icon.font_italic].enumerate():
+            c = &Command(self.tr.t(["opt.bold", "opt.italic"][i]), Key0.none(), false, false, icon)
+            bold = i == 0
+            on c.run():
+                if bold:
+                    self.session.settings.set_bold(not self.session.settings.bold)
+                else:
+                    self.session.settings.set_italic(not self.session.settings.italic)
+                self.stale = true
+            b = &ToolButton(self.ui, row, c)
+            b.set_on(st.bold if bold else st.italic)
+            self.commands.push(c)
+            self.toggles.push(b)
+
+    # what is being typed or dragged in it holds the keys
+    editing() -> bool:
+        for n in self.numbers:
+            if n.get_editing():
+                return true
+        return false
+
+    # every option written out: when it differs, one changed
+    fingerprint() -> str:
+        st = self.session.settings
+        return f"{st.width}|{st.hardness}|{st.spacing}|{st.antialias}|{int(st.mode)}|{st.overwrite}|{int(st.select_mode)}|{st.tolerance}|{st.global_fill}|{st.sample_image}|{int(st.gradient)}|{st.gradient_alpha}|{int(st.shape)}|{int(st.style)}|{st.radius}|{st.font}|{st.font_size}|{st.bold}|{st.italic}"
+
+    update():
+        if self.stale:
+            self.stale = false
+            self.build(self.kind)
+        for n in self.numbers:
+            n.update()
+        for s in self.sliders:
+            s.update()
+        for c in self.choices:
+            c.update()
+        for d in self.drops:
+            d.feedback()
+        for b in self.toggles:
+            b.feedback()
+        for choice in self.wheel_choices:
+            d, which, current, count = choice
+            if d.view.get_hovered():
+                wheel = self.ui.wheel_steps()
+                next = clamp(current - wheel, 0, count - 1)
+                if wheel != 0 and next != current:
+                    self.picked(which, next)
+        if m := self.menu:
+            m.update()
+        now = self.fingerprint()
+        if now != self.seen:
+            first = self.seen == ""
+            self.seen = now
+            if not first:
+                self.session.tell_options()
+
+# a key that is none, for commands with no shortcut
+Key0:
+    none() -> Key:
+        return Key.unknown
+
+# the bottom: the tool's help on the left; the picture's size, the
+# selection's, the pointer's place, the units and the zoom on the right
+StatusBar:
+    event zoom_asked(zoom = 1.0)
+    event fit_asked()
+    ui = &Ui
+    tr = &Tr
+    view = &View
+    hint = ""
+    icon = Icon.none
+    size = ""
+    selection = ""
+    pointer = ""
+    zoom = 1.0
+    dragging = false
+
+    init(ui = &Ui, parent = &View, tr = &Tr):
+        self.ui = ui
+        self.tr = tr
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_min_size(0.0, 24.0)
+        ui.cache(self.view)
+        on self.view.draw():
+            self.draw()
+        on self.view.mouse_down():
+            self.press()
+
+    set_info(icon = Icon.none, hint = "", size = "", selection = "", pointer = "", zoom = 1.0):
+        if (self.icon, self.hint, self.size, self.selection, self.pointer, self.zoom) == (icon, hint, size, selection, pointer, zoom):
+            return
+        self.view.render_once()
+        self.icon = icon
+        self.hint = hint
+        self.size = size
+        self.selection = selection
+        self.pointer = pointer
+        self.zoom = zoom
+
+    # where the zoom's parts are, from the right edge
+    slider_box() -> (float, float):
+        _, _, w, _ = self.ui.rect(self.view)
+        return w - 150.0, 110.0
+
+    press():
+        px, _ = self.view.get_pointer()
+        _, _, w, _ = self.ui.rect(self.view)
+        sx, sw = self.slider_box()
+        if px >= sx and px < sx + sw:
+            self.dragging = true
+        elif px >= sx - 22.0 and px < sx - 2.0:
+            emit zoom_asked(self.zoom / 1.5)
+        elif px >= sx + sw + 4.0 and px < sx + sw + 24.0:
+            emit zoom_asked(self.zoom * 1.5)
+        elif px >= sx - 46.0 and px < sx - 26.0:
+            emit fit_asked()
+        _ = w
+
+    update():
+        self.feedback()
+        if not self.dragging:
+            return
+        win = self.ui.window
+        if not win.input_get_mouse_button_down(Button.left):
+            self.dragging = false
+            return
+        px, _ = self.view.get_pointer()
+        sx, sw = self.slider_box()
+        t = clamp((px - sx) / sw, 0.0, 1.0)
+        # the slider is logarithmic: 1 % at the left, 3200 % at the right,
+        # 100 % at its middle-ish
+        emit zoom_asked(exp(log(0.01) + t * (log(32.0) - log(0.01))))
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        ui.fill(x, y, w, h, t.chrome)
+        ui.line(x, y + 0.5, x + w, y + 0.5, t.backdrop)
+        ui.icon(self.icon, x + 6.0, y + 4.0, 16.0, -1)
+        ui.text(x + 26.0, y, w * 0.5, h, self.hint, t.ink, Align.left + Align.middle, t.size)
+        sx, sw = self.slider_box()
+        right = x + sx - 52.0
+        # zoom percent, units, pointer, selection, size, right to left
+        ui.text(right - 60.0, y, 56.0, h, f"{int(round(self.zoom * 100.0))}%", t.ink, Align.right + Align.middle, t.size)
+        ui.text(right - 110.0, y, 46.0, h, self.tr.t("unit.px"), t.ink, Align.right + Align.middle, t.size)
+        ui.icon(Icon.cursor_pos, right - 230.0, y + 4.0, 16.0, -1)
+        ui.text(right - 210.0, y, 96.0, h, self.pointer, t.ink, Align.left + Align.middle, t.size)
+        if self.selection != "":
+            ui.icon(Icon.selection_size, right - 350.0, y + 4.0, 16.0, -1)
+            ui.text(right - 330.0, y, 100.0, h, self.selection, t.ink, Align.left + Align.middle, t.size)
+        ui.icon(Icon.image_size, right - 470.0, y + 4.0, 16.0, -1)
+        ui.text(right - 450.0, y, 100.0, h, self.size, t.ink, Align.left + Align.middle, t.size)
+        # fit, zoom out, the slider, zoom in
+        ui.icon(Icon.zoom_fit, x + sx - 44.0, y + 4.0, 16.0, -1)
+        ui.icon(Icon.zoom_out, x + sx - 20.0, y + 4.0, 16.0, -1)
+        ui.icon(Icon.zoom_in, x + sx + sw + 6.0, y + 4.0, 16.0, -1)
+        ui.line(x + sx, y + h * 0.5, x + sx + sw, y + h * 0.5, t.ink_muted, 1.0)
+        k = clamp((log(max(self.zoom, 0.01)) - log(0.01)) / (log(32.0) - log(0.01)), 0.0, 1.0)
+        kx = x + sx + k * sw
+        ui.fill_round(kx - 3.0, y + 5.0, 6.0, h - 10.0, 3.0, t.ink_soft)
+    feedback():
+        if self.view.get_hovered():
+            ui = self.ui
+            px, _ = self.view.get_pointer()
+            sx, sw = self.slider_box()
+            if px >= sx - 46.0:
+                ui.want_cursor(Cursor.hand)
+            if px >= sx - 46.0 and px < sx - 26.0:
+                ui.tip(self.tr.t("cmd.zoom_window"))
+            elif px >= sx - 22.0 and px < sx - 2.0:
+                ui.tip(self.tr.t("cmd.zoom_out"))
+            elif px >= sx + sw + 4.0 and px < sx + sw + 24.0:
+                ui.tip(self.tr.t("cmd.zoom_in"))

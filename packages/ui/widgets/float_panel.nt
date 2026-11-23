@@ -1,0 +1,266 @@
+# widgets/float_panel — paint.net's floating windows: a dark body with a
+# thin edge, a title strip with the title and a red close square at its
+# right.  The strip held with the left button moves the window; it stays
+# inside its parent, and brought near a side or a corner it sticks to it
+# like a magnet, staying there as the parent is resized. Drag a border or
+# corner to resize, keeping the opposite edge in place.
+
+from ui import FloatPanel, Icon
+from graphics import Align
+from window import Button, Cursor
+from view import Layout, View
+
+extend FloatPanel:
+    plate = &View
+    strip = 26.0
+    edge = 5.0
+    min_w = 56.0
+    min_h = 56.0
+    dragging = false
+    shown = true
+    resize_x = 0
+    resize_y = 0
+    grab_x = 0.0
+    grab_y = 0.0
+    start_x = 0.0
+    start_y = 0.0
+    start_w = 0.0
+    start_h = 0.0
+    # the sides it is held to, its gap from them, how near pulls it there
+    across = 0
+    down = 0
+    margin = 8.0
+    snap = 28.0
+    # where the drag would put it without the magnet
+    rx = 0.0
+    ry = 0.0
+
+    init(ui = &Ui, parent = &View, title = "", w = 200.0, h = 200.0):
+        self.ui = ui
+        self.title = title
+        self.root = ui.create(Layout.free, parent)
+        self.plate = ui.create(Layout.free, self.root)
+        self.plate.set_expand(true)
+        ui.cache(self.plate)
+        self.body = ui.create(Layout.vertical, self.plate)
+        self.body.set_clip(true)
+        self.set_size(w, h)
+        on self.root.draw():
+            x, y, w, h = self.ui.rect(self.root)
+            self.ui.fill_round(x + 1.0, y + 2.0, w, h, 6.0, 0x000000, 0.25)
+            self.root.render_children()
+        on self.plate.draw():
+            self.draw()
+            self.plate.render_children()
+            self.draw_strip()
+        on self.root.mouse_down():
+            if self.close_hot():
+                return
+            dx, dy = self.resize_edges()
+            if dx != 0 or dy != 0:
+                self.resize_x = dx
+                self.resize_y = dy
+                px, py = ui.pointer()
+                self.grab_x = px
+                self.grab_y = py
+                self.start_x = self.x
+                self.start_y = self.y
+                self.start_w = self.w
+                self.start_h = self.h
+            else:
+                _, py = self.root.get_pointer()
+                if py >= self.strip:
+                    return
+                self.dragging = true
+                self.rx = self.x
+                self.ry = self.y
+        on self.root.click():
+            if self.resize_x == 0 and self.resize_y == 0 and self.close_hot():
+                self.set_visible(false)
+                emit closed()
+
+    set_title(title = ""):
+        if self.title != title:
+            self.title = title
+            self.plate.render_once()
+
+    set_place(x = 0.0, y = 0.0):
+        _, _, pw, ph = self.ui.rect(self.root.get_parent().expect("parent"))
+        nx = x
+        ny = y
+        if pw > 0.0:
+            nx = clamp(x, 0.0, max(pw - self.w, 0.0))
+            ny = clamp(y, 0.0, max(ph - self.h, 0.0))
+        self.x = nx
+        self.y = ny
+        self.root.set_offset(floor(nx), floor(ny))
+
+    set_size(w = 0.0, h = 0.0):
+        self.w = w
+        self.h = h
+        self.root.set_min_size(w, h)
+        self.root.set_max_size(w, h)
+        pad = self.ui.theme.window_inset
+        bw, bh = self.client_size()
+        self.body.set_min_size(bw, bh)
+        self.body.set_max_size(bw, bh)
+        self.body.set_offset(pad, self.strip + pad)
+
+    client_size() -> (float, float):
+        inset = 2.0 * self.ui.theme.window_inset
+        return max(0.0, self.w - inset), max(0.0, self.h - self.strip - inset)
+
+    set_min_size(w = 0.0, h = 0.0):
+        self.min_w = w
+        self.min_h = h
+
+    dock(across = 0, down = 0):
+        self.across = across
+        self.down = down
+        self.stick()
+
+    # the place its sides ask for
+    stick():
+        if p := self.root.get_parent():
+            _, _, pw, ph = self.ui.rect(p)
+            if pw <= 0.0:
+                return
+            x = self.x
+            y = self.y
+            if self.across == 1:
+                x = self.margin
+            elif self.across == 2:
+                x = pw - self.w - self.margin
+            if self.down == 1:
+                y = self.margin
+            elif self.down == 2:
+                y = ph - self.h - self.margin
+            self.set_place(x, y)
+
+    set_visible(visible = true):
+        self.shown = visible
+        if not visible:
+            self.dragging = false
+            self.resize_x = 0
+            self.resize_y = 0
+        self.root.set_visible(visible)
+
+    get_visible() -> bool:
+        return self.shown
+
+    update():
+        if not self.shown:
+            return
+        win = self.ui.window
+        if self.resize_x != 0 or self.resize_y != 0:
+            self.resize()
+            if win.input_get_mouse_button_down(Button.left):
+                self.ui.want_cursor(self.resize_cursor(self.resize_x, self.resize_y), true)
+            else:
+                self.finish_resize()
+            return
+        if self.dragging:
+            if win.input_get_mouse_button_down(Button.left):
+                self.rx += float(win.input_get_mouse_x_speed())
+                self.ry += float(win.input_get_mouse_y_speed())
+                # the magnet: a side near enough takes it
+                self.across = 0
+                self.down = 0
+                if p := self.root.get_parent():
+                    _, _, pw, ph = self.ui.rect(p)
+                    if self.rx < self.margin + self.snap:
+                        self.across = 1
+                    elif self.rx + self.w > pw - self.margin - self.snap:
+                        self.across = 2
+                    if self.ry < self.margin + self.snap:
+                        self.down = 1
+                    elif self.ry + self.h > ph - self.margin - self.snap:
+                        self.down = 2
+                self.set_place(self.rx, self.ry)
+                self.stick()
+                self.ui.want_cursor(Cursor.move)
+            else:
+                self.dragging = false
+        else:
+            # the parent resized: at its sides still, and inside it
+            self.stick()
+        if self.root.get_hovered() and not self.dragging:
+            if self.close_hot():
+                self.ui.want_cursor(Cursor.hand)
+            else:
+                dx, dy = self.resize_edges()
+                if dx != 0 or dy != 0:
+                    self.ui.want_cursor(self.resize_cursor(dx, dy))
+
+    # ─── Inside ───
+
+    resize_edges() -> (int, int):
+        px, py = self.root.get_pointer()
+        _, _, w, h = self.ui.rect(self.root)
+        pad = self.ui.theme.window_inset
+        dx = -1 if px < pad else (1 if px >= w - pad else 0)
+        dy = -1 if py < self.edge else (1 if py >= h - pad else 0)
+        return dx, dy
+
+    resize_cursor(dx = 0, dy = 0) -> Cursor:
+        if dx == 0:
+            return Cursor.resize_ns
+        if dy == 0:
+            return Cursor.resize_ew
+        return Cursor.resize_nwse if dx == dy else Cursor.resize_nesw
+
+    resize_axis(side = 0, delta = 0.0, origin = 0.0, size = 0.0, least = 0.0, limit = 0.0) -> (float, float):
+        if side == 0:
+            return origin, size
+        fixed = clamp(origin + size if side < 0 else origin, 0.0, limit)
+        room = fixed if side < 0 else limit - fixed
+        next = clamp(round(size + delta * float(side)), min(least, room), room)
+        return (fixed - next if side < 0 else fixed), next
+
+    resize():
+        if p := self.root.get_parent():
+            _, _, pw, ph = self.ui.rect(p)
+            px, py = self.ui.pointer()
+            x, w = self.resize_axis(self.resize_x, px - self.grab_x, self.start_x, self.start_w, self.min_w, pw)
+            y, h = self.resize_axis(self.resize_y, py - self.grab_y, self.start_y, self.start_h, self.min_h, ph)
+            if w != self.w or h != self.h:
+                self.set_size(w, h)
+            self.set_place(x, y)
+
+    finish_resize():
+        if p := self.root.get_parent():
+            _, _, pw, ph = self.ui.rect(p)
+            if self.resize_x != 0 and ((self.across == 1 and abs(self.x - self.margin) >= 1.0) or (self.across == 2 and abs(pw - self.x - self.w - self.margin) >= 1.0)):
+                self.across = 0
+            if self.resize_y != 0 and ((self.down == 1 and abs(self.y - self.margin) >= 1.0) or (self.down == 2 and abs(ph - self.y - self.h - self.margin) >= 1.0)):
+                self.down = 0
+        self.resize_x = 0
+        self.resize_y = 0
+
+    close_box() -> (float, float, float, float):
+        return self.w - 22.0, 5.0, 16.0, 16.0
+
+    close_hot() -> bool:
+        px, py = self.root.get_pointer()
+        bx, by, bw, bh = self.close_box()
+        return px >= bx and px < bx + bw and py >= by and py < by + bh
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.root)
+        ui.fill_round(x, y, w, h, 6.0, t.panel)
+
+    draw_strip():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.root)
+        ui.fill_top_round(x, y, w, self.strip, 6.0, t.chrome)
+        ui.line(x + 1.0, y + self.strip, x + w - 1.0, y + self.strip, t.panel_edge)
+        ui.outline_round(x, y, w, h, 6.0, t.panel_edge)
+        ui.text(x + 10.0, y, w - 36.0, self.strip, self.title, t.ink_soft, Align.left + Align.middle, t.size)
+        bx, by, bw, bh = self.close_box()
+        hot = self.root.get_hovered() and self.close_hot()
+        if hot:
+            ui.fill_round(x + bx - 1.0, y + by - 1.0, bw + 2.0, bh + 2.0, 4.0, t.hover)
+        ui.icon(Icon.close_x, x + bx + 2.0, y + by + 2.0, 12.0, t.ink if hot else t.close)

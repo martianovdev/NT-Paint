@@ -1,0 +1,175 @@
+# Editable Paint.NET documents. The editor uses RGBA; PDN surfaces use BGRA.
+
+from raster import Bitmap
+from document.pdn_reader import PdnBytes, PdnReader, PdnRecord
+from document.pdn_writer import PdnWriter
+
+PdnLayer:
+    bitmap = Bitmap
+    name = ""
+    visible = true
+    background = false
+    opacity = 255
+    mode = 0
+    metadata = [(str, str)]
+
+    init(bitmap = Bitmap(), name = "", visible = true, background = false, opacity = 255, mode = 0, metadata = [(str, str)]):
+        self.bitmap = bitmap
+        self.name = name
+        self.visible = visible
+        self.background = background
+        self.opacity = opacity
+        self.mode = mode
+        self.metadata = metadata
+
+PdnImage:
+    width = 0
+    height = 0
+    metadata = [(str, str)]
+    layers = [PdnLayer]
+
+    init(width = 0, height = 0, metadata = [(str, str)]):
+        self.width = width
+        self.height = height
+        self.metadata = metadata
+
+Pdn:
+    matches(data = [u8]) -> bool:
+        return len(data) >= 4 and data[0] == u8(80) and data[1] == u8(68) and data[2] == u8(78) and data[3] == u8(51)
+
+    modes() -> [str]:
+        return ["Normal", "Multiply", "Additive", "ColorBurn", "ColorDodge", "Reflect", "Glow", "Overlay", "Difference", "Negation", "Lighten", "Darken", "Screen", "Xor"]
+
+    valid_size(w = 0, h = 0, count = 0) -> bool:
+        return w > 0 and h > 0 and w <= 16384 and h <= 16384 and count > 0 and count <= 4096 and w * h * 4 * count <= 512 * 1024 * 1024
+
+    blend_mode(reader = &PdnReader, layer = &PdnRecord, props = &PdnRecord, modes = [str]) -> int:
+        if mode := reader.field(props, "blendMode"):
+            return mode.number("value__", -1)
+        if legacy := reader.field(layer, "properties"):
+            if op := reader.field(legacy, "blendOp"):
+                for i, name in modes.enumerate():
+                    if op.name == "PaintDotNet.UserBlendOps+" + name + "BlendOp":
+                        return i
+                return -1
+        return 0
+
+    memory(reader = &PdnReader, blocks = [int: [u8]], id = 0, depth = 0) -> none([u8]):
+        if depth > 16:
+            return none
+        if data := blocks.get(id):
+            return data
+        if block := reader.objects.get(id):
+            if block.name != "PaintDotNet.MemoryBlock":
+                return none
+            length = block.number("length64", block.number("length", -1))
+            if length <= 0 or length > 512 * 1024 * 1024:
+                return none
+            if block.number("hasParent") == 1:
+                kind, parent = block.fields.get("parentBlock").or((0, 0))
+                offset = block.number("parentOffset64", block.number("parentOffset", -1))
+                if kind == 2 and offset >= 0:
+                    if contents := Pdn.memory(reader, blocks, parent, depth + 1):
+                        if length <= len(contents) - offset:
+                            return PdnBytes.copy(contents, offset, length)
+            elif block.number("deferred") == 0:
+                if contents := reader.field(block, "pointerData"):
+                    if contents.byte_count == length:
+                        at = contents.byte_offset
+                        return PdnBytes.copy(reader.data, at, length)
+        return none
+
+    read_layer(reader = &PdnReader, item = &PdnRecord, width = 0, height = 0, blocks = [int: [u8]], modes = [str]) -> none(PdnLayer):
+        if item.name != "PaintDotNet.BitmapLayer":
+            return none
+        if item.number("Layer+width") != width or item.number("Layer+height") != height:
+            return none
+        props = reader.field(item, "Layer+properties").or(&PdnRecord())
+        if props.name != "PaintDotNet.Layer+LayerProperties":
+            return none
+        surface = reader.field(item, "surface").or(&PdnRecord())
+        if surface.name != "PaintDotNet.Surface" or surface.number("width") != width or surface.number("height") != height:
+            return none
+        stride = surface.number("stride")
+        if stride < width * 4 or stride > 512 * 1024 * 1024 / height:
+            return none
+        kind, id = surface.fields.get("scan0").or((0, 0))
+        if kind != 2:
+            return none
+        bytes = Pdn.memory(reader, blocks, id).or([u8])
+        if len(bytes) < stride * height:
+            return none
+        mode = Pdn.blend_mode(reader, item, props, modes)
+        if mode < 0 or mode >= len(modes):
+            return none
+        rgba = [u8]
+        for y in range(height):
+            at = y * stride
+            for _ in range(width):
+                rgba.push(bytes[at + 2])
+                rgba.push(bytes[at + 1])
+                rgba.push(bytes[at])
+                rgba.push(bytes[at + 3])
+                at += 4
+        name = reader.field(props, "name").or(&PdnRecord()).text
+        return PdnLayer(Bitmap.adopt(width, height, rgba), name, props.number("visible", 1) != 0,
+            props.number("isBackground") != 0, clamp(props.number("opacity", 255), 0, 255), mode, reader.metadata(props))
+
+    decode(data = [u8]) -> none(PdnImage):
+        reader = &PdnReader(data)
+        if not reader.read():
+            return none
+        root = reader.objects.get(reader.root).or(&PdnRecord())
+        if root.name != "PaintDotNet.Document":
+            return none
+        list = reader.field(root, "layers").or(&PdnRecord())
+        if list.name != "PaintDotNet.LayerList":
+            return none
+        items = reader.field(list, "ArrayList+_items").or(&PdnRecord())
+        width = root.number("width")
+        height = root.number("height")
+        count = list.number("ArrayList+_size")
+        if not Pdn.valid_size(width, height, count) or count > len(items.entries):
+            return none
+        blocks = [int: [u8]]
+        remaining = 512 * 1024 * 1024
+        for id in reader.deferred:
+            block = reader.objects[id]
+            size = block.number("length64", block.number("length", -1))
+            if size <= 0 or size > remaining:
+                return none
+            if bytes := reader.pixels(size):
+                blocks[id] = bytes
+                remaining -= size
+            else:
+                return none
+        image = PdnImage(width, height, reader.metadata(root))
+        modes = Pdn.modes()
+        for i in range(count):
+            item = reader.object(items.entries[i]).or(&PdnRecord())
+            if layer := Pdn.read_layer(reader, item, width, height, blocks, modes):
+                image.layers.push(layer)
+            else:
+                return none
+        return image
+
+    encode(image = PdnImage()) -> none([u8]):
+        width = image.width
+        height = image.height
+        count = len(image.layers)
+        if not Pdn.valid_size(width, height, count):
+            return none
+        modes = Pdn.modes()
+        writer = &PdnWriter()
+        ids = writer.header(width, height, count, image.metadata)
+        for i, layer in image.layers.enumerate():
+            if layer.mode < 0 or layer.mode >= len(modes):
+                return none
+            b = layer.bitmap
+            if b.width != width or b.height != height or len(b.pixels) != width * height * 4:
+                return none
+            writer.layer(ids[i], width, height, layer.name, layer.visible, layer.background, layer.opacity, layer.mode, modes[layer.mode], layer.metadata)
+        writer.le(11)
+        for layer in image.layers:
+            writer.pixels(layer.bitmap.pixels)
+        return writer.data

@@ -1,0 +1,449 @@
+# tools/draw_tools — the Text tool, Line / Curve and Shapes.  Each shows
+# what it makes as it is dragged or typed (the layer put back as it was
+# and drawn again: tools.tool Preview) and keeps it as one step.
+
+from graphics import Font
+from window import Cursor, Key
+from raster import Shapes
+from text import Pos, TextBuffer, TextEditor
+from ui import Icon, TextInput
+from tools.session import Session, ShapeKind, ShapeStyle, ToolKind
+from tools.tool import Marks, Pointer, Preview, Tool
+
+# a click puts the caret there; typed text shows in the primary colour in
+# the toolbar's font. Escape or a click outside keeps the finished text.
+TextTool(Tool):
+    preview = Preview()
+    editing = false
+    x = 0.0
+    y = 0.0
+    editor = &TextEditor(&TextBuffer())
+    blink = 0.0
+    selecting = false
+    last_press = -1.0
+    last_x = 0.0
+    last_y = 0.0
+
+    kind() -> ToolKind:
+        return ToolKind.text
+
+    press(s = &Session, p = Pointer()):
+        if p.right:
+            return
+        if self.editing:
+            if font := self.font(s):
+                size = self.size_px(s)
+                lh = font.get_line_height(size)
+                margin = max(2.0, 4.0 / s.view.zoom)
+                if p.x >= self.x - margin and p.x <= self.x + self.width(font, size) + margin and p.y >= self.y - margin and p.y <= self.y + float(self.editor.buffer.get_line_count()) * lh + margin:
+                    double = not p.shift and self.last_press >= 0.0 and s.ui.time - self.last_press <= 0.4 and abs(p.sx - self.last_x) <= 6.0 and abs(p.sy - self.last_y) <= 6.0
+                    pos = self.position(font, size, p, double)
+                    if double:
+                        self.editor.select_word(pos)
+                        self.last_press = -1.0
+                    else:
+                        self.editor.set_caret(pos, p.shift)
+                        self.last_press = s.ui.time
+                    self.last_x = p.sx
+                    self.last_y = p.sy
+                    self.selecting = not double
+                    self.blink = s.ui.time
+                    return
+            self.commit(s)
+        if self.preview.start(s):
+            self.editing = true
+            self.x = floor(p.x)
+            self.y = floor(p.y)
+            self.editor.reset()
+            self.last_press = s.ui.time
+            self.last_x = p.sx
+            self.last_y = p.sy
+            self.blink = s.ui.time
+
+    drag(s = &Session, p = Pointer()):
+        if self.selecting:
+            if f := self.font(s):
+                self.editor.set_caret(self.position(f, self.size_px(s), p), true)
+                if self.editor.has_selection():
+                    self.last_press = -1.0
+                self.blink = s.ui.time
+
+    release(s = &Session, p = Pointer()):
+        self.drag(s, p)
+        self.selecting = false
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    size_px(s = &Session) -> float:
+        return s.settings.font_size * 96.0 / 72.0
+
+    font(s = &Session) -> none(&Font):
+        st = s.settings
+        return s.fonts.get(s.gpu, st.font, st.bold, st.italic)
+
+    width(font = &Font, size = 0.0) -> float:
+        w = 20.0
+        b = self.editor.buffer
+        for i in range(b.get_line_count()):
+            w = max(w, font.measure_text(size, b.get_line(i)).width)
+        return w
+
+    position(font = &Font, size = 0.0, p = Pointer(), word = false) -> Pos:
+        b = self.editor.buffer
+        lh = font.get_line_height(size)
+        row = clamp(int(floor((p.y - self.y) / lh)), 0, b.get_line_count() - 1)
+        col = TextInput.column(font, size, b.get_line(row), p.x - self.x, word)
+        return Pos(row, col)
+
+    key(s = &Session):
+        if not self.editing:
+            return
+        win = s.ui.window
+        if win.input_get_key_pressed(Key.escape) or (win.input_get_key_down(Key.control) and win.input_get_key_pressed(Key.enter)):
+            self.commit(s)
+            return
+        e = self.editor
+        revision = e.buffer.revision
+        caret = e.caret
+        anchor = e.anchor
+        TextInput.keys(s.ui, e, true)
+        if revision != e.buffer.revision:
+            self.draw(s)
+        if revision != e.buffer.revision or not e.caret.same(caret) or not e.anchor.same(anchor):
+            self.blink = s.ui.time
+            self.last_press = -1.0
+
+    draw(s = &Session):
+        if d := s.doc:
+            self.preview.reset(s)
+            st = s.settings
+            if font := self.font(s):
+                layer = d.layers[self.preview.layer]
+                s.painter.text(font, self.size_px(s), self.x, self.y, self.editor.buffer.get_text())
+                s.painter.apply_color(layer.surface, s.primary, st.mode, st.overwrite, d.sel_texture())
+                self.preview.mark(s.painter.end())
+            d.touch()
+
+    cancel(s = &Session) -> bool:
+        if not self.editing:
+            return false
+        self.editing = false
+        self.selecting = false
+        self.editor.reset()
+        self.preview.cancel(s)
+        return true
+
+    recolor(s = &Session):
+        if self.editing:
+            self.draw(s)
+
+    commit(s = &Session):
+        if not self.editing:
+            return
+        self.editing = false
+        self.selecting = false
+        if self.editor.buffer.get_text() == "":
+            self.preview.cancel(s)
+            return
+        self.preview.finish(s, "history.text", Icon.tool_text)
+        self.editor.reset()
+
+    overlay(s = &Session):
+        if not self.editing:
+            return
+        size = self.size_px(s)
+        if f := self.font(s):
+            e = self.editor
+            b = e.buffer
+            lh = f.get_line_height(size)
+            v = s.view
+            ax, ay = v.to_screen(self.x - 2.0, self.y - 2.0)
+            bx, by = v.to_screen(self.x + self.width(f, size) + 2.0, self.y + float(b.get_line_count()) * lh + 2.0)
+            Marks.box(s, ax, ay, bx, by)
+            if e.has_selection():
+                a, end = e.get_selection()
+                for i in range(a.line, end.line + 1):
+                    line = b.get_line(i)
+                    left = f.measure_text(size, line.slice(0, a.col)).width if i == a.line else 0.0
+                    right = f.measure_text(size, line.slice(0, end.col)).width if i == end.line else f.measure_text(size, line).width + 4.0
+                    x, y = v.to_screen(self.x + left, self.y + float(i) * lh)
+                    if right > left:
+                        s.ui.fill(x, y, (right - left) * v.zoom, lh * v.zoom, s.ui.theme.accent, 0.35)
+            if int((s.ui.time - self.blink) / s.ui.theme.blink) % 2 == 0:
+                caret = e.caret
+                cx = f.measure_text(size, b.get_line(caret.line).slice(0, caret.col)).width
+                kx, ky = v.to_screen(self.x + cx, self.y + float(caret.line) * lh)
+                s.ui.fill(kx, ky, 1.0, lh * v.zoom, 0x000000)
+                s.ui.fill(kx + 1.0, ky, 1.0, lh * v.zoom, 0xFFFFFF, 0.6)
+
+    busy() -> bool:
+        return self.editing
+
+    cursor() -> Cursor:
+        return Cursor.text
+
+# Shapes are dragged from corner to corner. Line / Curve stays editable
+# after the initial drag, with two inner points and two endpoints.
+ShapeTool(Tool):
+    which = ToolKind.shapes
+    preview = Preview()
+    down = false
+    right = false
+    x0 = 0.0
+    y0 = 0.0
+    x1 = 0.0
+    y1 = 0.0
+    controls = [float]
+    curved = false
+    handle = -1
+    hot = -1
+    grab_x = 0.0
+    grab_y = 0.0
+
+    init(which = ToolKind.shapes):
+        self.which = which
+
+    kind() -> ToolKind:
+        return self.which
+
+    press(s = &Session, p = Pointer()):
+        if self.pending():
+            self.handle = self.hit(s, p)
+            if self.handle >= 0:
+                self.grab_x = self.controls[self.handle] - p.x
+                self.grab_y = self.controls[self.handle + 1] - p.y
+                return
+            self.commit(s)
+        if self.preview.start(s):
+            self.down = true
+            self.right = p.right
+            self.x0 = p.x
+            self.y0 = p.y
+            self.x1 = p.x
+            self.y1 = p.y
+
+    drag(s = &Session, p = Pointer()):
+        if self.handle >= 0:
+            x = p.x + self.grab_x
+            y = p.y + self.grab_y
+            if abs(x - self.controls[self.handle]) > 0.000001 or abs(y - self.controls[self.handle + 1]) > 0.000001:
+                self.controls[self.handle] = x
+                self.controls[self.handle + 1] = y
+                self.curved = true
+                self.draw(s)
+            return
+        if not self.down:
+            return
+        self.x1 = p.x
+        self.y1 = p.y
+        if p.shift:
+            if self.which == ToolKind.line:
+                a = atan2(self.y1 - self.y0, self.x1 - self.x0)
+                a = floor(a / 0.2617993878 + 0.5) * 0.2617993878
+                len = sqrt((self.x1 - self.x0) * (self.x1 - self.x0) + (self.y1 - self.y0) * (self.y1 - self.y0))
+                self.x1 = self.x0 + cos(a) * len
+                self.y1 = self.y0 + sin(a) * len
+            else:
+                side = max(abs(self.x1 - self.x0), abs(self.y1 - self.y0))
+                self.x1 = self.x0 + (side if self.x1 >= self.x0 else -side)
+                self.y1 = self.y0 + (side if self.y1 >= self.y0 else -side)
+        self.draw(s)
+
+    pending() -> bool:
+        return len(self.controls) != 0
+
+    hit(s = &Session, p = Pointer()) -> int:
+        best = -1
+        distance = 81.0
+        for i in range(0, len(self.controls), 2):
+            x, y = s.view.to_screen(self.controls[i], self.controls[i + 1])
+            dx = p.sx - x
+            dy = p.sy - y
+            ds = dx * dx + dy * dy
+            if ds < distance:
+                best = i
+                distance = ds
+        return best
+
+    # Catmull–Rom interpolation with one-sided tangents at the ends.
+    # Each segment passes through its two control points.
+    spline() -> [float]:
+        c = self.controls
+        out = [c[0], c[1]]
+        for i in range(0, 6, 2):
+            x, y = c[i], c[i + 1]
+            dx, dy = c[i + 2] - x, c[i + 3] - y
+            ax, ay = dx, dy
+            bx, by = dx, dy
+            if i > 0:
+                ax = (c[i + 2] - c[i - 2]) * 0.5
+                ay = (c[i + 3] - c[i - 1]) * 0.5
+            if i < 4:
+                bx = (c[i + 4] - x) * 0.5
+                by = (c[i + 5] - y) * 0.5
+            span = abs(dx) + abs(dy) + abs(ax) + abs(ay) + abs(bx) + abs(by)
+            steps = clamp(int(ceil(span / 16.0)), 8, 128)
+            for j in range(1, steps):
+                t = float(j) / float(steps)
+                u = 1.0 - t
+                end = t * t * (3.0 - 2.0 * t)
+                start_tangent = t * u * u
+                end_tangent = -t * t * u
+                out.push(x + end * dx + start_tangent * ax + end_tangent * bx)
+                out.push(y + end * dy + start_tangent * ay + end_tangent * by)
+            out.push(c[i + 2])
+            out.push(c[i + 3])
+        return out
+
+    # the outline of the shape in its box
+    points(s = &Session) -> [float]:
+        l = min(self.x0, self.x1)
+        t = min(self.y0, self.y1)
+        r = max(self.x0, self.x1)
+        b = max(self.y0, self.y1)
+        cx = (l + r) * 0.5
+        cy = (t + b) * 0.5
+        out = [float]
+        match s.settings.shape:
+            case ShapeKind.rounded:
+                return Shapes.rounded_points(l, t, r, b, s.settings.radius)
+            case ShapeKind.ellipse:
+                return Shapes.ellipse_points(l, t, r, b)
+            case ShapeKind.triangle:
+                out = [cx, t, r, b, l, b]
+            case ShapeKind.diamond:
+                out = [cx, t, r, cy, cx, b, l, cy]
+            case ShapeKind.hexagon:
+                q = (r - l) * 0.25
+                out = [l + q, t, r - q, t, r, cy, r - q, b, l + q, b, l, cy]
+            case ShapeKind.star:
+                for k in range(10):
+                    a = -1.5707963 + float(k) * 0.6283185
+                    k2 = 1.0 if k % 2 == 0 else 0.4
+                    out.push(cx + cos(a) * (r - l) * 0.5 * k2)
+                    out.push(cy + sin(a) * (b - t) * 0.5 * k2)
+            case ShapeKind.arrow:
+                h = (b - t)
+                out = [l, t + h * 0.3, l + (r - l) * 0.6, t + h * 0.3, l + (r - l) * 0.6, t, r, cy, l + (r - l) * 0.6, b, l + (r - l) * 0.6, b - h * 0.3, l, b - h * 0.3]
+            case _:
+                out = [l, t, r, t, r, b, l, b]
+        return out
+
+    draw(s = &Session):
+        if d := s.doc:
+            self.preview.reset(s)
+            st = s.settings
+            pt = s.painter
+            layer = d.layer().surface
+            sel = d.sel_texture()
+            fg = s.secondary if self.right else s.primary
+            bg = s.primary if self.right else s.secondary
+            if self.which == ToolKind.line:
+                if self.curved:
+                    pt.outline(self.spline(), st.width, false, st.antialias)
+                else:
+                    pt.line(self.x0, self.y0, self.x1, self.y1, st.width, st.antialias)
+                pt.apply_color(layer, fg, st.mode, st.overwrite, sel)
+                self.preview.mark(pt.end())
+            else:
+                pts = self.points(s)
+                if st.style != ShapeStyle.outline:
+                    pt.polygon(pts, st.antialias)
+                    pt.apply_color(layer, bg if st.style == ShapeStyle.both else fg, st.mode, st.overwrite, sel)
+                    self.preview.mark(pt.end())
+                if st.style != ShapeStyle.fill:
+                    if st.style == ShapeStyle.both:
+                        pt.begin(layer)
+                    pt.outline(pts, st.width, true, st.antialias)
+                    pt.apply_color(layer, fg, st.mode, st.overwrite, sel)
+                    self.preview.mark(pt.end())
+            d.touch()
+
+    release(s = &Session, p = Pointer()):
+        if self.handle >= 0:
+            self.drag(s, p)
+            self.handle = -1
+            self.hover(s, p)
+            return
+        if not self.down:
+            return
+        self.drag(s, p)
+        self.down = false
+        if self.x0 == self.x1 and self.y0 == self.y1:
+            self.preview.cancel(s)
+            return
+        if self.which == ToolKind.line:
+            dx = (self.x1 - self.x0) / 3.0
+            dy = (self.y1 - self.y0) / 3.0
+            self.controls = [self.x0, self.y0, self.x0 + dx, self.y0 + dy, self.x1 - dx, self.y1 - dy, self.x1, self.y1]
+            self.hover(s, p)
+            return
+        self.keep(s)
+
+    keep(s = &Session):
+        if self.which == ToolKind.line:
+            self.preview.finish(s, "history.line", Icon.tool_line)
+        else:
+            self.preview.finish(s, "history.shape", Icon.tool_shapes)
+
+    cancel(s = &Session) -> bool:
+        if not self.down:
+            return false
+        self.down = false
+        self.preview.cancel(s)
+        return true
+
+    recolor(s = &Session):
+        if self.down or self.pending():
+            self.draw(s)
+        elif self.which == ToolKind.shapes and self.preview.reopen(s):
+            self.draw(s)
+            self.keep(s)
+
+    hover(s = &Session, p = Pointer()):
+        self.hot = self.hit(s, p)
+
+    key(s = &Session):
+        if self.pending() and s.ui.window.input_get_key_pressed(Key.enter):
+            self.commit(s)
+
+    commit(s = &Session):
+        if self.which != ToolKind.line or not self.preview.active():
+            return
+        self.down = false
+        if not self.pending() and self.x0 == self.x1 and self.y0 == self.y1:
+            self.preview.cancel(s)
+            return
+        self.controls.clear()
+        self.curved = false
+        self.handle = -1
+        self.hot = -1
+        self.keep(s)
+
+    overlay(s = &Session):
+        if self.pending():
+            for i in range(0, len(self.controls), 2):
+                x, y = s.view.to_screen(self.controls[i], self.controls[i + 1])
+                Marks.knob(s, x, y)
+                if i == self.hot or i == self.handle:
+                    s.ui.circle(x, y, 4.0, s.ui.theme.accent)
+            return
+        if not self.down:
+            return
+        v = s.view
+        ax, ay = v.to_screen(self.x0, self.y0)
+        bx, by = v.to_screen(self.x1, self.y1)
+        if self.which == ToolKind.line:
+            Marks.handle(s, ax, ay)
+            Marks.handle(s, bx, by)
+        else:
+            Marks.box(s, ax, ay, bx, by)
+
+    busy() -> bool:
+        return self.down or self.handle >= 0
+
+    cursor() -> Cursor:
+        if self.handle >= 0 or self.hot >= 0:
+            return Cursor.move
+        return Cursor.crosshair

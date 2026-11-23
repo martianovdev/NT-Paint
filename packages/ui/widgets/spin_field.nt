@@ -1,0 +1,133 @@
+# widgets/spin_field — a whole number in a dark field, typed on a press
+# (Enter keeps, Escape lets go), with two small arrows at its right that
+# step it; the wheel over it steps it too.
+
+from ui import LineEdit, SpinField
+from graphics import Align
+from window import Button, Cursor, Key
+from view import Layout
+
+extend SpinField:
+    line = &LineEdit
+    editing = false
+
+    init(ui = &Ui, parent = &View, value = 0, min = 0, max = 100, width = 60.0):
+        self.ui = ui
+        self.value = value
+        self.min = min
+        self.max = max
+        self.line = &LineEdit(ui)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_min_size(width, 22.0)
+        self.view.set_max_size(width, 22.0)
+        self.view.set_focusable(true)
+        on self.view.draw():
+            self.draw()
+
+    set_value(value = 0):
+        next = clamp(value, self.min, self.max)
+        if next != self.value:
+            self.value = next
+            self.view.render_once()
+
+    set_range(min = 0, max = 100):
+        self.min = min
+        self.max = max
+        self.set_value(self.value)
+
+    get_editing() -> bool:
+        return self.editing
+
+    update():
+        ui = self.ui
+        win = ui.window
+        if self.view.get_hovered():
+            px, _ = self.view.get_pointer()
+            _, _, width, _ = ui.rect(self.view)
+            ui.want_cursor(Cursor.hand if px >= width - 14.0 else Cursor.text)
+            wheel = ui.wheel_steps()
+            if wheel != 0:
+                self.step(wheel)
+                return
+        first = false
+        if win.input_get_mouse_button_pressed(Button.left) and self.view.get_hovered():
+            px, py = self.view.get_pointer()
+            _, _, w, h = ui.rect(self.view)
+            if px >= w - 14.0:
+                self.finish(true)
+                self.set(self.value + (1 if py < h * 0.5 else -1))
+                return
+            elif not self.editing:
+                ui.views.set_focus(self.view)
+                self.editing = true
+                self.view.render_once()
+                self.line.begin(str(self.value))
+                first = true
+        if not self.editing:
+            return
+        ui.hold_keys()
+        if not self.view.get_focused() or win.input_get_key_pressed(Key.tab) or (win.input_get_mouse_button_pressed(Button.left) and not self.view.get_hovered()):
+            self.finish(true)
+            return
+        if win.input_get_key_repeated(Key.up) or win.input_get_key_repeated(Key.down):
+            self.step(1 if win.input_get_key_repeated(Key.up) else -1)
+            return
+        _, _, width, _ = ui.rect(self.view)
+        self.line.pointer(self.view, 1.0, width - 16.0, first)
+        result = self.line.update()
+        self.line.tick_caret(self.view)
+        match result:
+            case 1:
+                self.finish(true)
+            case 2:
+                self.finish(false)
+            case _:
+                pass
+
+    set(v = 0):
+        nv = clamp(v, self.min, self.max)
+        if nv != self.value:
+            self.set_value(nv)
+            emit changed(nv)
+
+    typed_value() -> int:
+        if v := self.line.get_text().strip().to_int():
+            return clamp(v, self.min, self.max)
+        return self.value
+
+    step(by = 0):
+        base = self.typed_value() if self.editing else self.value
+        self.set(base + by)
+        if self.editing:
+            self.line.begin(str(self.value))
+
+    finish(keep = true):
+        if not self.editing:
+            return
+        self.editing = false
+        self.view.render_once()
+        self.line.close()
+        if self.view.get_focused():
+            self.ui.views.set_focus(none)
+        if keep:
+            self.set(self.typed_value())
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        hot = self.view.get_hovered()
+        ui.fill_round(x, y, w, h, t.radius, t.field)
+        ui.outline_round(x, y, w, h, t.radius, t.ink_muted if self.editing or hot else t.field_edge)
+        if self.editing:
+            self.line.draw(x + 1.0, y + 1.0, w - 16.0, h - 2.0, t.size)
+        else:
+            ui.text(x + 3.0, y, w - 19.0, h, str(self.value), t.ink, Align.right + Align.middle, t.size)
+        # the arrows
+        ax = x + w - 12.0
+        ui.fill_round(ax - 2.0, y + 2.0, 12.0, h - 4.0, 3.0, t.button)
+        up = [ax + 4.5, y + 4.0, ax + 8.0, y + 9.0, ax + 1.0, y + 9.0]
+        dn = [ax + 1.0, y + h - 9.0, ax + 8.0, y + h - 9.0, ax + 4.5, y + h - 4.0]
+        ui.graphics.render_set_color(ui.color(t.ink_soft))
+        ui.graphics.render_polygon(up)
+        ui.graphics.render_polygon(dn)

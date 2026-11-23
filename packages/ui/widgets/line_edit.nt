@@ -1,0 +1,234 @@
+# widgets/line_edit — one line of text edited in place, over a row its
+# owner draws: no view of its own, the owner hands it the keys while it
+# is open and draws it where the text was.  Enter keeps what was typed,
+# Escape lets it go; the caret keys, Home and End, Ctrl for words, Shift
+# to select, the clipboard and undo as in code.
+
+from ui import LineEdit, TextInput
+from graphics import Align
+from window import Button, Cursor, Key
+from text import Pos, TextBuffer, TextEditor
+
+extend LineEdit:
+    caret_painted = false
+    text_revision = -1
+    open = false
+    moved = 0.0
+    offset = 0.0
+    grab = false
+    grab_x = 0.0
+    last_x = 0.0
+    last_press = -1.0
+    pressed_col = 0
+    selecting = false
+
+    init(ui = &Ui):
+        self.ui = ui
+        self.editor = &TextEditor(&TextBuffer())
+
+    # text to edit, the characters from start to end selected
+    begin(text = "", start = 0, end = -1):
+        self.editor.reset(text)
+        self.editor.set_caret(Pos(0, start))
+        self.editor.set_caret(Pos(0, end if end >= 0 else len(text)), true)
+        self.open = true
+        self.offset = 0.0
+        self.grab = false
+        self.last_press = -1.0
+        self.moved = self.ui.time
+
+    get_open() -> bool:
+        return self.open
+
+    get_text() -> str:
+        return self.editor.buffer.get_line(0)
+
+    close():
+        self.open = false
+        self.grab = false
+
+    update() -> int:
+        if not self.open:
+            return 0
+        e = self.editor
+        win = self.ui.window
+        self.ui.hold_keys()
+        before = e.caret
+        revision = e.buffer.revision
+        if win.input_get_key_pressed(Key.enter):
+            self.open = false
+            return 1
+        if win.input_get_key_pressed(Key.escape):
+            self.open = false
+            return 2
+        TextInput.keys(self.ui, e)
+        if not e.caret.same(before) or e.buffer.revision != revision:
+            self.moved = self.ui.time
+        return 0
+
+    click(x = 0.0, size = 0.0, extend = false):
+        col = TextInput.column(self.ui.font, size, self.get_text(), x - 4.0 + self.offset)
+        self.editor.set_caret(Pos(0, col), extend)
+        self.moved = self.ui.time
+
+    pointer(view = &View, left = 0.0, width = 0.0, select_all = false):
+        ui = self.ui
+        win = ui.window
+        px, _ = view.get_pointer()
+        x = px - left
+        size = ui.theme.size
+        if win.input_get_mouse_button_pressed(Button.left):
+            self.grab = view.get_hovered() and x >= 0.0 and x < width
+            if not self.grab:
+                return
+            shift = win.input_get_key_down(Key.shift)
+            self.grab_x = x
+            self.pressed_col = TextInput.column(ui.font, size, self.get_text(), x - 4.0 + self.offset)
+            self.selecting = not select_all or shift
+            if not shift and self.last_press >= 0.0 and ui.time - self.last_press <= 0.4 and abs(x - self.last_x) <= 6.0:
+                at = TextInput.column(ui.font, size, self.get_text(), x - 4.0 + self.offset, true)
+                self.editor.select_word(Pos(0, at))
+                self.selecting = false
+                self.last_press = -1.0
+            else:
+                if self.selecting:
+                    self.click(x, size, shift)
+                self.last_press = ui.time
+                self.last_x = x
+            self.moved = ui.time
+        elif not win.input_get_mouse_button_down(Button.left):
+            self.grab = false
+        elif self.grab and abs(x - self.grab_x) > 2.0:
+            if not self.selecting:
+                self.editor.set_caret(Pos(0, self.pressed_col))
+                self.selecting = true
+            self.last_press = -1.0
+            self.click(x, size, true)
+
+    caret_visible() -> bool:
+        since = self.ui.time - self.moved
+        blink = self.ui.theme.blink
+        return since < blink or int(since / blink) % 2 == 0
+
+    tick_caret(view = &View):
+        visible = self.caret_visible()
+        revision = self.editor.buffer.revision
+        if visible != self.caret_painted or revision != self.text_revision:
+            self.caret_painted = visible
+            self.text_revision = revision
+            view.render_once()
+
+    # the field over x, y, w, h: its plate, the selection, the text, the
+    # caret
+    draw(x = 0.0, y = 0.0, w = 0.0, h = 0.0, size = 0.0):
+        if not self.open:
+            return
+        ui = self.ui
+        t = ui.theme
+        e = self.editor
+        line = self.get_text()
+        ui.fill_round(x, y, w, h, t.radius, t.field)
+        ui.outline_round(x, y, w, h, t.radius, t.accent)
+        px, py = ui.pointer()
+        if px >= x and px < x + w and py >= y and py < y + h:
+            ui.want_cursor(Cursor.text)
+        pad = 4.0
+        room = max(1.0, w - pad * 2.0)
+        full = ui.measure(line, size)
+        caret = ui.measure(line.slice(0, e.caret.col), size)
+        self.offset = clamp(self.offset, 0.0, max(0.0, full - room + 2.0))
+        if caret < self.offset:
+            self.offset = caret
+        elif caret > self.offset + room - 2.0:
+            self.offset = max(0.0, caret - room + 2.0)
+        tx = x + pad - self.offset
+        ui.graphics.render_scissor_begin(int(x + pad), int(y + 2.0), int(room), max(1, int(h - 4.0)))
+        sa, sb = e.get_selection()
+        ax = tx + ui.measure(line.slice(0, sa.col), size)
+        bx = tx + ui.measure(line.slice(0, sb.col), size)
+        if bx > ax:
+            ui.fill(ax, y + 3.0, bx - ax, h - 6.0, t.selection)
+        ui.graphics.render_set_color(ui.color(t.ink))
+        ui.graphics.render_text_box(ui.font, size, tx, y, full + 4.0, h, line, Align.left + Align.middle)
+        if self.caret_visible():
+            ui.fill(tx + caret, y + 4.0, 1.5, h - 8.0, t.caret)
+        ui.graphics.render_scissor_end()
+
+extend TextInput:
+    keys(ui = &Ui, editor = &TextEditor, multiline = false):
+        win = ui.window
+        e = editor
+        ctrl = win.input_get_key_down(Key.control)
+        shift = win.input_get_key_down(Key.shift)
+        alt = win.input_get_key_down(Key.alt)
+        if not ctrl or alt:
+            e.type(TextInput.clean(win.input_get_text(), multiline))
+        if win.input_get_key_repeated(Key.left):
+            e.move_left(ctrl, shift)
+        if win.input_get_key_repeated(Key.right):
+            e.move_right(ctrl, shift)
+        if win.input_get_key_repeated(Key.home):
+            if multiline and not ctrl:
+                e.set_caret(Pos(e.caret.line, 0), shift)
+            else:
+                e.move_start(shift)
+        if win.input_get_key_repeated(Key.end):
+            if multiline and not ctrl:
+                e.move_end(shift)
+            else:
+                e.move_finish(shift)
+        if multiline:
+            if win.input_get_key_repeated(Key.up):
+                e.move_up(1, shift)
+            if win.input_get_key_repeated(Key.down):
+                e.move_down(1, shift)
+            if win.input_get_key_repeated(Key.enter):
+                e.type("\n")
+        if win.input_get_key_repeated(Key.backspace):
+            e.backspace(ctrl, false)
+        if win.input_get_key_repeated(Key.delete):
+            e.delete(ctrl)
+        if not ctrl or alt:
+            return
+        if win.input_get_key_pressed(Key.a):
+            e.select_all()
+        if win.input_get_key_pressed(Key.c) and e.has_selection():
+            win.clipboard_set_text(e.copy())
+        if win.input_get_key_pressed(Key.x) and e.has_selection():
+            win.clipboard_set_text(e.cut())
+        if win.input_get_key_repeated(Key.v):
+            e.paste(TextInput.clean(win.clipboard_get_text(), multiline, true))
+        if win.input_get_key_repeated(Key.z):
+            if shift:
+                e.redo()
+            else:
+                e.undo()
+        if win.input_get_key_repeated(Key.y):
+            e.redo()
+
+    clean(text = "", multiline = false, paste = false) -> str:
+        out = ""
+        for c in text.chars():
+            if c == char("\r") or c == char("\n"):
+                if not multiline and paste:
+                    break
+                if multiline and paste:
+                    out.append(str(c))
+            elif c == char("\t") and paste:
+                out.append(" " if not multiline else "    ")
+            elif int(c) >= 32 and int(c) != 127:
+                out.append(str(c))
+        return out
+
+    column(font = &Font, size = 0.0, line = "", x = 0.0, word = false) -> int:
+        lo = 0
+        hi = len(line)
+        while lo < hi:
+            mid = (lo + hi) / 2
+            right = font.measure_text(size, line.slice(0, mid + 1)).width
+            cut = right if word else (right + font.measure_text(size, line.slice(0, mid)).width) * 0.5
+            if x < cut:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo

@@ -1,0 +1,118 @@
+# display — a picture on the screen: a checker under what is see-through
+# (8-pixel cells of the window, as paint.net's), the picture's texels
+# sharp when zoomed in.
+
+from imaging import Display
+from graphics import Blend, Color, Filter, MaterialState
+
+extend Display:
+    draw(gpu = &Gpu, texture = &Texture, tw = 0, th = 0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, nearest = false, checker = true):
+        g = gpu.graphics
+        m = gpu.material("display", DisplayShader.source())
+        m.set_state(MaterialState(Blend.alpha))
+        f = Filter.nearest if nearest else Filter.linear
+        m.set_texture("pic", texture, f, f)
+        # shrunk (a thumbnail, a zoom under 100%): up to 8×8 texels averaged
+        # under each pixel of the screen, so thin lines do not drop out
+        n = 1.0
+        if not nearest and w > 0.0 and h > 0.0:
+            n = clamp(ceil(max(float(tw) / w, float(th) / h)), 1.0, 8.0)
+        m.set_constant("info", float(tw), float(th), 1.0 if checker else 0.0, n)
+        m.set_constant("foot", 1.0 / max(w, 1.0), 1.0 / max(h, 1.0), 0.0, 0.0)
+        g.material_bind(m)
+        g.render_set_color(Color(1.0, 1.0, 1.0, 1.0))
+        g.render_rectangle(x, y, w, h)
+        g.material_unbind()
+
+    selection(gpu = &Gpu, mask = none(&Texture), x = 0.0, y = 0.0, w = 0.0, h = 0.0, nearest = false, phase = 0.0, solid = false):
+        g = gpu.graphics
+        tint = Color(0.25, 0.61, 1.0, 0.23)
+        if solid:
+            g.render_set_color(tint)
+            g.render_rectangle(x, y, w, h)
+            return
+        if w <= 0.0 or h <= 0.0:
+            return
+        m = gpu.material("display_selection", DisplayShader.selection(), sel = true)
+        m.set_state(MaterialState(Blend.alpha))
+        f = Filter.nearest if nearest else Filter.linear
+        m.set_texture("sel", mask.or(gpu.everything()), f, f)
+        m.set_constant("tint", tint.r, tint.g, tint.b, tint.a)
+        m.set_constant("region", w, h, phase, 0.0 if mask == none else 1.0)
+        g.material_bind(m)
+        g.render_set_color(Color(1.0, 1.0, 1.0, 1.0))
+        # The extra pixel lets the contour fall on either side of the mask.
+        g.render_rectangle(x - 1.0, y - 1.0, w + 2.0, h + 2.0)
+        g.material_unbind()
+
+DisplayShader:
+    selection() -> str:
+        return """
+uniform vec4 tint;
+uniform vec4 region;
+
+float coverage(vec2 p)
+{
+    if (p.x < 0.0 || p.y < 0.0 || p.x >= region.x || p.y >= region.y)
+        return 0.0;
+    return region.w > 0.5 ? selk(p / region.xy) : 1.0;
+}
+
+void fragment()
+{
+    vec2 p = uv * (region.xy + vec2(2.0)) - vec2(1.0);
+    float fill = coverage(p);
+    float inside = step(0.5, fill);
+    float left = step(0.5, coverage(p - vec2(1.0, 0.0)));
+    float top = step(0.5, coverage(p - vec2(0.0, 1.0)));
+    if (inside != left || inside != top)
+    {
+        float along = inside != top ? FRAGCOORD.x : FRAGCOORD.y;
+        float dash = step(0.5, fract((along - region.z) / 8.0));
+        COLOR = vec4(vec3(dash), 1.0);
+    }
+    else
+    {
+        COLOR = vec4(tint.rgb, tint.a * fill);
+    }
+}
+"""
+
+    source() -> str:
+        return """
+uniform sampler2D pic;
+uniform vec4 info;
+uniform vec4 foot;
+void fragment()
+{
+    vec4 c = texture(pic, uv);
+    if (info.w > 1.5)
+    {
+        // the texels under this pixel, averaged with their alpha
+        vec4 sum = vec4(0.0);
+        float n = info.w;
+        for (int j = 0; j < int(n); j++)
+        {
+            for (int i = 0; i < int(n); i++)
+            {
+                vec2 o = (vec2(float(i), float(j)) + 0.5) / n - 0.5;
+                vec4 t = texture(pic, uv + o * foot.xy);
+                sum += vec4(t.rgb * t.a, t.a);
+            }
+        }
+        sum /= n * n;
+        c = sum.a > 0.0 ? vec4(sum.rgb / sum.a, sum.a) : vec4(0.0);
+    }
+    float cell = floor(FRAGCOORD.x / 8.0) + floor(FRAGCOORD.y / 8.0);
+    float dark = step(0.5, fract(cell * 0.5));
+    vec3 back = mix(vec3(1.0, 1.0, 1.0), vec3(0.8, 0.8, 0.8), dark);
+    if (info.z > 0.5)
+    {
+        COLOR = vec4(mix(back, c.rgb, c.a), 1.0);
+    }
+    else
+    {
+        COLOR = c;
+    }
+}
+"""

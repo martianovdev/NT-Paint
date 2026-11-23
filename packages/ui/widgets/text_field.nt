@@ -1,0 +1,103 @@
+# widgets/text_field — text typed in a field, as natiny's editor has it:
+# a dark field with the text; a click places the caret, Shift and a drag
+# extend the selection; Enter, Tab or the focus gone keeps it, Escape lets it
+# go back.
+
+from ui import LineEdit, TextField
+from graphics import Align
+from window import Button, Cursor, Key
+from view import Layout
+
+extend TextField:
+    line = &LineEdit
+    editing = false
+    enabled = true
+
+    init(ui = &Ui, parent = &View, text = ""):
+        self.ui = ui
+        self.text = text
+        self.line = &LineEdit(ui)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_min_size(40.0, ui.theme.field_height)
+        self.view.set_clip(true)
+        self.view.set_focusable(true)
+        on self.view.draw():
+            self.draw()
+
+    set_text(text = ""):
+        if self.text != text:
+            self.text = text
+            self.view.render_once()
+
+    set_enabled(enabled = true):
+        if self.enabled != enabled:
+            self.enabled = enabled
+            self.view.render_once()
+        if not enabled and self.editing:
+            self.finish(false)
+
+    get_editing() -> bool:
+        return self.editing
+
+    update():
+        ui = self.ui
+        views = ui.views
+        win = ui.window
+        if not self.enabled:
+            return
+        if self.view.get_hovered():
+            ui.want_cursor(Cursor.text)
+        if win.input_get_mouse_button_pressed(Button.left) and self.view.get_hovered():
+            if not self.editing:
+                views.set_focus(self.view)
+                self.editing = true
+                self.view.render_once()
+                self.line.begin(self.text)
+        if not self.editing:
+            return
+        ui.hold_keys()
+        if not self.view.get_focused() or (win.input_get_mouse_button_pressed(Button.left) and not self.view.get_hovered()):
+            self.finish(true)
+            return
+        if win.input_get_key_pressed(Key.tab):
+            self.finish(true)
+            return
+        _, _, w, _ = ui.rect(self.view)
+        self.line.pointer(self.view, 0.0, w)
+        result = self.line.update()
+        self.line.tick_caret(self.view)
+        match result:
+            case 1:
+                self.finish(true)
+            case 2:
+                self.finish(false)
+            case _:
+                pass
+
+    # ─── Inside ───
+
+    finish(keep = true):
+        if not self.editing:
+            return
+        self.editing = false
+        self.view.render_once()
+        text = self.line.get_text()
+        self.line.close()
+        if self.view.get_focused():
+            self.ui.views.set_focus(none)
+        if keep and text != self.text:
+            self.text = text
+            emit committed(text)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        if self.editing:
+            self.line.draw(x, y, w, h, t.size)
+            return
+        hot = self.enabled and self.view.get_hovered()
+        ui.fill_round(x, y, w, h, t.radius, t.field_hot if hot else t.field)
+        ui.outline_round(x, y, w, h, t.radius, t.field_edge if hot else t.line)
+        ui.text(x + 4.0, y, w - 8.0, h, self.text, t.ink if self.enabled else t.ink_faint, Align.left + Align.middle, t.size)

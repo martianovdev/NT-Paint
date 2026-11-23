@@ -1,0 +1,86 @@
+# widgets/card — a part of what Properties shows, as natiny's editor
+# draws it: on the backdrop, rounded, a title strip with the title in the
+# middle, then rows - each a plate of the panel's colour with a name on
+# the left, bright when the node says the value and dim when natiny's own
+# holds, and its fields after it.
+
+from ui import Card
+from graphics import Align
+from view import Layout, View
+
+Cards:
+    # the title strip; round a row; between rows; round the rows; the
+    # names' column
+    header = 26.0
+    row_pad = 2.0
+    row_gap = 2.0
+    body_pad = 2.0
+    label = 84.0
+
+extend Card:
+    # the views it made that no field holds
+    held = [&View]
+    # each row's name dim
+    muted = [bool]
+    label_width = Cards.label
+
+    init(ui = &Ui, parent = &View, title = ""):
+        self.ui = ui
+        self.title = title
+        self.root = ui.create(Layout.vertical, parent)
+        header = ui.create(Layout.free, self.root)
+        self.rows = ui.create(Layout.vertical, self.root)
+        self.held.push(header)
+        header.set_min_size(0.0, Cards.header)
+        header.set_max_size(0.0, Cards.header)
+        self.rows.set_padding(Cards.body_pad, 0.0, Cards.body_pad, Cards.body_pad)
+        self.rows.set_gap(0.0, Cards.row_gap)
+        on self.root.draw():
+            x, y, w, h = self.ui.rect(self.root)
+            self.ui.fill_round(x, y, w, h, self.ui.theme.radius * 1.5, self.ui.theme.backdrop)
+            self.root.render_children()
+        on header.draw():
+            x, y, w, h = self.ui.rect(header)
+            self.ui.text(x, y, w, h, self.title, self.ui.theme.ink, Align.center + Align.middle, self.ui.theme.size)
+
+    row(name = "", muted = false, cells = 1, tall = false) -> &View:
+        ui = self.ui
+        t = ui.theme
+        index = len(self.muted)
+        self.muted.push(muted)
+        line = ui.create(Layout.horizontal, self.rows)
+        p = Cards.row_pad
+        line.set_padding(p, p, p, p)
+        line.set_gap(t.gap * 0.5, 0.0)
+        line.set_min_size(0.0, t.field_height + p * 2.0)
+        if not tall:
+            line.set_max_size(0.0, t.field_height + p * 2.0)
+        caption = ui.create(Layout.free, line)
+        caption.set_min_size(self.label_width, 0.0)
+        caption.set_max_size(self.label_width, 0.0)
+        caption.set_clip(true)
+        fields = ui.create(Layout.horizontal, line)
+        fields.set_expand(true)
+        fields.set_gap(2.0 if cells > 1 else t.gap * 0.5, 0.0)
+        self.held.push(line)
+        self.held.push(caption)
+        self.held.push(fields)
+        on line.draw():
+            x, y, w, h = self.ui.rect(line)
+            self.ui.fill_round(x, y, w, h, self.ui.theme.radius, self.ui.theme.chrome)
+            line.render_children()
+        on caption.draw():
+            th = self.ui.theme
+            x, y, w, h = self.ui.rect(caption)
+            ink = th.ink_faint if self.muted[index] else th.ink
+            # one line, cut off at the column's edge; a tall row's beside
+            # its first line
+            self.ui.text(x + 4.0, y, w - 8.0, min(h, th.field_height), name, ink, Align.left + Align.middle, th.size)
+        return fields
+
+    set_label_width(width = 84.0):
+        self.label_width = width
+
+    set_muted(index = 0, muted = true):
+        if index >= 0 and index < len(self.muted):
+            self.muted[index] = muted

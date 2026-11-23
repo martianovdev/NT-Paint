@@ -1,0 +1,47 @@
+# widgets/check_box — a small box: the accent with a check when checked, a
+# dark field when not.  A click toggles it and tells.
+
+from ui import CheckBox, Icon
+from window import Cursor
+from view import Layout
+
+extend CheckBox:
+    enabled = true
+
+    init(ui = &Ui, parent = &View, checked = false):
+        self.ui = ui
+        self.checked = checked
+        self.view = ui.create(Layout.free, parent)
+        size = ui.theme.check
+        self.view.set_min_size(size, ui.theme.field_height)
+        self.view.set_max_size(size, ui.theme.field_height)
+        on self.view.draw():
+            self.draw()
+        on self.view.click():
+            if self.enabled:
+                self.checked = not self.checked
+                emit toggled(self.checked)
+
+    set_checked(checked = false):
+        self.checked = checked
+
+    set_enabled(enabled = true):
+        self.enabled = enabled
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, _, h = ui.rect(self.view)
+        s = t.check
+        top = y + (h - s) * 0.5
+        hot = self.enabled and self.view.get_hovered()
+        if hot:
+            ui.want_cursor(Cursor.hand)
+        if self.checked and self.enabled:
+            ui.fill_round(x, top, s, s, t.radius, t.accent)
+            ui.icon(Icon.check, x + (s - 14.0) * 0.5, top + (s - 14.0) * 0.5, 14.0, t.accent_ink)
+        else:
+            ui.fill_round(x, top, s, s, t.radius, t.field)
+            ui.outline_round(x, top, s, s, t.radius, t.field_edge if hot else t.line)
+            if self.checked:
+                ui.icon(Icon.check, x + (s - 14.0) * 0.5, top + (s - 14.0) * 0.5, 14.0, t.ink_faint)

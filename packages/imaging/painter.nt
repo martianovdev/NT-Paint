@@ -1,0 +1,377 @@
+# painter — a stroke on the GPU.  Coverage lives in two surfaces of the
+# layer's size: a segment is drawn into the second as the larger of what
+# the first holds and its own, then copied back over its box, so a stroke
+# that crosses itself never doubles.  Shapes and text are drawn white by
+# the 2D batch into a cleared coverage.  Applying reads base (the layer
+# when the stroke began) and writes the layer in the dirty box only.
+
+from imaging import Painter
+from gpu import Shaders
+from graphics import Color, Filter, Material, Surface, Texture
+from raster import Rect
+
+extend Painter:
+    base = none(&Surface)
+    cover = none(&Surface)
+    cover2 = none(&Surface)
+    dirty = Rect()
+    w = 0
+    h = 0
+
+    init(gpu = &Gpu):
+        self.gpu = gpu
+
+    begin(layer = &Surface):
+        g = self.gpu
+        self.w = layer.get_width()
+        self.h = layer.get_height()
+        self.ensure()
+        if b := self.base:
+            g.copy(b, layer.get_texture(), Rect(0, 0, self.w, self.h))
+        self.clear_cover()
+        self.dirty = Rect()
+
+    get_dirty() -> Rect:
+        return self.dirty
+
+    get_base() -> &Surface:
+        self.ensure()
+        return self.base.expect("base")
+
+    # surfaces of the layer's size, made again when it changed
+    ensure():
+        g = self.gpu
+        same = false
+        if b := self.base:
+            same = b.get_width() == self.w and b.get_height() == self.h
+        if not same:
+            self.base = g.surface(self.w, self.h)
+            self.cover = g.surface(self.w, self.h)
+            self.cover2 = g.surface(self.w, self.h)
+
+    clear_cover():
+        if c := self.cover:
+            self.gpu.clear(c, 0)
+
+    capsule(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, radius = 1.0, hardness = 1.0, aa = true, end_radius = -1.0):
+        g = self.gpu
+        start = max(radius, 0.5)
+        end = start if end_radius < 0.0 else max(end_radius, 0.5)
+        rad = max(start, end)
+        box = Rect.around(min(x0, x1) - rad - 2.0, min(y0, y1) - rad - 2.0, max(x0, x1) + rad + 2.0, max(y0, y1) + rad + 2.0).clip(self.w, self.h)
+        if box.empty():
+            return
+        c = self.cover.expect("cover")
+        c2 = self.cover2.expect("cover")
+        m = g.material("capsule", PaintShaders.capsule())
+        m.set_texture("prev", c.get_texture(), Filter.nearest, Filter.nearest)
+        m.set_constant("seg", x0, y0, x1, y1)
+        m.set_constant("brush", start, clamp(hardness, 0.0, 1.0), 1.0 if aa else 0.0, end)
+        g.run(c2, m, float(box.x), float(box.y), float(box.w), float(box.h))
+        g.copy(c, c2.get_texture(), box)
+        self.dirty = self.dirty.union(box)
+
+    # the coverage surface bound for the 2D batch to draw into in white
+    shapes_begin(fresh = true) -> &Surface:
+        c = self.cover.expect("cover")
+        if fresh:
+            self.gpu.clear(c, 0)
+        gr = self.gpu.graphics
+        gr.surface_bind(c)
+        gr.render_set_color(Color(1.0, 1.0, 1.0, 1.0))
+        return c
+
+    shapes_end(box = Rect()):
+        gr = self.gpu.graphics
+        gr.render_set_antialias(true)
+        gr.surface_unbind()
+        self.dirty = self.dirty.union(box.clip(self.w, self.h))
+
+    polygon(pts = [float], aa = true, fresh = true):
+        if len(pts) < 6:
+            return
+        _ = self.shapes_begin(fresh)
+        gr = self.gpu.graphics
+        gr.render_set_antialias(aa)
+        gr.render_polygon(pts)
+        self.shapes_end(PaintShaders.box(pts, 2.0))
+
+    outline(pts = [float], width = 1.0, closed = true, aa = true, fresh = true):
+        n = len(pts) / 2
+        if n < 2:
+            return
+        _ = self.shapes_begin(fresh)
+        gr = self.gpu.graphics
+        gr.render_set_antialias(aa)
+        if closed and n >= 3:
+            gr.render_polygon_outline(pts, width)
+        else:
+            for k in range(n - 1):
+                gr.render_line(pts[k * 2], pts[k * 2 + 1], pts[k * 2 + 2], pts[k * 2 + 3], width)
+            # round joins
+            if width > 2.0:
+                for k in range(n):
+                    gr.render_circle(pts[k * 2], pts[k * 2 + 1], width * 0.5)
+        self.shapes_end(PaintShaders.box(pts, width + 2.0))
+
+    line(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, width = 1.0, aa = true, fresh = true):
+        _ = self.shapes_begin(fresh)
+        gr = self.gpu.graphics
+        gr.render_set_antialias(aa)
+        gr.render_line(x0, y0, x1, y1, width)
+        if width > 2.0:
+            gr.render_circle(x0, y0, width * 0.5)
+            gr.render_circle(x1, y1, width * 0.5)
+        self.shapes_end(PaintShaders.box([x0, y0, x1, y1], width + 2.0))
+
+    text(font = &Font, size = 0.0, x = 0.0, y = 0.0, text = "", fresh = true):
+        _ = self.shapes_begin(fresh)
+        gr = self.gpu.graphics
+        lines = text.split("\n")
+        lh = font.get_line_height(size)
+        yy = y
+        wmax = 0.0
+        for l in lines:
+            gr.render_text(font, size, x, yy, l)
+            wmax = max(wmax, font.measure_text(size, l).width)
+            yy += lh
+        self.shapes_end(Rect.around(x - 4.0, y - 4.0, x + wmax + 8.0, yy + 8.0))
+
+    from_mask(m = Mask()):
+        g = self.gpu
+        c = self.cover.expect("cover")
+        tex = g.mask_texture(m)
+        mat = g.material("cover_mask", PaintShaders.from_mask())
+        mat.set_texture("pic", tex, Filter.nearest, Filter.nearest)
+        box = m.bounds()
+        g.run(c, mat, 0.0, 0.0, float(self.w), float(self.h))
+        self.dirty = self.dirty.union(box)
+
+    # a pass of an applying shader over the dirty box of layer, base and
+    # coverage set, the selection (or everything) as sel
+    apply(layer = &Surface, m = &Material, sel = none(&Texture)):
+        g = self.gpu
+        box = self.dirty.clip(self.w, self.h)
+        if box.empty():
+            return
+        m.set_texture("base", self.base.expect("base").get_texture(), Filter.nearest, Filter.nearest)
+        m.set_texture("cover", self.cover.expect("cover").get_texture(), Filter.nearest, Filter.nearest)
+        m.set_texture("sel", sel.or(g.everything()), Filter.nearest, Filter.nearest)
+        g.run(layer, m, float(box.x), float(box.y), float(box.w), float(box.h))
+
+    apply_color(layer = &Surface, c = 0, mode = BlendMode.normal, overwrite = false, sel = none(&Texture)):
+        m = self.gpu.material("apply_color", PaintShaders.apply_color(), true, true)
+        m.set_constant("paint", Shaders.channel(c, 16), Shaders.channel(c, 8), Shaders.channel(c, 0), Shaders.channel(c, 24))
+        m.set_constant("how", float(mode), 1.0 if overwrite else 0.0, 0.0, 0.0)
+        self.apply(layer, m, sel)
+
+    apply_erase(layer = &Surface, sel = none(&Texture)):
+        m = self.gpu.material("apply_erase", PaintShaders.apply_erase(), true)
+        self.apply(layer, m, sel)
+
+    apply_recolor(layer = &Surface, target = 0, c = 0, tolerance = 0.5, sel = none(&Texture)):
+        m = self.gpu.material("apply_recolor", PaintShaders.apply_recolor(), true)
+        m.set_constant("paint", Shaders.channel(c, 16), Shaders.channel(c, 8), Shaders.channel(c, 0), Shaders.channel(c, 24))
+        m.set_constant("target", Shaders.channel(target, 16), Shaders.channel(target, 8), Shaders.channel(target, 0), tolerance)
+        self.apply(layer, m, sel)
+
+    apply_clone(layer = &Surface, src = &Texture, dx = 0.0, dy = 0.0, sel = none(&Texture)):
+        m = self.gpu.material("apply_clone", PaintShaders.apply_clone(), true, true)
+        m.set_texture("pic", src, Filter.nearest, Filter.nearest)
+        m.set_constant("offset", dx, dy, 0.0, 0.0)
+        self.apply(layer, m, sel)
+
+    gradient(layer = &Surface, r = Rect(), kind = GradientKind.linear, x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, a = 0, b = 0, alpha = false, mode = BlendMode.normal, sel = none(&Texture)):
+        g = self.gpu
+        box = r.clip(self.w, self.h)
+        if box.empty():
+            return
+        m = g.material("gradient", PaintShaders.gradient(), true, true)
+        m.set_texture("base", self.base.expect("base").get_texture(), Filter.nearest, Filter.nearest)
+        m.set_texture("sel", sel.or(g.everything()), Filter.nearest, Filter.nearest)
+        m.set_constant("line", x0, y0, x1, y1)
+        m.set_constant("ca", Shaders.channel(a, 16), Shaders.channel(a, 8), Shaders.channel(a, 0), Shaders.channel(a, 24))
+        m.set_constant("cb", Shaders.channel(b, 16), Shaders.channel(b, 8), Shaders.channel(b, 0), Shaders.channel(b, 24))
+        m.set_constant("how", float(kind), 1.0 if alpha else 0.0, float(mode), 0.0)
+        g.run(layer, m, float(box.x), float(box.y), float(box.w), float(box.h))
+        self.dirty = self.dirty.union(box)
+
+    end() -> Rect:
+        out = self.dirty.clip(self.w, self.h)
+        self.dirty = Rect()
+        return out
+
+PaintShaders:
+    box(pts = [float], pad = 0.0) -> Rect:
+        if len(pts) < 2:
+            return Rect()
+        x0 = pts[0]
+        y0 = pts[1]
+        x1 = x0
+        y1 = y0
+        i = 2
+        while i + 1 < len(pts):
+            x0 = min(x0, pts[i])
+            x1 = max(x1, pts[i])
+            y0 = min(y0, pts[i + 1])
+            y1 = max(y1, pts[i + 1])
+            i += 2
+        return Rect.around(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+
+    # a capsule's coverage: the distance to its segment; soft inside
+    # hardness; the larger of it and what prev holds
+    capsule() -> str:
+        return """
+uniform sampler2D prev;
+uniform vec4 seg;
+uniform vec4 brush;
+void fragment()
+{
+    vec2 p = px();
+    vec2 a = seg.xy;
+    vec2 v = seg.zw - a;
+    float t = clamp(dot(p - a, v) / max(dot(v, v), 0.000001), 0.0, 1.0);
+    float d = length(a + v * t - p);
+    float r = mix(brush.x, brush.w, t);
+    float cov = brush.z > 0.5 ? clamp(r + 0.5 - d, 0.0, 1.0) : (d <= r ? 1.0 : 0.0);
+    float inner = r * brush.y;
+    if (brush.y < 1.0 && d > inner)
+    {
+        float k = clamp((r - d) / max(r - inner, 0.0001), 0.0, 1.0);
+        cov *= k * k * (3.0 - 2.0 * k);
+    }
+    float old = texture(prev, tuv(p)).r;
+    COLOR = vec4(max(old, cov), 0.0, 0.0, 1.0);
+}
+"""
+
+    from_mask() -> str:
+        return """
+uniform sampler2DArray pic;
+void fragment()
+{
+    COLOR = vec4(texture(pic, vec3(tuv(px()), 0.0)).r, 0.0, 0.0, 1.0);
+}
+"""
+
+    # how.x the blend mode, how.y 1 to overwrite
+    apply_color() -> str:
+        return """
+uniform sampler2D base;
+uniform sampler2D cover;
+uniform vec4 paint;
+uniform vec4 how;
+void fragment()
+{
+    vec2 t = tuv(px());
+    vec4 b = texture(base, t);
+    float k = texture(cover, t).r * selk(t);
+    if (how.y > 0.5)
+    {
+        COLOR = mix(b, paint, k);
+    }
+    else
+    {
+        COLOR = over(vec4(paint.rgb, paint.a * k), b, how.x);
+    }
+}
+"""
+
+    apply_erase() -> str:
+        return """
+uniform sampler2D base;
+uniform sampler2D cover;
+void fragment()
+{
+    vec2 t = tuv(px());
+    vec4 b = texture(base, t);
+    float k = texture(cover, t).r * selk(t);
+    COLOR = vec4(b.rgb, b.a * (1.0 - k));
+}
+"""
+
+    # target.rgb the colour replaced, target.a the tolerance
+    apply_recolor() -> str:
+        return """
+uniform sampler2D base;
+uniform sampler2D cover;
+uniform vec4 paint;
+uniform vec4 target;
+void fragment()
+{
+    vec2 t = tuv(px());
+    vec4 b = texture(base, t);
+    float k = texture(cover, t).r * selk(t);
+    float dist = length(b.rgb - target.rgb) / 1.7320508;
+    float near = target.a <= 0.0 ? (dist <= 0.0 ? 1.0 : 0.0) : clamp(1.0 - dist / target.a, 0.0, 1.0);
+    near = near > 0.0 ? clamp(near * 2.0, 0.0, 1.0) : 0.0;
+    COLOR = vec4(mix(b.rgb, paint.rgb, k * near), b.a);
+}
+"""
+
+    apply_clone() -> str:
+        return """
+uniform sampler2D base;
+uniform sampler2D cover;
+uniform sampler2D pic;
+uniform vec4 offset;
+void fragment()
+{
+    vec2 p = px();
+    vec2 t = tuv(p);
+    vec4 b = texture(base, t);
+    float k = texture(cover, t).r * selk(t);
+    vec4 s = texture(pic, tuv(p + offset.xy));
+    COLOR = over(vec4(s.rgb, s.a * k), b, 0.0);
+}
+"""
+
+    # line: start and end; how.x the kind, how.y 1 for alpha, how.z the
+    # blend mode
+    gradient() -> str:
+        return """
+uniform sampler2D base;
+uniform vec4 line;
+uniform vec4 ca;
+uniform vec4 cb;
+uniform vec4 how;
+float weight(vec2 p)
+{
+    vec2 a = line.xy;
+    vec2 v = line.zw - a;
+    float len2 = dot(v, v);
+    if (len2 <= 0.0001) { return 0.0; }
+    vec2 d = p - a;
+    float along = dot(d, v) / len2;
+    if (how.x < 0.5) { return clamp(along, 0.0, 1.0); }
+    if (how.x < 1.5) { return clamp(abs(along), 0.0, 1.0); }
+    if (how.x < 2.5)
+    {
+        float across = dot(d, vec2(-v.y, v.x)) / len2;
+        return clamp(abs(along) + abs(across), 0.0, 1.0);
+    }
+    if (how.x < 3.5) { return clamp(sqrt(dot(d, d) / len2), 0.0, 1.0); }
+    float ang = atan(d.y, d.x) - atan(v.y, v.x);
+    ang = mod(ang + 3.14159265, 6.2831853) - 3.14159265;
+    return abs(ang) / 3.14159265;
+}
+void fragment()
+{
+    vec2 p = px();
+    vec2 t = tuv(p);
+    vec4 b = texture(base, t);
+    float w = weight(p);
+    float k = selk(t);
+    vec4 made;
+    if (how.y > 0.5)
+    {
+        float fa = mix(ca.a, 1.0 - cb.a, w);
+        made = vec4(b.rgb, b.a * clamp(fa, 0.0, 1.0));
+    }
+    else
+    {
+        made = over(mix(ca, cb, w), b, how.z);
+    }
+    COLOR = mix(b, made, k);
+}
+"""

@@ -1,0 +1,100 @@
+# widgets/resource_field — a field that names a file of the project (or a
+# shape made of nothing), as natiny's editor draws one: a dark box with
+# the kind's icon and the name, "None" faint for none, that cannot be
+# typed into; after it a button that opens the file (when it names one)
+# and a button that searches for another.  A file dragged over it that
+# it takes outlines it in the accent.
+
+from ui import Icon, ResourceField
+from graphics import Align
+from window import Cursor
+from view import Layout, View
+
+extend ResourceField:
+    icon = Icon.none
+    value = ""
+    label = ""
+    drop = false
+    box = &View
+    opener = &View
+    browser = &View
+
+    init(ui = &Ui, parent = &View, icon = Icon.none):
+        self.ui = ui
+        self.icon = icon
+        t = ui.theme
+        self.view = ui.create(Layout.horizontal, parent)
+        self.view.set_expand(true)
+        self.view.set_gap(2.0, 0.0)
+        self.box = ui.create(Layout.free, self.view)
+        self.box.set_expand(true)
+        self.box.set_min_size(40.0, t.field_height)
+        self.box.set_clip(true)
+        self.opener = ui.create(Layout.free, self.view)
+        self.opener.set_min_size(t.field_height, t.field_height)
+        self.opener.set_visible(false)
+        self.browser = ui.create(Layout.free, self.view)
+        self.browser.set_min_size(t.field_height, t.field_height)
+        on self.view.draw():
+            self.view.render_children()
+            if self.drop:
+                x, y, w, h = self.ui.rect(self.view)
+                self.ui.outline_round(x - 1.0, y - 1.0, w + 2.0, h + 2.0, self.ui.theme.radius, self.ui.theme.accent, 2.0)
+        on self.box.draw():
+            self.draw_box()
+        on self.opener.draw():
+            self.draw_button(self.opener, Icon.open, 14.0)
+        on self.browser.draw():
+            self.draw_button(self.browser, Icon.search, 16.0)
+        on self.opener.click():
+            emit open_asked()
+        on self.browser.click():
+            x, y, _, h = self.ui.rect(self.view)
+            emit browse_asked(x, y + h + 2.0)
+
+    # what it names, as text: a path, or a shape's JSON; "" for none
+    set_value(value = ""):
+        self.value = value
+        # a shape names no file to open
+        self.opener.set_visible(value != "" and not value.starts_with("{"))
+
+    set_label(label = ""):
+        self.label = label
+
+    set_drop(on = false):
+        self.drop = on
+
+    get_box_hovered() -> bool:
+        return self.box.get_hovered()
+
+    # the pointer is over it
+    get_hovered() -> bool:
+        px, py = self.ui.pointer()
+        x, y, w, h = self.ui.rect(self.view)
+        return px >= x and px < x + w and py >= y and py < y + h
+
+    # ─── Inside ───
+
+    draw_box():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.box)
+        ui.fill_round(x, y, w, h, t.radius, t.field)
+        # the edge lit under the pointer: something to press, to right-click
+        ui.outline_round(x, y, w, h, t.radius, t.field_edge if self.box.get_hovered() else t.line)
+        empty = self.value == ""
+        if self.icon != Icon.none:
+            ui.icon(self.icon, x + t.text_pad - 2.0, y + (h - 16.0) * 0.5, 16.0, t.ink_faint if empty else -1)
+        left = x + t.text_pad + 18.0
+        # one line, cut off at the field's edge
+        ui.text(left, y, x + w - left - 6.0, h, "None" if empty else (self.label if self.label != "" else self.value), t.ink_faint if empty else t.ink_soft, Align.left + Align.middle, t.size)
+
+    draw_button(view = &View, icon = Icon.none, size = 16.0):
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(view)
+        hot = view.get_hovered()
+        ui.fill_round(x, y, w, h, t.radius, t.button_hot if hot else t.button)
+        if hot:
+            ui.want_cursor(Cursor.hand)
+        ui.icon(icon, x + (w - size) * 0.5, y + (h - size) * 0.5, size, t.ink if hot else t.ink_muted)

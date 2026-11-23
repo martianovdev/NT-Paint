@@ -1,0 +1,110 @@
+# document/history — what was done, to undo and redo.  A step is one of:
+#
+#   pixels     a rectangle of a layer changed: what it held before and
+#              after, each a small surface of its own
+#   state      the layers' list, size or properties changed: the states
+#              before and after (surfaces shared: a later pixel step keeps
+#              its own copy of what it changes, so undoing in order brings
+#              each surface back to what it was)
+#
+# and each may carry the selection before and after.  Undone steps stay
+# until something new is done.
+
+from graphics import Surface
+from raster import Mask, Rect
+from ui import Icon
+from document.layer import LayerState
+
+enum StepKind:
+    pixels
+    state
+    selection
+
+Step:
+    # the history panel's words for it (a translation key) and its icon
+    title = ""
+    icon = Icon.history_item
+    kind = StepKind.pixels
+    layer = 0
+    rect = Rect()
+    before = none(&Surface)
+    after = none(&Surface)
+    states_before = [LayerState]
+    states_after = [LayerState]
+    size_before = (0, 0)
+    size_after = (0, 0)
+    current_before = 0
+    current_after = 0
+    sel_before = Mask()
+    sel_after = Mask()
+    had_sel_before = false
+    had_sel_after = false
+    # whether the selection is part of the step
+    sel_kept = false
+
+    init(title = "", icon = Icon.history_item, kind = StepKind.pixels):
+        self.title = title
+        self.icon = icon
+        self.kind = kind
+
+    set_pixels(before = &Surface, after = &Surface, layer = 0, rect = Rect()):
+        self.layer = layer
+        self.rect = rect
+        self.before = before
+        self.after = after
+
+    set_states(before = [LayerState], after = [LayerState], size_before = (0, 0), size_after = (0, 0), current_before = 0, current_after = 0):
+        self.states_before = before
+        self.states_after = after
+        self.size_before = size_before
+        self.size_after = size_after
+        self.current_before = current_before
+        self.current_after = current_after
+
+    set_selection(before = Mask(), had_before = false, after = Mask(), had_after = false):
+        self.sel_kept = true
+        self.sel_before = before
+        self.had_sel_before = had_before
+        self.sel_after = after
+        self.had_sel_after = had_after
+
+History:
+    steps = [&Step]
+    # how many of the steps are done (the rest are undone, redoable)
+    at = 0
+    revision = 0
+
+    push(step = &Step):
+        while len(self.steps) > self.at:
+            _ = self.steps.pop()
+        self.steps.push(step)
+        self.at = len(self.steps)
+        self.revision += 1
+
+    can_undo() -> bool:
+        return self.at > 0
+
+    can_redo() -> bool:
+        return self.at < len(self.steps)
+
+    # the step undo would undo, and moves back
+    back() -> none(&Step):
+        if self.at <= 0:
+            return none
+        self.at -= 1
+        self.revision += 1
+        return self.steps[self.at]
+
+    # the step redo would redo, and moves on
+    forward() -> none(&Step):
+        if self.at >= len(self.steps):
+            return none
+        s = self.steps[self.at]
+        self.at += 1
+        self.revision += 1
+        return s
+
+    clear():
+        self.steps.clear()
+        self.at = 0
+        self.revision += 1

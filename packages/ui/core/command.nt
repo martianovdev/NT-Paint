@@ -1,0 +1,121 @@
+# core/command — commands: what runs them and how their shortcut reads.
+
+from ui import Command
+from window import Key
+
+extend Command:
+    init(title = "", key = Key.unknown, ctrl = false, shift = false, icon = Icon.none, alt = false):
+        self.alt = alt
+        self.icon = icon
+        self.title = title
+        self.key = key
+        self.ctrl = ctrl
+        self.shift = shift
+
+    set_checked(checked = true):
+        if self.checked != checked:
+            self.checked = checked
+            self.revision += 1
+
+    set_shortcut_text(text = ""):
+        if self.shortcut_text != text:
+            self.shortcut_text = text
+            self.revision += 1
+
+    set_enabled(enabled = true):
+        if self.enabled != enabled:
+            self.enabled = enabled
+            self.revision += 1
+
+    set_title(title = ""):
+        if self.title != title:
+            self.title = title
+            self.revision += 1
+
+    set_icon(icon = Icon.none):
+        if self.icon != icon:
+            self.icon = icon
+            self.revision += 1
+
+    set_hint(hint = ""):
+        self.hint = hint
+
+    get_hint() -> str:
+        if self.hint != "":
+            return self.hint
+        key = self.get_shortcut()
+        return self.title if key == "" else f"{self.title} ({key})"
+
+    get_shortcut() -> str:
+        if self.shortcut_text != "":
+            return self.shortcut_text
+        if self.key == Key.unknown:
+            return ""
+        out = ""
+        if self.ctrl:
+            out += "Ctrl+"
+        if self.alt:
+            out += "Alt+"
+        if self.shift:
+            out += "Shift+"
+        return out + Keys.name(self.key)
+
+    trigger():
+        if self.enabled:
+            emit run()
+
+    poll(ui = &Ui) -> bool:
+        if self.key == Key.unknown or not self.enabled:
+            return false
+        g = ui.window
+        if not g.input_get_key_pressed(self.key):
+            return false
+        if g.input_get_key_down(Key.control) != self.ctrl or g.input_get_key_down(Key.shift) != self.shift or g.input_get_key_down(Key.alt) != self.alt:
+            return false
+        emit run()
+        return true
+
+Keys:
+    # a key as a shortcut names it
+    name(key = Key.unknown) -> str:
+        if (key >= Key.a and key <= Key.z) or (key >= Key.d0 and key <= Key.d9):
+            return str(char(int(key)))
+        if key >= Key.f1 and key <= Key.f12:
+            return f"F{key - Key.f1 + 1}"
+        if key >= Key.minus and key <= Key.grave:
+            return "-=[]\\;',./`".slice(int(key - Key.minus), int(key - Key.minus) + 1)
+        if key >= Key.kp0 and key <= Key.kp_add:
+            return "Num " + "0123456789./*-+".slice(int(key - Key.kp0), int(key - Key.kp0) + 1)
+        match key:
+            case Key.delete:
+                return "Del"
+            case Key.insert:
+                return "Ins"
+            case Key.enter:
+                return "Enter"
+            case Key.escape:
+                return "Esc"
+            case Key.space:
+                return "Space"
+            case Key.backspace:
+                return "Backspace"
+            case Key.tab:
+                return "Tab"
+            case Key.home:
+                return "Home"
+            case Key.end:
+                return "End"
+            case Key.page_up:
+                return "PgUp"
+            case Key.page_down:
+                return "PgDn"
+            case Key.left:
+                return "Left"
+            case Key.right:
+                return "Right"
+            case Key.up:
+                return "Up"
+            case Key.down:
+                return "Down"
+            case _:
+                return "?"

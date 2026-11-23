@@ -1,0 +1,201 @@
+# PDN3 uses a typed NRBF graph followed by the layers' BGRA memory blocks.
+# The class names and member types here are part of the on-disk format.
+
+from compress import Gzip
+
+PdnWriter:
+    data = [u8]
+    next_id = 2
+    metadata_type = "System.Collections.Generic.KeyValuePair`2[[System.String, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089],[System.String, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089]]"
+
+    id() -> int:
+        id = self.next_id
+        self.next_id += 1
+        return id
+
+    le(value = 0, size = 1):
+        for i in range(size):
+            self.data.push(u8(value >> (8 * i)))
+
+    be32(value = 0):
+        for i in range(4):
+            self.data.push(u8(value >> (24 - 8 * i)))
+
+    append(bytes = [u8]):
+        for b in bytes:
+            self.data.push(b)
+
+    string(value = ""):
+        bytes = value.bytes()
+        count = len(bytes)
+        while count >= 128:
+            self.le((count & 127) | 128)
+            count >>= 7
+        self.le(count)
+        self.append(bytes)
+
+    reference(id = 0):
+        self.le(9)
+        self.le(id, 4)
+
+    text(value = ""):
+        self.le(6)
+        self.le(self.id(), 4)
+        self.string(value)
+
+    library(id = 0, name = ""):
+        self.le(12)
+        self.le(id, 4)
+        self.string(name + ", Version=5.0.0.0, Culture=neutral, PublicKeyToken=null")
+
+    # (name, BinaryType, primitive type or library ID, type name)
+    typed(id = 0, name = "", lib = 0, fields = [(str, int, int, str)]):
+        self.le(4 if lib == 0 else 5)
+        self.le(id, 4)
+        self.string(name)
+        self.le(len(fields), 4)
+        for field in fields:
+            key, _, _, _ = field
+            self.string(key)
+        for field in fields:
+            _, kind, _, _ = field
+            self.le(kind)
+        for field in fields:
+            _, kind, extra, type_name = field
+            if kind == 0:
+                self.le(extra)
+            elif kind == 3 or kind == 4:
+                self.string(type_name)
+                if kind == 4:
+                    self.le(extra, 4)
+        if lib != 0:
+            self.le(lib, 4)
+
+    metadata(id = 0, items = [(str, str)]):
+        self.le(7)
+        self.le(id, 4)
+        self.le(0)
+        self.le(1, 4)
+        self.le(len(items), 4)
+        self.le(3)
+        self.string(self.metadata_type)
+        for key, value in items:
+            self.typed(-self.id(), self.metadata_type, 0, [("key", 1, 0, ""), ("value", 1, 0, "")])
+            self.text(key)
+            self.text(value)
+
+    header(width = 0, height = 0, count = 0, metadata = [(str, str)]) -> [int]:
+        self.append("PDN3".bytes())
+        xml = f"<pdnImage width=\"{width}\" height=\"{height}\" layers=\"{count}\" savedWithVersion=\"5.0.0.0\"><custom></custom></pdnImage>".bytes()
+        self.le(len(xml), 3)
+        self.append(xml)
+        self.le(0x000100, 3)
+        self.le(1, 4)
+        self.le(-1, 4)
+        self.le(1, 4)
+        self.le(0, 4)
+        self.library(1, "PaintDotNet.Data")
+        self.library(2, "PaintDotNet.Core")
+        list_id = self.id()
+        version_id = self.id()
+        metadata_id = self.id()
+        items_id = self.id()
+        self.typed(1, "PaintDotNet.Document", 1, [
+            ("isDisposed", 0, 1, ""), ("layers", 4, 1, "PaintDotNet.LayerList"),
+            ("width", 0, 8, ""), ("height", 0, 8, ""),
+            ("savedWith", 3, 0, "System.Version"), ("userMetadataItems", 3, 0, self.metadata_type + "[]")])
+        self.le(0)
+        self.reference(list_id)
+        self.le(width, 4)
+        self.le(height, 4)
+        self.reference(version_id)
+        self.reference(metadata_id)
+        self.typed(list_id, "PaintDotNet.LayerList", 1, [
+            ("parent", 4, 1, "PaintDotNet.Document"), ("ArrayList+_items", 5, 0, ""),
+            ("ArrayList+_size", 0, 8, ""), ("ArrayList+_version", 0, 8, "")])
+        self.reference(1)
+        self.reference(items_id)
+        self.le(count, 4)
+        self.le(count, 4)
+        self.typed(version_id, "System.Version", 0, [
+            ("_Major", 0, 8, ""), ("_Minor", 0, 8, ""), ("_Build", 0, 8, ""), ("_Revision", 0, 8, "")])
+        self.le(5, 4)
+        self.le(0, 4)
+        self.le(0, 4)
+        self.le(0, 4)
+        self.metadata(metadata_id, metadata)
+        self.le(16)
+        self.le(items_id, 4)
+        self.le(count, 4)
+        ids = [int]
+        for _ in range(count):
+            id = self.id()
+            ids.push(id)
+            self.reference(id)
+        return ids
+
+    layer(id = 0, width = 0, height = 0, name = "", visible = true, background = false, opacity = 255, mode = 0, blend_name = "", metadata = [(str, str)]):
+        bitmap_props = self.id()
+        surface = self.id()
+        layer_props = self.id()
+        blend_op = self.id()
+        memory = self.id()
+        metadata_id = self.id()
+        self.typed(id, "PaintDotNet.BitmapLayer", 1, [
+            ("properties", 4, 1, "PaintDotNet.BitmapLayer+BitmapLayerProperties"),
+            ("surface", 4, 2, "PaintDotNet.Surface"), ("Layer+isDisposed", 0, 1, ""),
+            ("Layer+width", 0, 8, ""), ("Layer+height", 0, 8, ""),
+            ("Layer+properties", 4, 1, "PaintDotNet.Layer+LayerProperties")])
+        self.reference(bitmap_props)
+        self.reference(surface)
+        self.le(0)
+        self.le(width, 4)
+        self.le(height, 4)
+        self.reference(layer_props)
+        blend_class = "PaintDotNet.UserBlendOps+" + blend_name + "BlendOp"
+        self.typed(bitmap_props, "PaintDotNet.BitmapLayer+BitmapLayerProperties", 1, [("blendOp", 4, 1, blend_class)])
+        self.reference(blend_op)
+        self.typed(surface, "PaintDotNet.Surface", 2, [
+            ("width", 0, 8, ""), ("height", 0, 8, ""), ("stride", 0, 8, ""), ("scan0", 4, 2, "PaintDotNet.MemoryBlock")])
+        self.le(width, 4)
+        self.le(height, 4)
+        self.le(width * 4, 4)
+        self.reference(memory)
+        self.typed(layer_props, "PaintDotNet.Layer+LayerProperties", 1, [
+            ("name", 1, 0, ""), ("userMetadataItems", 3, 0, self.metadata_type + "[]"),
+            ("visible", 0, 1, ""), ("isBackground", 0, 1, ""), ("opacity", 0, 2, ""),
+            ("blendMode", 4, 1, "PaintDotNet.LayerBlendMode")])
+        self.text(name)
+        self.reference(metadata_id)
+        self.le(1 if visible else 0)
+        self.le(1 if background else 0)
+        self.le(opacity)
+        self.typed(-self.id(), "PaintDotNet.LayerBlendMode", 1, [("value__", 0, 8, "")])
+        self.le(mode, 4)
+        self.typed(blend_op, blend_class, 1, [(str, int, int, str)])
+        self.typed(memory, "PaintDotNet.MemoryBlock", 2, [
+            ("length64", 0, 9, ""), ("hasParent", 0, 1, ""), ("deferred", 0, 1, "")])
+        self.le(width * height * 4, 8)
+        self.le(0)
+        self.le(1)
+        self.metadata(metadata_id, metadata)
+
+    pixels(rgba = [u8]):
+        size = 256 * 1024
+        self.le(0)
+        self.be32(size)
+        for index in range((len(rgba) + size - 1) / size):
+            start = index * size
+            end = min(start + size, len(rgba))
+            chunk = [u8]
+            i = start
+            while i < end:
+                chunk.push(rgba[i + 2])
+                chunk.push(rgba[i + 1])
+                chunk.push(rgba[i])
+                chunk.push(rgba[i + 3])
+                i += 4
+            packed = Gzip.compress(chunk, 1)
+            self.be32(index)
+            self.be32(len(packed))
+            self.append(packed)

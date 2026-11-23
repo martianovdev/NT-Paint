@@ -1,0 +1,69 @@
+# NT Paint — an image editor with painting, effects and
+# composition done on the GPU.  This file starts it: the window, the
+# graphics backend (--gl for OpenGL, --d3d12 for Direct3D 12), the fonts
+# and the editor; the pictures given as arguments open in it.
+
+from graphics import App, Backend, Colors, Font, Graphics
+from window import Window
+from ui import Ui
+from i18n import Tr
+from imaging import Gpu
+from fs import Fs
+from workspace.editor import Editor
+
+Assets:
+    font() -> [u8]:
+        return build.file("assets/fonts/roboto.ttf")
+
+    mono() -> [u8]:
+        return build.file("assets/fonts/jetbrains_mono.ttf")
+
+Paint(App):
+    graphics = &Graphics
+    window = &Window
+    ui = &Ui
+    editor = &Editor
+
+    init(graphics = &Graphics, window = &Window, args = [str]):
+        self.graphics = graphics
+        self.window = window
+        font = graphics.font_create(Assets.font())
+        mono = graphics.font_create(Assets.mono())
+        # Chinese (and anything Roboto lacks) from the system's YaHei
+        fallback = none(&Font)
+        if bytes := Fs().read_bytes("C:/Windows/Fonts/msyh.ttc"):
+            fb = graphics.font_create(bytes)
+            graphics.font_set_fallback(font, fb)
+            graphics.font_set_fallback(mono, fb)
+            fallback = fb
+        self.ui = &Ui(graphics, window, font, mono)
+        window.set_close_held(true)
+        window.input_capture_browser_file_shortcuts()
+        self.editor = &Editor(self.ui, &Gpu(graphics), window, args, fallback)
+
+    frame(dt = 0.0):
+        g = self.graphics
+        if not self.window.is_open():
+            g.backend_stop()
+            return
+        w = float(g.window_get_width(self.window))
+        h = float(g.window_get_height(self.window))
+        self.ui.frame(dt, w, h)
+        self.editor.update()
+        g.window_bind(self.window)
+        g.render_clear(Colors.hex(self.ui.theme.backdrop))
+        self.ui.render(w, h)
+        g.window_unbind()
+
+Main:
+    init(args = [str]):
+        backend = Backend.auto
+        for a in args:
+            if a == "--gl":
+                backend = Backend.opengl
+            elif a == "--d3d12":
+                backend = Backend.d3d12
+        window = &Window(Tr.app_name(), 1500, 900)
+        graphics = &Graphics(window, backend)
+        graphics.backend_loop(&Paint(graphics, window, args))
+        graphics.backend_shutdown()

@@ -1,0 +1,328 @@
+# highlight — languages and the colouring of lines.  A line is scanned
+# from the state the line above left (0: nothing open; 1: inside a
+# """ string; 2: inside a /* comment), so a buffer is coloured from the top
+# down and a change rescans from its line only.
+
+from text import Highlight, Language, Languages, Span, TokenKind, Word
+
+extend Language:
+    init(name = "", style = 3, comment = "", opens = ""):
+        self.name = name
+        self.style = style
+        self.comment = comment
+        self.opens = opens
+
+    add_keywords(words = [str]):
+        for w in words:
+            self.keywords[w] = true
+
+    add_types(words = [str]):
+        for w in words:
+            self.types[w] = true
+
+    add_directives(words = [str]):
+        for w in words:
+            self.directives[w] = true
+
+    scan(line = "", state = 0) -> ([Span], int):
+        out = [Span]
+        if self.style == 3:
+            if line != "":
+                out.push(Span(0, len(line), TokenKind.plain))
+            return out, 0
+        s = Scanner(line.chars())
+        st = state
+        # what goes on from the line above
+        if st == 1:
+            end = s.find_triple()
+            out.push(Span(0, end, TokenKind.string))
+            if end == len(s.c) and not s.closed:
+                return out, 1
+            s.go(end)
+            st = 0
+        elif st == 2:
+            end = s.find_block_end()
+            out.push(Span(0, end, TokenKind.comment))
+            if not s.closed:
+                return out, 2
+            s.go(end)
+            st = 0
+        while s.at < len(s.c):
+            start = s.at
+            c = s.c[s.at]
+            n = int(c)
+            if n == 32 or n == 9:
+                s.step(1)
+                continue
+            # comments
+            if self.style == 0 and c == char("#"):
+                out.push(Span(start, len(s.c), TokenKind.comment))
+                break
+            if self.style == 1 and c == char("/") and s.peek(1) == char("/"):
+                out.push(Span(start, len(s.c), TokenKind.comment))
+                break
+            if self.style == 1 and c == char("/") and s.peek(1) == char("*"):
+                s.step(2)
+                end = s.find_block_end()
+                out.push(Span(start, end, TokenKind.comment))
+                if not s.closed:
+                    return out, 2
+                s.go(end)
+                continue
+            if self.style == 1 and c == char("#"):
+                out.push(Span(start, len(s.c), TokenKind.directive))
+                break
+            # strings
+            if c == char("\"") or (c == char("'") and self.style == 0):
+                if self.style == 0 and c == char("\"") and s.peek(1) == char("\"") and s.peek(2) == char("\""):
+                    s.step(3)
+                    end = s.find_triple()
+                    out.push(Span(start, end, TokenKind.string))
+                    if not s.closed:
+                        return out, 1
+                    s.go(end)
+                    continue
+                s.step(1)
+                s.skip_string(c)
+                kind = TokenKind.string
+                # a JSON key: a string a colon follows
+                if self.style == 2 and s.next_solid() == char(":"):
+                    kind = TokenKind.property
+                out.push(Span(start, s.at, kind))
+                continue
+            # numbers
+            if Scanner.digit(n) or (c == char(".") and Scanner.digit(int(s.peek(1)))):
+                s.skip_number()
+                out.push(Span(start, s.at, TokenKind.number))
+                continue
+            # names
+            if Scanner.name_start(n):
+                # f"…": the f is the string's
+                if self.style == 0 and (c == char("f") or c == char("b")) and s.peek(1) == char("\""):
+                    s.step(2)
+                    s.skip_string(char("\""))
+                    out.push(Span(start, s.at, TokenKind.string))
+                    continue
+                s.skip_name()
+                word = s.word(start)
+                out.push(Span(start, s.at, self.kind_of(word, s, start)))
+                continue
+            s.step(1)
+            if self.style == 2 and n != 44 and n != 58 and n != 91 and n != 93 and n != 123 and n != 125:
+                out.push(Span(start, s.at, TokenKind.invalid))
+            else:
+                out.push(Span(start, s.at, TokenKind.punctuation))
+        return out, 0
+
+    # ─── Inside ───
+
+    kind_of(word = "", s = Scanner(), start = 0) -> i32:
+        if self.keywords.get(word).or(false):
+            return TokenKind.keyword
+        if self.directives.get(word).or(false):
+            return TokenKind.directive
+        if self.types.get(word).or(false):
+            return TokenKind.type
+        if self.style == 2:
+            return TokenKind.invalid
+        # a capital: a type, made or not (natiny)
+        first = int(word.chars()[0])
+        if self.style == 0 and first >= 65 and first <= 90:
+            return TokenKind.type
+        # called: a function; after a dot: a field
+        if s.next_solid() == char("("):
+            return TokenKind.function
+        if s.prev_solid(start) == char("."):
+            return TokenKind.property
+        return TokenKind.plain
+
+extend Languages:
+    natiny() -> Language:
+        l = Language("natiny", 0, "#", ":")
+        l.add_keywords(["import", "from", "as", "interface", "enum", "native", "export", "handle", "callback", "init", "deinit", "self", "if", "elif", "else", "while", "for", "in", "break", "continue", "return", "pass", "match", "case", "and", "or", "not", "is", "none", "true", "false", "yield", "when", "event", "emit", "on", "off", "flow", "thread", "extend"])
+        l.add_directives(["package", "requires", "build"])
+        l.add_types(["int", "float", "str", "bool", "char", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64", "pool", "ref", "out"])
+        return l
+
+    nsl() -> Language:
+        l = Language("nsl", 1, "//", "{")
+        l.add_keywords(["attribute", "varying", "uniform", "const", "struct", "if", "else", "for", "while", "return", "break", "continue", "discard", "true", "false", "in", "out", "inout"])
+        l.add_types(["void", "bool", "int", "uint", "float", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4", "bvec2", "bvec3", "bvec4", "mat2", "mat3", "mat4", "sampler2D", "samplerCube"])
+        return l
+
+    json() -> Language:
+        l = Language("json", 2, "", "{")
+        l.add_keywords(["true", "false", "null"])
+        return l
+
+    plain() -> Language:
+        return Language("text", 3)
+
+    for_path(path = "") -> Language:
+        p = path.lower()
+        if p.ends_with(".nt"):
+            return Languages.natiny()
+        if p.ends_with(".nsl") or p.ends_with(".glsl") or p.ends_with(".c") or p.ends_with(".h"):
+            return Languages.nsl()
+        if p.ends_with(".json") or p.ends_with(".scene") or p.ends_with(".material") or p.ends_with(".ntp"):
+            return Languages.json()
+        return Languages.plain()
+
+extend Highlight:
+    # each line's runs and the state it leaves; the lines below valid are
+    # not scanned yet, or were changed
+    lines = [[Span]]
+    states = [int]
+    valid = 0
+    seen = -1
+    words = [int: [Word]]
+
+    set_words(words = [int: [Word]]):
+        self.words = words
+
+    init(language = Language()):
+        self.language = language
+
+    set_language(language = Language()):
+        self.language = language
+        self.valid = 0
+
+    spans(buffer = &TextBuffer, line = 0) -> [Span]:
+        if self.seen != buffer.revision:
+            changed = buffer.take_changed()
+            if changed >= 0:
+                self.valid = min(self.valid, changed)
+            self.seen = buffer.revision
+        count = buffer.get_line_count()
+        if line < 0 or line >= count:
+            return [Span]
+        while len(self.lines) > count:
+            self.lines.pop()
+            self.states.pop()
+        self.valid = min(self.valid, count)
+        while self.valid <= line:
+            l = self.valid
+            state = self.states[l - 1] if l > 0 else 0
+            spans, after = self.language.scan(buffer.get_line(l), state)
+            if l < len(self.lines):
+                self.lines[l] = spans
+                self.states[l] = after
+            else:
+                self.lines.push(spans)
+                self.states.push(after)
+            self.valid += 1
+        if words := self.words.get(line):
+            return Highlight.named(self.lines[line], words, buffer.get_line(line))
+        return self.lines[line]
+
+    # the runs of a line, a name a word gives in the word's kind
+    named(spans = [Span], words = [Word], line = "") -> [Span]:
+        out = [Span]
+        for s in spans:
+            kind = s.kind
+            if kind in [TokenKind.plain, TokenKind.type, TokenKind.function, TokenKind.property]:
+                for w in words:
+                    if w.start == s.start and w.end == s.end and line.slice(s.start, s.end) == w.text:
+                        kind = w.kind
+                        break
+            out.push(Span(s.start, s.end, kind))
+        return out
+
+# a line's characters, walked
+Scanner:
+    c = [char]
+    at = 0
+    # the string or comment looked for was closed on this line
+    closed = false
+
+    init(c = [char]):
+        self.c = c
+
+    go(at = 0):
+        self.at = at
+
+    step(n = 1):
+        self.at += n
+
+    peek(k = 0) -> char:
+        i = self.at + k
+        if i < len(self.c):
+            return self.c[i]
+        return char(0)
+
+    digit(n = 0) -> bool:
+        return n >= 48 and n <= 57
+
+    name_start(n = 0) -> bool:
+        return (n >= 65 and n <= 90) or (n >= 97 and n <= 122) or n == 95 or n >= 128
+
+    skip_name():
+        while self.at < len(self.c):
+            n = int(self.c[self.at])
+            if not (Scanner.name_start(n) or Scanner.digit(n)):
+                break
+            self.at += 1
+
+    skip_number():
+        while self.at < len(self.c):
+            n = int(self.c[self.at])
+            if not (Scanner.name_start(n) or Scanner.digit(n) or n == 46):
+                break
+            self.at += 1
+
+    skip_string(quote = char("\"")):
+        while self.at < len(self.c):
+            c = self.c[self.at]
+            self.at += 1
+            if c == char("\\"):
+                self.at += 1
+            elif c == quote:
+                break
+        self.at = min(self.at, len(self.c))
+
+    # where the """ that closes a string ends, or the line's end
+    find_triple() -> int:
+        self.closed = false
+        i = self.at
+        while i + 2 < len(self.c):
+            if self.c[i] == char("\"") and self.c[i + 1] == char("\"") and self.c[i + 2] == char("\""):
+                self.closed = true
+                return i + 3
+            i += 1
+        return len(self.c)
+
+    # where the */ that closes a comment ends, or the line's end
+    find_block_end() -> int:
+        self.closed = false
+        i = self.at
+        while i + 1 < len(self.c):
+            if self.c[i] == char("*") and self.c[i + 1] == char("/"):
+                self.closed = true
+                return i + 2
+            i += 1
+        return len(self.c)
+
+    word(start = 0) -> str:
+        out = ""
+        for i in range(start, self.at):
+            out = out + str(self.c[i])
+        return out
+
+    # the next character not a space after the place, 0 for none
+    next_solid() -> char:
+        i = self.at
+        while i < len(self.c):
+            n = int(self.c[i])
+            if n != 32 and n != 9:
+                return self.c[i]
+            i += 1
+        return char(0)
+
+    prev_solid(start = 0) -> char:
+        i = start - 1
+        while i >= 0:
+            n = int(self.c[i])
+            if n != 32 and n != 9:
+                return self.c[i]
+            i -= 1
+        return char(0)

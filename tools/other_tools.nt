@@ -1,0 +1,372 @@
+# tools/other_tools — the Zoom, the Pan (Hand), the Paint Bucket, the
+# Gradient and the Color Picker.
+
+from window import Cursor
+from raster import Bitmap, Fill, Mask, SelectMode
+from ui import Icon
+from tools.session import Session, ToolKind
+from tools.tool import Marks, Pointer, Preview, Tool
+
+# a click zooms in (the right button out) about the pointer; a drag
+# frames a rectangle
+ZoomTool(Tool):
+    down = false
+    right = false
+    x0 = 0.0
+    y0 = 0.0
+    x1 = 0.0
+    y1 = 0.0
+
+    kind() -> ToolKind:
+        return ToolKind.zoom
+
+    press(s = &Session, p = Pointer()):
+        self.down = true
+        self.right = p.right
+        self.x0 = p.x
+        self.y0 = p.y
+        self.x1 = p.x
+        self.y1 = p.y
+
+    drag(s = &Session, p = Pointer()):
+        self.x1 = p.x
+        self.y1 = p.y
+
+    release(s = &Session, p = Pointer()):
+        if not self.down:
+            return
+        self.down = false
+        w = abs(self.x1 - self.x0)
+        h = abs(self.y1 - self.y0)
+        if not self.right and w * s.view.zoom > 4.0 and h * s.view.zoom > 4.0:
+            s.ask_zoom(0.0, min(self.x0, self.x1), min(self.y0, self.y1), w, h)
+        else:
+            s.ask_zoom(0.5 if self.right else 2.0, p.sx, p.sy)
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        self.down = false
+
+    overlay(s = &Session):
+        if self.down and not self.right:
+            ax, ay = s.view.to_screen(self.x0, self.y0)
+            bx, by = s.view.to_screen(self.x1, self.y1)
+            Marks.box(s, ax, ay, bx, by)
+
+    busy() -> bool:
+        return self.down
+
+    cursor() -> Cursor:
+        return Cursor.crosshair
+
+    cancel(s = &Session) -> bool:
+        if not self.down:
+            return false
+        self.down = false
+        return true
+
+    recolor(s = &Session):
+        pass
+
+PanTool(Tool):
+    down = false
+    lx = 0.0
+    ly = 0.0
+
+    kind() -> ToolKind:
+        return ToolKind.pan
+
+    press(s = &Session, p = Pointer()):
+        self.down = true
+        self.lx = p.sx
+        self.ly = p.sy
+
+    drag(s = &Session, p = Pointer()):
+        if self.down:
+            s.ask_pan(p.sx - self.lx, p.sy - self.ly)
+            self.lx = p.sx
+            self.ly = p.sy
+
+    release(s = &Session, p = Pointer()):
+        self.down = false
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        self.down = false
+
+    overlay(s = &Session):
+        pass
+
+    busy() -> bool:
+        return self.down
+
+    cursor() -> Cursor:
+        return Cursor.move
+
+    cancel(s = &Session) -> bool:
+        if not self.down:
+            return false
+        self.down = false
+        return true
+
+    recolor(s = &Session):
+        pass
+
+# the region like the pixel clicked, in the layer or the whole picture,
+# filled with the primary colour (the secondary with the right button)
+Bucket(Tool):
+    preview = Preview()
+    region = Mask()
+    right = false
+    # the click, and the pixels it looked at (the fill is redone from them
+    # when the options change)
+    x = 0
+    y = 0
+    pixels = Bitmap()
+    sampled_image = false
+
+    kind() -> ToolKind:
+        return ToolKind.bucket
+
+    press(s = &Session, p = Pointer()):
+        if d := s.doc:
+            x = int(floor(p.x))
+            y = int(floor(p.y))
+            if x < 0 or y < 0 or x >= d.width or y >= d.height:
+                return
+            st = s.settings
+            self.pixels = d.flattened_pixels() if st.sample_image else d.layer_pixels(d.current)
+            self.sampled_image = st.sample_image
+            self.x = x
+            self.y = y
+            self.right = p.right
+            self.find(s)
+            if self.preview.start(s):
+                self.fill(s)
+                self.preview.finish(s, "history.paint_bucket", Icon.tool_bucket)
+
+    # the region like the pixel clicked, by the options now
+    find(s = &Session):
+        if d := s.doc:
+            st = s.settings
+            if st.sample_image != self.sampled_image:
+                self.pixels = d.flattened_pixels() if st.sample_image else d.layer_pixels(d.current)
+                self.sampled_image = st.sample_image
+            region = Fill.flood(self.pixels, self.x, self.y, st.tolerance / 100.0, not st.global_fill)
+            if d.has_selection:
+                region.combine(d.selection, SelectMode.intersect)
+            self.region = region
+
+    fill(s = &Session):
+        if d := s.doc:
+            st = s.settings
+            self.preview.reset(s)
+            pt = s.painter
+            pt.from_mask(self.region)
+            pt.apply_color(d.layer().surface, s.secondary if self.right else s.primary, st.mode, st.overwrite)
+            self.preview.mark(pt.end())
+            d.touch()
+
+    cancel(s = &Session) -> bool:
+        return false
+
+    recolor(s = &Session):
+        if self.preview.reopen(s):
+            self.find(s)
+            self.fill(s)
+            self.preview.finish(s, "history.paint_bucket", Icon.tool_bucket)
+
+    drag(s = &Session, p = Pointer()):
+        pass
+
+    release(s = &Session, p = Pointer()):
+        pass
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        pass
+
+    overlay(s = &Session):
+        pass
+
+    busy() -> bool:
+        return false
+
+    cursor() -> Cursor:
+        return Cursor.crosshair
+
+# a drag from start to end; the primary colour to the secondary (swapped
+# with the right button), or the layer's alpha faded (transparency mode)
+GradientTool(Tool):
+    preview = Preview()
+    down = false
+    right = false
+    x0 = 0.0
+    y0 = 0.0
+    x1 = 0.0
+    y1 = 0.0
+
+    kind() -> ToolKind:
+        return ToolKind.gradient
+
+    press(s = &Session, p = Pointer()):
+        if self.preview.start(s):
+            self.down = true
+            self.right = p.right
+            self.x0 = p.x
+            self.y0 = p.y
+            self.x1 = p.x
+            self.y1 = p.y
+
+    drag(s = &Session, p = Pointer()):
+        if not self.down:
+            return
+        self.x1 = p.x
+        self.y1 = p.y
+        if p.shift:
+            a = atan2(self.y1 - self.y0, self.x1 - self.x0)
+            a = floor(a / 0.2617993878 + 0.5) * 0.2617993878
+            len = sqrt((self.x1 - self.x0) * (self.x1 - self.x0) + (self.y1 - self.y0) * (self.y1 - self.y0))
+            self.x1 = self.x0 + cos(a) * len
+            self.y1 = self.y0 + sin(a) * len
+        self.draw(s)
+
+    draw(s = &Session):
+        if d := s.doc:
+            self.preview.reset(s)
+            st = s.settings
+            a = s.secondary if self.right else s.primary
+            b = s.primary if self.right else s.secondary
+            r = d.sel_bounds()
+            s.painter.gradient(d.layer().surface, r, st.gradient, self.x0, self.y0, self.x1, self.y1, a, b, st.gradient_alpha, st.mode, d.sel_texture())
+            self.preview.mark(s.painter.end())
+            d.touch()
+
+    release(s = &Session, p = Pointer()):
+        if not self.down:
+            return
+        self.drag(s, p)
+        self.down = false
+        if self.x0 == self.x1 and self.y0 == self.y1:
+            self.preview.cancel(s)
+            return
+        self.preview.finish(s, "history.gradient", Icon.tool_gradient)
+
+    cancel(s = &Session) -> bool:
+        if not self.down:
+            return false
+        self.down = false
+        self.preview.cancel(s)
+        return true
+
+    recolor(s = &Session):
+        if self.down:
+            self.draw(s)
+        elif self.preview.reopen(s):
+            self.draw(s)
+            self.preview.finish(s, "history.gradient", Icon.tool_gradient)
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        pass
+
+    overlay(s = &Session):
+        if self.down:
+            ax, ay = s.view.to_screen(self.x0, self.y0)
+            bx, by = s.view.to_screen(self.x1, self.y1)
+            Marks.ants(s, ax, ay, bx, by)
+            Marks.knob(s, ax, ay)
+            Marks.knob(s, bx, by)
+
+    busy() -> bool:
+        return self.down
+
+    cursor() -> Cursor:
+        return Cursor.crosshair
+
+# the colour under the pointer taken as the primary (the secondary with
+# the right button), from the layer or the whole picture
+Picker(Tool):
+    down = false
+    right = false
+    pixels = Bitmap()
+
+    kind() -> ToolKind:
+        return ToolKind.picker
+
+    press(s = &Session, p = Pointer()):
+        if d := s.doc:
+            self.down = true
+            self.right = p.right
+            self.pixels = d.flattened_pixels() if s.settings.sample_image else d.layer_pixels(d.current)
+            self.take(s, p)
+
+    take(s = &Session, p = Pointer()):
+        x = int(floor(p.x))
+        y = int(floor(p.y))
+        if x < 0 or y < 0 or x >= self.pixels.width or y >= self.pixels.height:
+            return
+        c = self.pixels.get(x, y)
+        if self.right:
+            s.set_secondary(c)
+        else:
+            s.set_primary(c)
+
+    drag(s = &Session, p = Pointer()):
+        if self.down:
+            self.take(s, p)
+
+    release(s = &Session, p = Pointer()):
+        if not self.down:
+            return
+        self.down = false
+        self.pixels = Bitmap()
+        if s.settings.picker_back:
+            s.ask_tool(s.previous)
+
+    hover(s = &Session, p = Pointer()):
+        pass
+
+    key(s = &Session):
+        pass
+
+    commit(s = &Session):
+        self.down = false
+
+    overlay(s = &Session):
+        pass
+
+    busy() -> bool:
+        return self.down
+
+    cursor() -> Cursor:
+        return Cursor.crosshair
+
+    cancel(s = &Session) -> bool:
+        if not self.down:
+            return false
+        self.down = false
+        return true
+
+    recolor(s = &Session):
+        pass

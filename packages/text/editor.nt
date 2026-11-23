@@ -1,0 +1,430 @@
+# editor — TextEditor: the caret, the selection and every edit a
+# keyboard makes, each one step of the history.
+
+from text import Highlight, Language, Pos, TextEditor
+import history
+
+extend TextEditor:
+    # the column up and down keep to, as the caret moves through shorter
+    # lines
+    want = 0
+
+    init(buffer = &TextBuffer):
+        self.buffer = buffer
+        self.highlight = &Highlight(Language())
+
+    set_language(language = Language()):
+        self.highlight.set_language(language)
+
+    get_language() -> Language:
+        return self.highlight.language
+
+    set_marks(marks = [Mark]):
+        self.marks = marks
+
+    marks_at(at = Pos()) -> str:
+        out = [str]
+        for m in self.marks:
+            if m.line == at.line and at.col >= m.start and at.col <= m.end:
+                out.push(m.message)
+        return "\n".join(out)
+
+    reset(text = ""):
+        self.buffer.set_text(text)
+        self.forget_history()
+        self.caret = Pos()
+        self.anchor = Pos()
+        self.want = 0
+
+    # ─── Selection ───
+
+    has_selection() -> bool:
+        return not self.caret.same(self.anchor)
+
+    get_selection() -> (Pos, Pos):
+        if self.caret.before(self.anchor):
+            return self.caret, self.anchor
+        return self.anchor, self.caret
+
+    get_selected_text() -> str:
+        a, b = self.get_selection()
+        return self.buffer.get_range(a, b)
+
+    set_caret(at = Pos(), extend = false):
+        self.caret = self.buffer.clamp(at)
+        if not extend:
+            self.anchor = self.caret
+        self.want = self.caret.col
+        self.joinable = false
+
+    select_all():
+        self.anchor = Pos()
+        last = self.buffer.get_line_count() - 1
+        self.caret = Pos(last, self.buffer.get_length(last))
+        self.joinable = false
+
+    select_word(at = Pos()):
+        p = self.buffer.clamp(at)
+        line = self.buffer.get_line(p.line).chars()
+        if len(line) == 0:
+            self.set_caret(p)
+            return
+        i = min(p.col, len(line) - 1)
+        kind = Chars.kind(line[i])
+        a = i
+        while a > 0 and Chars.kind(line[a - 1]) == kind:
+            a -= 1
+        b = i
+        while b < len(line) and Chars.kind(line[b]) == kind:
+            b += 1
+        self.anchor = Pos(p.line, a)
+        self.caret = Pos(p.line, b)
+        self.want = b
+        self.joinable = false
+
+    select_line(line = 0):
+        n = self.buffer.get_line_count()
+        l = clamp(line, 0, n - 1)
+        self.anchor = Pos(l, 0)
+        self.caret = Pos(l + 1, 0) if l + 1 < n else Pos(l, self.buffer.get_length(l))
+        self.joinable = false
+
+    # ─── Moving ───
+
+    move_left(word = false, extend = false):
+        if self.has_selection() and not extend:
+            a, _ = self.get_selection()
+            self.set_caret(a)
+            return
+        p = self.caret
+        if p.col > 0:
+            col = p.col - 1
+            if word:
+                col = self.word_start(p.line, p.col)
+            self.set_caret(Pos(p.line, col), extend)
+        elif p.line > 0:
+            self.set_caret(Pos(p.line - 1, self.buffer.get_length(p.line - 1)), extend)
+
+    move_right(word = false, extend = false):
+        if self.has_selection() and not extend:
+            _, b = self.get_selection()
+            self.set_caret(b)
+            return
+        p = self.caret
+        if p.col < self.buffer.get_length(p.line):
+            col = p.col + 1
+            if word:
+                col = self.word_end(p.line, p.col)
+            self.set_caret(Pos(p.line, col), extend)
+        elif p.line + 1 < self.buffer.get_line_count():
+            self.set_caret(Pos(p.line + 1, 0), extend)
+
+    move_up(lines = 1, extend = false):
+        self.move_vertically(-lines, extend)
+
+    move_down(lines = 1, extend = false):
+        self.move_vertically(lines, extend)
+
+    move_home(extend = false):
+        p = self.caret
+        first = Chars.indent(self.buffer.get_line(p.line))
+        self.set_caret(Pos(p.line, 0 if p.col == first else first), extend)
+
+    move_end(extend = false):
+        p = self.caret
+        self.set_caret(Pos(p.line, self.buffer.get_length(p.line)), extend)
+
+    move_start(extend = false):
+        self.set_caret(Pos(), extend)
+
+    move_finish(extend = false):
+        last = self.buffer.get_line_count() - 1
+        self.set_caret(Pos(last, self.buffer.get_length(last)), extend)
+
+    # ─── Editing ───
+
+    type(text = ""):
+        if text == "":
+            return
+        kind = "type" if not self.has_selection() and not ("\n" in text) else "edit"
+        self.begin(kind)
+        self.replace_selection(text)
+        self.finish()
+
+    newline():
+        line = self.buffer.get_line(self.caret.line)
+        head = line.slice(0, min(self.caret.col, len(line)))
+        indent = head.slice(0, Chars.indent(head))
+        opens = self.get_language().opens
+        if opens != "" and head.strip().ends_with(opens):
+            indent = indent + Chars.spaces(self.tab)
+        self.begin("edit")
+        self.replace_selection("\n" + indent)
+        self.finish()
+
+    backspace(word = false, smart = true):
+        self.begin("edit")
+        if self.has_selection():
+            self.replace_selection("")
+        else:
+            p = self.caret
+            if p.col > 0:
+                line = self.buffer.get_line(p.line)
+                back = p.col - 1
+                if word:
+                    back = self.word_start(p.line, p.col)
+                elif smart and Chars.indent(line) >= p.col:
+                    # in the indent: back to the stop before
+                    back = max(0, (p.col - 1) / self.tab * self.tab)
+                self.take(Pos(p.line, back), p)
+                self.caret = Pos(p.line, back)
+            elif p.line > 0:
+                end = Pos(p.line - 1, self.buffer.get_length(p.line - 1))
+                self.take(end, p)
+                self.caret = end
+            self.anchor = self.caret
+            self.want = self.caret.col
+        self.finish()
+
+    delete(word = false):
+        self.begin("edit")
+        if self.has_selection():
+            self.replace_selection("")
+        else:
+            p = self.caret
+            if p.col < self.buffer.get_length(p.line):
+                to = p.col + 1
+                if word:
+                    to = self.word_end(p.line, p.col)
+                self.take(p, Pos(p.line, to))
+            elif p.line + 1 < self.buffer.get_line_count():
+                self.take(p, Pos(p.line + 1, 0))
+        self.finish()
+
+    indent():
+        a, b = self.get_selection()
+        if a.line == b.line:
+            if not self.has_selection():
+                col = self.caret.col
+                self.type(Chars.spaces(self.tab - col % self.tab))
+                return
+        self.begin("edit")
+        last = self.last_line(a, b)
+        for l in range(a.line, last + 1):
+            if self.buffer.get_length(l) > 0:
+                self.put(Pos(l, 0), Chars.spaces(self.tab))
+        self.reselect(a, b, self.tab, last)
+        self.finish()
+
+    outdent():
+        a, b = self.get_selection()
+        self.begin("edit")
+        last = self.last_line(a, b)
+        shift_a = 0
+        shift_b = 0
+        for l in range(a.line, last + 1):
+            n = min(Chars.indent(self.buffer.get_line(l)), self.tab)
+            if n > 0:
+                self.take(Pos(l, 0), Pos(l, n))
+            if l == a.line:
+                shift_a = n
+            if l == b.line:
+                shift_b = n
+        na = Pos(a.line, max(0, a.col - shift_a))
+        nb = Pos(b.line, max(0, b.col - shift_b))
+        self.anchor = na
+        self.caret = nb
+        self.finish()
+
+    toggle_comment():
+        mark = self.get_language().comment
+        if mark == "":
+            return
+        a, b = self.get_selection()
+        last = self.last_line(a, b)
+        # every line commented: they are uncommented; else all are
+        all = true
+        least = 1 << 30
+        for l in range(a.line, last + 1):
+            line = self.buffer.get_line(l)
+            if line.strip() == "":
+                continue
+            least = min(least, Chars.indent(line))
+            if not line.strip().starts_with(mark):
+                all = false
+        if least == 1 << 30:
+            return
+        self.begin("edit")
+        for l in range(a.line, last + 1):
+            line = self.buffer.get_line(l)
+            if line.strip() == "":
+                continue
+            if all:
+                at = Chars.indent(line)
+                n = len(mark)
+                if line.slice(at + n, at + n + 1) == " ":
+                    n += 1
+                self.take(Pos(l, at), Pos(l, at + n))
+            else:
+                self.put(Pos(l, least), mark + " ")
+        self.anchor = self.buffer.clamp(Pos(a.line, 0))
+        self.caret = self.buffer.clamp(Pos(last, self.buffer.get_length(last)))
+        self.finish()
+
+    duplicate_lines():
+        a, b = self.get_selection()
+        last = self.last_line(a, b)
+        lines = [str]
+        for l in range(a.line, last + 1):
+            lines.push(self.buffer.get_line(l))
+        self.begin("edit")
+        self.put(Pos(last, self.buffer.get_length(last)), "\n" + "\n".join(lines))
+        n = last - a.line + 1
+        self.anchor = Pos(self.anchor.line + n, self.anchor.col)
+        self.caret = Pos(self.caret.line + n, self.caret.col)
+        self.finish()
+
+    move_lines(dir = 1):
+        a, b = self.get_selection()
+        last = self.last_line(a, b)
+        count = self.buffer.get_line_count()
+        if (dir < 0 and a.line == 0) or (dir > 0 and last + 1 >= count):
+            return
+        self.begin("edit")
+        if dir < 0:
+            above = self.buffer.get_line(a.line - 1)
+            self.take(Pos(a.line - 1, 0), Pos(a.line, 0))
+            self.put(Pos(last - 1, self.buffer.get_length(last - 1)), "\n" + above)
+        else:
+            below = self.buffer.get_line(last + 1)
+            self.take(Pos(last, self.buffer.get_length(last)), Pos(last + 1, self.buffer.get_length(last + 1)))
+            self.put(Pos(a.line, 0), below + "\n")
+        self.anchor = Pos(self.anchor.line + dir, self.anchor.col)
+        self.caret = Pos(self.caret.line + dir, self.caret.col)
+        self.finish()
+
+    cut() -> str:
+        out = self.copy()
+        self.begin("edit")
+        if self.has_selection():
+            self.replace_selection("")
+        else:
+            l = self.caret.line
+            n = self.buffer.get_line_count()
+            if l + 1 < n:
+                self.take(Pos(l, 0), Pos(l + 1, 0))
+            elif l > 0:
+                self.take(Pos(l - 1, self.buffer.get_length(l - 1)), Pos(l, self.buffer.get_length(l)))
+            else:
+                self.take(Pos(0, 0), Pos(0, self.buffer.get_length(0)))
+            self.caret = self.buffer.clamp(Pos(l, 0))
+            self.anchor = self.caret
+        self.finish()
+        return out
+
+    copy() -> str:
+        if self.has_selection():
+            return self.get_selected_text()
+        return self.buffer.get_line(self.caret.line) + "\n"
+
+    paste(text = ""):
+        if text == "":
+            return
+        self.begin("edit")
+        self.replace_selection(text)
+        self.finish()
+
+    # ─── Inside ───
+
+    # the selection (if any) taken out, text put in its place, the caret
+    # after it
+    replace_selection(text = ""):
+        a, b = self.get_selection()
+        self.take(a, b)
+        end = self.put(a, text)
+        self.caret = end
+        self.anchor = end
+        self.want = end.col
+
+    move_vertically(lines = 1, extend = false):
+        if self.has_selection() and not extend:
+            a, b = self.get_selection()
+            self.caret = a if lines < 0 else b
+            self.anchor = self.caret
+        line = clamp(self.caret.line + lines, 0, self.buffer.get_line_count() - 1)
+        want = self.want
+        p = self.buffer.clamp(Pos(line, want))
+        if lines < 0 and self.caret.line == 0:
+            p = Pos(0, 0)
+        elif lines > 0 and self.caret.line == self.buffer.get_line_count() - 1:
+            p = Pos(line, self.buffer.get_length(line))
+        self.caret = p
+        if not extend:
+            self.anchor = p
+        self.want = want
+        self.joinable = false
+
+    # the last line a selection takes in whole: one ending at a line's
+    # start leaves that line out
+    last_line(a = Pos(), b = Pos()) -> int:
+        if b.line > a.line and b.col == 0:
+            return b.line - 1
+        return b.line
+
+    # the selection kept over lines that moved right by n
+    reselect(a = Pos(), b = Pos(), n = 0, last = 0):
+        na = Pos(a.line, a.col + n if a.col > 0 or self.buffer.get_length(a.line) > 0 else 0)
+        nb = Pos(b.line, b.col + n if b.line <= last and b.col > 0 else b.col)
+        if self.caret.before(self.anchor):
+            self.caret = na
+            self.anchor = nb
+        else:
+            self.anchor = na
+            self.caret = nb
+
+    word_start(line = 0, col = 0) -> int:
+        chars = self.buffer.get_line(line).chars()
+        i = min(col, len(chars))
+        while i > 0 and Chars.kind(chars[i - 1]) == 0:
+            i -= 1
+        if i > 0:
+            kind = Chars.kind(chars[i - 1])
+            while i > 0 and Chars.kind(chars[i - 1]) == kind:
+                i -= 1
+        return i
+
+    word_end(line = 0, col = 0) -> int:
+        chars = self.buffer.get_line(line).chars()
+        i = col
+        while i < len(chars) and Chars.kind(chars[i]) == 0:
+            i += 1
+        if i < len(chars):
+            kind = Chars.kind(chars[i])
+            while i < len(chars) and Chars.kind(chars[i]) == kind:
+                i += 1
+        return i
+
+Chars:
+    # 0 a space, 1 a part of a word, 2 anything else
+    kind(c = char(" ")) -> int:
+        n = int(c)
+        if n == 32 or n == 9:
+            return 0
+        if (n >= 48 and n <= 57) or (n >= 65 and n <= 90) or (n >= 97 and n <= 122) or n == 95 or n >= 128:
+            return 1
+        return 2
+
+    # how many spaces and tabs a line begins with
+    indent(line = "") -> int:
+        n = 0
+        for c in line.chars():
+            if c != char(" ") and c != char("\t"):
+                break
+            n += 1
+        return n
+
+    spaces(n = 0) -> str:
+        out = ""
+        for _ in range(n):
+            out = out + " "
+        return out

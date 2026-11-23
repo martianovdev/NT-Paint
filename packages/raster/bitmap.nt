@@ -1,0 +1,404 @@
+# bitmap — RGBA8 pixels: made, copied, cut, put, flipped, turned; read
+# from PNG, JPEG and BMP files and written as PNG and BMP.
+
+from raster import Bitmap, Pixel, Rect
+from image import Images, ImageResult
+
+extend Bitmap:
+    init(width = 0, height = 0, color = 0):
+        self.width = max(width, 0)
+        self.height = max(height, 0)
+        r = u8(Pixel.red(color))
+        g = u8(Pixel.green(color))
+        b = u8(Pixel.blue(color))
+        a = u8(Pixel.alpha(color))
+        px = self.pixels
+        n = self.width * self.height
+        for _ in range(n):
+            px.push(r)
+            px.push(g)
+            px.push(b)
+            px.push(a)
+
+    adopt(width = 0, height = 0, pixels = [u8]) -> Bitmap:
+        out = Bitmap()
+        out.take(width, height, pixels)
+        return out
+
+    take(width = 0, height = 0, pixels = [u8]):
+        self.width = width
+        self.height = height
+        self.pixels = pixels
+
+    decode(data = [u8]) -> none(Bitmap):
+        if len(data) >= 2 and data[0] == u8(66) and data[1] == u8(77):
+            return Bitmap.decode_bmp(data)
+        if not Images.known(data):
+            return none
+        img = Images.decode(data)
+        if img.result != ImageResult.success or img.width <= 0:
+            return none
+        return Bitmap.adopt(img.width, img.height, img.pixels)
+
+    encode_png() -> [u8]:
+        return Images.encode_png(self.width, self.height, self.pixels, 6)
+
+    encode_bmp() -> [u8]:
+        w = self.width
+        h = self.height
+        size = 54 + w * h * 4
+        out = [u8]
+        out.push(u8(66))
+        out.push(u8(77))
+        Bytes.u32(out, size)
+        Bytes.u32(out, 0)
+        Bytes.u32(out, 54)
+        Bytes.u32(out, 40)
+        Bytes.u32(out, w)
+        Bytes.u32(out, h)
+        out.push(u8(1))
+        out.push(u8(0))
+        out.push(u8(32))
+        out.push(u8(0))
+        Bytes.u32(out, 0)
+        Bytes.u32(out, w * h * 4)
+        Bytes.u32(out, 2835)
+        Bytes.u32(out, 2835)
+        Bytes.u32(out, 0)
+        Bytes.u32(out, 0)
+        px = self.pixels
+        y = h - 1
+        while y >= 0:
+            i = y * w * 4
+            for _ in range(w):
+                out.push(px[i + 2])
+                out.push(px[i + 1])
+                out.push(px[i])
+                out.push(px[i + 3])
+                i += 4
+            y -= 1
+        return out
+
+    decode_bmp(data = [u8]) -> none(Bitmap):
+        if len(data) < 54:
+            return none
+        offset = Bytes.read32(data, 10)
+        w = Bytes.read32(data, 18)
+        hs = Bytes.read32(data, 22)
+        bits = int(data[28]) | (int(data[29]) << 8)
+        compression = Bytes.read32(data, 30)
+        top_down = false
+        h = hs
+        if hs >= 0x80000000:
+            h = 0x100000000 - hs
+            top_down = true
+        if w <= 0 or h <= 0 or (bits != 24 and bits != 32) or (compression != 0 and compression != 3):
+            return none
+        bpp = bits / 8
+        stride = ((w * bpp + 3) / 4) * 4
+        if offset + stride * h > len(data):
+            return none
+        out = Bitmap(w, h)
+        px = out.pixels
+        for y in range(h):
+            row = y if top_down else h - 1 - y
+            s = offset + row * stride
+            d = y * w * 4
+            for _ in range(w):
+                px[d] = data[s + 2]
+                px[d + 1] = data[s + 1]
+                px[d + 2] = data[s]
+                px[d + 3] = data[s + 3] if bpp == 4 else u8(255)
+                s += bpp
+                d += 4
+        # a 32-bit file that keeps no alpha (all zero) is opaque
+        if bpp == 4:
+            any = false
+            i = 3
+            while i < len(px):
+                if px[i] != u8(0):
+                    any = true
+                    break
+                i += 4
+            if not any:
+                i = 3
+                while i < len(px):
+                    px[i] = u8(255)
+                    i += 4
+        return out
+
+    bounds() -> Rect:
+        return Rect(0, 0, self.width, self.height)
+
+    get(x = 0, y = 0) -> int:
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return 0
+        i = (y * self.width + x) * 4
+        px = self.pixels
+        return (int(px[i + 3]) << 24) | (int(px[i]) << 16) | (int(px[i + 1]) << 8) | int(px[i + 2])
+
+    set(x = 0, y = 0, c = 0):
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return
+        i = (y * self.width + x) * 4
+        px = self.pixels
+        px[i] = u8((c >> 16) & 255)
+        px[i + 1] = u8((c >> 8) & 255)
+        px[i + 2] = u8(c & 255)
+        px[i + 3] = u8((c >> 24) & 255)
+
+    copy() -> Bitmap:
+        return Bitmap.adopt(self.width, self.height, self.pixels.copy())
+
+    region(r = Rect()) -> Bitmap:
+        c = r.clip(self.width, self.height)
+        out = Bitmap(c.w, c.h)
+        if c.empty():
+            return out
+        src = self.pixels
+        dst = out.pixels
+        for y in range(c.h):
+            s = ((c.y + y) * self.width + c.x) * 4
+            d = y * c.w * 4
+            for k in range(c.w * 4):
+                dst[d + k] = src[s + k]
+        return out
+
+    put(src = Bitmap(), x = 0, y = 0):
+        r = Rect(x, y, src.width, src.height).clip(self.width, self.height)
+        if r.empty():
+            return
+        s_px = src.pixels
+        d_px = self.pixels
+        for yy in range(r.h):
+            s = ((r.y - y + yy) * src.width + (r.x - x)) * 4
+            d = ((r.y + yy) * self.width + r.x) * 4
+            for k in range(r.w * 4):
+                d_px[d + k] = s_px[s + k]
+
+    restore(src = Bitmap(), r = Rect()):
+        c = r.clip(self.width, self.height)
+        if c.empty() or src.width != self.width or src.height != self.height:
+            return
+        s_px = src.pixels
+        d_px = self.pixels
+        for yy in range(c.h):
+            i = ((c.y + yy) * self.width + c.x) * 4
+            for k in range(c.w * 4):
+                d_px[i + k] = s_px[i + k]
+
+    draw(src = Bitmap(), x = 0, y = 0, opacity = 255):
+        r = Rect(x, y, src.width, src.height).clip(self.width, self.height)
+        if r.empty():
+            return
+        s_px = src.pixels
+        d_px = self.pixels
+        for yy in range(r.h):
+            s = ((r.y - y + yy) * src.width + (r.x - x)) * 4
+            d = ((r.y + yy) * self.width + r.x) * 4
+            for _ in range(r.w):
+                sa = int(s_px[s + 3]) * opacity / 255
+                if sa >= 255:
+                    d_px[d] = s_px[s]
+                    d_px[d + 1] = s_px[s + 1]
+                    d_px[d + 2] = s_px[s + 2]
+                    d_px[d + 3] = u8(255)
+                elif sa > 0:
+                    da = int(d_px[d + 3])
+                    oa = sa * 255 + da * (255 - sa)
+                    if oa > 0:
+                        for k in range(3):
+                            d_px[d + k] = u8((int(s_px[s + k]) * sa * 255 + int(d_px[d + k]) * da * (255 - sa)) / oa)
+                        d_px[d + 3] = u8((oa + 127) / 255)
+                s += 4
+                d += 4
+
+    fill(c = 0):
+        self.fill_rect(self.bounds(), c)
+
+    fill_rect(r = Rect(), c = 0):
+        cl = r.clip(self.width, self.height)
+        if cl.empty():
+            return
+        rr = u8(Pixel.red(c))
+        gg = u8(Pixel.green(c))
+        bb = u8(Pixel.blue(c))
+        aa = u8(Pixel.alpha(c))
+        px = self.pixels
+        for y in range(cl.h):
+            i = ((cl.y + y) * self.width + cl.x) * 4
+            for _ in range(cl.w):
+                px[i] = rr
+                px[i + 1] = gg
+                px[i + 2] = bb
+                px[i + 3] = aa
+                i += 4
+
+    erase(mask = Mask(), r = Rect()):
+        cl = r.clip(self.width, self.height)
+        if cl.empty():
+            return
+        px = self.pixels
+        md = mask.data
+        for y in range(cl.h):
+            for x in range(cl.w):
+                p = (cl.y + y) * self.width + cl.x + x
+                m = int(md[p])
+                if m > 0:
+                    i = p * 4 + 3
+                    px[i] = u8(int(px[i]) * (255 - m) / 255)
+
+    flipped_h() -> Bitmap:
+        out = Bitmap(self.width, self.height)
+        s = self.pixels
+        d = out.pixels
+        w = self.width
+        for y in range(self.height):
+            for x in range(w):
+                si = (y * w + x) * 4
+                di = (y * w + (w - 1 - x)) * 4
+                for k in range(4):
+                    d[di + k] = s[si + k]
+        return out
+
+    flipped_v() -> Bitmap:
+        out = Bitmap(self.width, self.height)
+        s = self.pixels
+        d = out.pixels
+        row = self.width * 4
+        for y in range(self.height):
+            si = y * row
+            di = (self.height - 1 - y) * row
+            for k in range(row):
+                d[di + k] = s[si + k]
+        return out
+
+    rotated_cw() -> Bitmap:
+        w = self.width
+        h = self.height
+        out = Bitmap(h, w)
+        s = self.pixels
+        d = out.pixels
+        for y in range(h):
+            for x in range(w):
+                si = (y * w + x) * 4
+                # (x, y) goes to (h - 1 - y, x)
+                di = (x * h + (h - 1 - y)) * 4
+                for k in range(4):
+                    d[di + k] = s[si + k]
+        return out
+
+    rotated_ccw() -> Bitmap:
+        w = self.width
+        h = self.height
+        out = Bitmap(h, w)
+        s = self.pixels
+        d = out.pixels
+        for y in range(h):
+            for x in range(w):
+                si = (y * w + x) * 4
+                # (x, y) goes to (y, w - 1 - x)
+                di = ((w - 1 - x) * h + y) * 4
+                for k in range(4):
+                    d[di + k] = s[si + k]
+        return out
+
+    rotated_180() -> Bitmap:
+        out = Bitmap(self.width, self.height)
+        s = self.pixels
+        d = out.pixels
+        n = self.width * self.height
+        for p in range(n):
+            si = p * 4
+            di = (n - 1 - p) * 4
+            for k in range(4):
+                d[di + k] = s[si + k]
+        return out
+
+    canvas(w = 0, h = 0, ox = 0, oy = 0, c = 0) -> Bitmap:
+        out = Bitmap(w, h, c)
+        out.put(self, ox, oy)
+        return out
+
+    sample(fx = 0.0, fy = 0.0) -> int:
+        if self.width <= 0 or self.height <= 0:
+            return 0
+        x = fx - 0.5
+        y = fy - 0.5
+        x0 = int(floor(x))
+        y0 = int(floor(y))
+        tx = x - float(x0)
+        ty = y - float(y0)
+        c00 = self.get(clamp(x0, 0, self.width - 1), clamp(y0, 0, self.height - 1))
+        c10 = self.get(clamp(x0 + 1, 0, self.width - 1), clamp(y0, 0, self.height - 1))
+        c01 = self.get(clamp(x0, 0, self.width - 1), clamp(y0 + 1, 0, self.height - 1))
+        c11 = self.get(clamp(x0 + 1, 0, self.width - 1), clamp(y0 + 1, 0, self.height - 1))
+        return Bilinear.mix(c00, c10, c01, c11, tx, ty)
+
+    opaque_bounds() -> Rect:
+        x0 = self.width
+        y0 = self.height
+        x1 = -1
+        y1 = -1
+        px = self.pixels
+        for y in range(self.height):
+            i = y * self.width * 4 + 3
+            for x in range(self.width):
+                if px[i] != u8(0):
+                    x0 = min(x0, x)
+                    x1 = max(x1, x)
+                    y0 = min(y0, y)
+                    y1 = max(y1, y)
+                i += 4
+        if x1 < 0:
+            return Rect()
+        return Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+
+    thumbnail(w = 0, h = 0) -> Bitmap:
+        out = Bitmap(w, h)
+        if self.width <= 0 or self.height <= 0 or w <= 0 or h <= 0:
+            return out
+        s = self.pixels
+        d = out.pixels
+        for y in range(h):
+            sy = min(self.height - 1, (y * self.height + self.height / (2 * h)) / h)
+            for x in range(w):
+                sx = min(self.width - 1, (x * self.width + self.width / (2 * w)) / w)
+                si = (sy * self.width + sx) * 4
+                di = (y * w + x) * 4
+                for k in range(4):
+                    d[di + k] = s[si + k]
+        return out
+
+# bilinear mixing of four packed colours, premultiplied so see-through
+# neighbours do not darken the edge
+Bilinear:
+    mix(c00 = 0, c10 = 0, c01 = 0, c11 = 0, tx = 0.0, ty = 0.0) -> int:
+        w00 = (1.0 - tx) * (1.0 - ty)
+        w10 = tx * (1.0 - ty)
+        w01 = (1.0 - tx) * ty
+        w11 = tx * ty
+        a00 = float(Pixel.alpha(c00))
+        a10 = float(Pixel.alpha(c10))
+        a01 = float(Pixel.alpha(c01))
+        a11 = float(Pixel.alpha(c11))
+        a = a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11
+        if a <= 0.001:
+            return 0
+        r = (float(Pixel.red(c00)) * a00 * w00 + float(Pixel.red(c10)) * a10 * w10 + float(Pixel.red(c01)) * a01 * w01 + float(Pixel.red(c11)) * a11 * w11) / a
+        g = (float(Pixel.green(c00)) * a00 * w00 + float(Pixel.green(c10)) * a10 * w10 + float(Pixel.green(c01)) * a01 * w01 + float(Pixel.green(c11)) * a11 * w11) / a
+        b = (float(Pixel.blue(c00)) * a00 * w00 + float(Pixel.blue(c10)) * a10 * w10 + float(Pixel.blue(c01)) * a01 * w01 + float(Pixel.blue(c11)) * a11 * w11) / a
+        return Pixel.pack(int(r + 0.5), int(g + 0.5), int(b + 0.5), int(a + 0.5))
+
+# little-endian numbers in files
+Bytes:
+    u32(out = [u8], v = 0):
+        out.push(u8(v & 255))
+        out.push(u8((v >> 8) & 255))
+        out.push(u8((v >> 16) & 255))
+        out.push(u8((v >> 24) & 255))
+
+    read32(data = [u8], at = 0) -> int:
+        if at + 4 > len(data):
+            return 0
+        return int(data[at]) | (int(data[at + 1]) << 8) | (int(data[at + 2]) << 16) | (int(data[at + 3]) << 24)

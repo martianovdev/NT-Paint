@@ -1,0 +1,178 @@
+# imaging — pictures on the GPU: layers are surfaces, and everything done
+# to their pixels is a pass of a shader over a rectangle of one of them.
+#
+#   gpu = &Gpu(graphics)
+#   layer = gpu.upload(bitmap)                 # a surface of the picture
+#   painter = &Painter(gpu)
+#   painter.begin(layer)                       # the layer kept as it was
+#   painter.capsule(x0, y0, x1, y1, 8.0, 0.75) # coverage: the max of what
+#   painter.capsule(...)                       # was and what is drawn now
+#   painter.apply_color(layer, 0xFF2040FF)     # layer = base ⊕ colour × cover
+#   changed = painter.end()                    # the rectangle it touched
+#
+#   compositor.compose(layers, w, h)           # the layers blended, one texture
+#   Display.draw(gpu, texture, x, y, w, h)     # on a checker, as a canvas
+#
+# Pixels are straight RGBA8 in every surface (as PNG keeps them); passes
+# write with blending off and do the arithmetic themselves.  A selection
+# is a texture of layers (one layer) made from a CPU mask: its red is how
+# much a pixel is selected.  What the CPU does better (regions, outlines,
+# files) is the package raster's.
+#
+# Inside: gpu (the context, shaders, passes, upload and download),
+# painter (strokes, shapes, text, fills, gradients), compositor (layer
+# blend modes), transform (resize, flip, turn, move), display.
+
+package imaging "0.1.0"
+
+requires graphics "0.1"
+requires raster "0.1"
+
+from graphics import Font, Graphics, Material, Surface, Texture
+from raster import Bitmap, Mask, Rect
+
+# paint.net's layer blend modes, in its order
+enum BlendMode:
+    normal
+    multiply
+    additive
+    color_burn
+    color_dodge
+    reflect
+    glow
+    overlay
+    difference
+    negation
+    lighten
+    darken
+    screen
+    xor
+
+enum GradientKind:
+    linear
+    reflected
+    diamond
+    radial
+    conical
+
+# the GPU and the shaders every pass shares
+Gpu in gpu:
+    graphics = &Graphics
+    init(graphics = &Graphics)
+    # the material of a shader made once by name: head (the pass's
+    # rectangle, uv, px(), tuv()), the selection's sampler when sel, the
+    # blend functions when blend, then body (a fragment(), uniforms...)
+    material(name = "", body = "", sel = false, blend = false) -> &Material
+    surface(w = 0, h = 0) -> &Surface
+    # a pass of m over the rectangle x, y, w, h of target (in its pixels):
+    # its constants rect and size set; blending off
+    run(target = &Surface, m = &Material, x = 0.0, y = 0.0, w = 0.0, h = 0.0)
+    # target's rectangle filled with a colour (0xAARRGGBB), or all of it
+    clear(target = &Surface, c = 0)
+    fill(target = &Surface, r = Rect(), c = 0)
+    # the rectangle r of src put at the same place in dst (one size)
+    copy(dst = &Surface, src = &Texture, r = Rect())
+    # src's rectangle sx, sy, w × h put at dx, dy of dst (any sizes)
+    blit(dst = &Surface, src = &Texture, src_w = 0, src_h = 0, sx = 0, sy = 0, dx = 0, dy = 0, w = 0, h = 0)
+    # a surface of a bitmap's pixels
+    upload(b = Bitmap()) -> &Surface
+    # a bitmap's pixels put into an existing surface of its size
+    upload_into(dst = &Surface, b = Bitmap())
+    # a surface's pixels, read back (what earlier frames drew)
+    download(s = &Surface) -> Bitmap
+    # a mask as a texture shaders read as a selection (red = how much)
+    mask_texture(m = Mask(), reuse = none(&Texture)) -> &Texture
+    # the selection that selects everything
+    everything() -> &Texture
+    # the copy of a surface: a new one of its size and pixels
+    duplicate(s = &Surface) -> &Surface
+
+# strokes, shapes, text and fills: coverage drawn into a surface of the
+# layer's size (red 0…1, the larger kept), then put onto the layer from
+# what it was when the stroke began
+Painter in painter:
+    gpu = &Gpu
+    init(gpu = &Gpu)
+    # a stroke on layer begins: the layer kept as it is (base), the
+    # coverage cleared
+    begin(layer = &Surface)
+    # the rectangle the stroke has touched so far
+    get_dirty() -> Rect
+    # the layer as it was when the stroke began
+    get_base() -> &Surface
+    # a round brush along a segment: radius, hardness 0…1, smoothed
+    capsule(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, radius = 1.0, hardness = 1.0, aa = true, end_radius = -1.0)
+    # the coverage drawn anew from shapes (the 2D batch, white): a
+    # polygon's inside, a path's outline of width, text; cleared first
+    # when fresh
+    polygon(pts = [float], aa = true, fresh = true)
+    outline(pts = [float], width = 1.0, closed = true, aa = true, fresh = true)
+    line(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, width = 1.0, aa = true, fresh = true)
+    text(font = &Font, size = 0.0, x = 0.0, y = 0.0, text = "", fresh = true)
+    # the coverage taken from a mask (a bucket's region)
+    from_mask(m = Mask())
+    # what was drawn since begin put onto the layer, in the dirty
+    # rectangle: a colour by a blend mode (overwrite: alpha and all), the
+    # alpha taken away, colours near target recoloured, a picture moved by
+    # dx, dy (clone stamp); sel limits each
+    apply_color(layer = &Surface, c = 0, mode = BlendMode.normal, overwrite = false, sel = none(&Texture))
+    apply_erase(layer = &Surface, sel = none(&Texture))
+    apply_recolor(layer = &Surface, target = 0, c = 0, tolerance = 0.5, sel = none(&Texture))
+    apply_clone(layer = &Surface, src = &Texture, dx = 0.0, dy = 0.0, sel = none(&Texture))
+    # a gradient over the layer from base: colours a to b, or (alpha) the
+    # base's alpha faded; within r and the selection
+    gradient(layer = &Surface, r = Rect(), kind = GradientKind.linear, x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, a = 0, b = 0, alpha = false, mode = BlendMode.normal, sel = none(&Texture))
+    # the stroke over: the rectangle it changed
+    end() -> Rect
+
+# what the compositor is given of a layer
+LayerInput:
+    texture = none(&Texture)
+    visible = true
+    opacity = 255
+    mode = BlendMode.normal
+
+    init(texture = none(&Texture), visible = true, opacity = 255, mode = BlendMode.normal):
+        self.texture = texture
+        self.visible = visible
+        self.opacity = opacity
+        self.mode = mode
+
+# the layers blended bottom to top into one picture
+Compositor in compositor:
+    gpu = &Gpu
+    init(gpu = &Gpu)
+    # the layers (bottom first) blended over see-through: the picture's
+    # texture
+    compose(layers = [LayerInput], w = 0, h = 0) -> &Texture
+    get_texture() -> none(&Texture)
+    get_surface() -> none(&Surface)
+
+# whole surfaces made anew: resized, flipped, turned, on a canvas; and a
+# picture moved, scaled and turned into another
+Transforms in transform:
+    # bilinear up, box-averaged down
+    resized(gpu = &Gpu, src = &Surface, w = 0, h = 0) -> &Surface
+    resize_into(gpu = &Gpu, src = &Surface, out = &Surface)
+    flipped(gpu = &Gpu, src = &Surface, horizontal = true) -> &Surface
+    # turns: 1 clockwise, 2 half, 3 counter-clockwise
+    rotated(gpu = &Gpu, src = &Surface, turns = 1) -> &Surface
+    # src on a canvas of w × h with its top left at ox, oy, the rest c
+    canvas(gpu = &Gpu, src = &Surface, w = 0, h = 0, ox = 0, oy = 0, c = 0) -> &Surface
+    # dst (in r) = under, with src's pixels (sel's part of them) moved by
+    # dx, dy, scaled by sx, sy and turned by angle about cx, cy laid over;
+    # source is the source texture's bounds in document coordinates.
+    place(gpu = &Gpu, dst = &Surface, under = &Texture, src = &Texture, sel = none(&Texture), r = Rect(), cx = 0.0, cy = 0.0, dx = 0.0, dy = 0.0, sx = 1.0, sy = 1.0, angle = 0.0, source = Rect())
+    # the part of src that sel selects, the rest see-through
+    cut(gpu = &Gpu, dst = &Surface, src = &Texture, sel = &Texture, r = Rect())
+    # src with sel's part made see-through (keep: the selected part kept,
+    # the rest see-through)
+    erase(gpu = &Gpu, dst = &Surface, src = &Texture, sel = &Texture, r = Rect())
+    # the selected part filled with a colour over src
+    fill(gpu = &Gpu, dst = &Surface, src = &Texture, sel = &Texture, r = Rect(), c = 0)
+
+# a picture shown: on a checker of 8-pixel cells, its texels sharp
+# (nearest) or smooth
+Display in display:
+    draw(gpu = &Gpu, texture = &Texture, tw = 0, th = 0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, nearest = false, checker = true)
+    selection(gpu = &Gpu, mask = none(&Texture), x = 0.0, y = 0.0, w = 0.0, h = 0.0, nearest = false, phase = 0.0, solid = false)

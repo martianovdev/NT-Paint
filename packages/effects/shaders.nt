@@ -1,0 +1,402 @@
+# shaders — the effects' fragment code.  Each effect is a function
+# effect(p) giving the colour at pixel p from src (sampled by at(), its
+# edges clamped); the common main mixes it with the source by how much the
+# selection selects.  Parameters arrive as p0, p1 (eight numbers), the
+# palette as c0 and c1; a second picture (a blur made by earlier passes,
+# premultiplied) as aux.
+
+FxShaders:
+    common() -> str:
+        return """
+uniform sampler2D src;
+uniform sampler2D aux;
+uniform vec4 p0;
+uniform vec4 p1;
+uniform vec4 c0;
+uniform vec4 c1;
+
+vec4 at(vec2 p)
+{
+    return texture(src, clamp(p, vec2(0.5, 0.5), size.xy - vec2(0.5, 0.5)) / size.xy);
+}
+
+vec4 aux_at(vec2 p)
+{
+    vec4 c = texture(aux, clamp(p, vec2(0.5, 0.5), size.xy - vec2(0.5, 0.5)) / size.xy);
+    return c.a > 0.0 ? vec4(c.rgb / c.a, c.a) : vec4(0.0, 0.0, 0.0, 0.0);
+}
+
+float luma(vec3 c)
+{
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+vec3 rgb2hsv(vec3 c)
+{
+    vec4 k = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    vec4 p = c.g < c.b ? vec4(c.bg, k.wz) : vec4(c.gb, k.xy);
+    vec4 q = c.r < p.x ? vec4(p.xyw, c.r) : vec4(c.r, p.yzx);
+    float d = q.x - min(q.w, q.y);
+    float e = 0.0000001;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+vec3 hsv2rgb(vec3 c)
+{
+    vec3 k = abs(fract(vec3(c.x, c.x, c.x) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return c.z * mix(vec3(1.0, 1.0, 1.0), clamp(k - 1.0, 0.0, 1.0), c.y);
+}
+
+float hash(vec2 p)
+{
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+vec2 centre()
+{
+    return size.xy * (0.5 + vec2(p0.y, p0.z) * 0.5);
+}
+
+vec4 avg(vec4 acc, float n)
+{
+    acc /= n;
+    return acc.a > 0.0 ? vec4(acc.rgb / acc.a, acc.a) : vec4(0.0, 0.0, 0.0, 0.0);
+}
+
+vec4 premul(vec4 c)
+{
+    return vec4(c.rgb * c.a, c.a);
+}
+"""
+
+    main() -> str:
+        return """
+void fragment()
+{
+    vec2 p = px();
+    vec2 t = tuv(p);
+    vec4 s = texture(src, t);
+    vec4 e = clamp(effect(p), 0.0, 1.0);
+    COLOR = mix(s, e, selk(t));
+}
+"""
+
+    # one direction of a gaussian into a premultiplied picture: dir.xy the
+    # step's direction, dir.z sigma, dir.w the step; opt.x 1 when src is
+    # straight
+    blur() -> str:
+        return """
+uniform sampler2D src;
+uniform vec4 dir;
+uniform vec4 opt;
+void fragment()
+{
+    vec2 p = px();
+    float sigma = max(dir.z, 0.3);
+    float step = max(dir.w, 1.0);
+    float n = ceil(sigma * 3.0 / step);
+    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    for (int i = 0; i < 97; i++)
+    {
+        float k = float(i) - 48.0;
+        if (abs(k) > n) { continue; }
+        float x = k * step;
+        float w = exp(-x * x / (2.0 * sigma * sigma));
+        vec2 q = clamp(p + dir.xy * x, vec2(0.5, 0.5), size.xy - vec2(0.5, 0.5));
+        vec4 c = texture(src, q / size.xy);
+        if (opt.x > 0.5) { c = vec4(c.rgb * c.a, c.a); }
+        acc += c * w;
+        wsum += w;
+    }
+    COLOR = acc / max(wsum, 0.00001);
+}
+"""
+
+    body(id = "") -> str:
+        match id:
+            case "invert_colors":
+                return "vec4 effect(vec2 p) { vec4 c = at(p); return vec4(1.0 - c.rgb, c.a); }"
+            case "invert_alpha":
+                return "vec4 effect(vec2 p) { vec4 c = at(p); return vec4(c.rgb, 1.0 - c.a); }"
+            case "black_white":
+                return "vec4 effect(vec2 p) { vec4 c = at(p); float l = luma(c.rgb); return vec4(l, l, l, c.a); }"
+            case "sepia":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); float l = luma(c.rgb);
+                    return vec4(pow(l, 1.0 / 1.2), l, pow(l, 1.0 / 0.8), c.a); }"""
+            case "auto_level", "levels":
+                # p0: lo, hi of red, green; p1: lo, hi of blue, gamma, out
+                # (levels: all channels one lo / hi in p0.x, p0.y)
+                return """vec4 effect(vec2 p) { vec4 c = at(p);
+                    vec3 lo = vec3(p0.x, p0.z, p1.x) / 255.0;
+                    vec3 hi = vec3(p0.y, p0.w, p1.y) / 255.0;
+                    vec3 x = clamp((c.rgb - lo) / max(hi - lo, vec3(0.001, 0.001, 0.001)), 0.0, 1.0);
+                    x = pow(x, vec3(1.0 / max(p1.z, 0.01)));
+                    float ol = c1.x / 255.0; float oh = c1.y / 255.0;
+                    return vec4(ol + x * (oh - ol), c.a); }"""
+            case "brightness_contrast":
+                return """vec4 effect(vec2 p) { vec4 c = at(p);
+                    float k = p0.y >= 0.0 ? 1.0 + p0.y / 100.0 * 3.0 : 1.0 + p0.y / 100.0;
+                    return vec4((c.rgb - 0.5) * k + 0.5 + p0.x / 100.0, c.a); }"""
+            case "hue_saturation":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec3 h = rgb2hsv(c.rgb);
+                    h.x = fract(h.x + p0.x / 360.0 + 1.0); h.y = clamp(h.y * p0.y / 100.0, 0.0, 1.0);
+                    vec3 o = hsv2rgb(h);
+                    if (p0.z > 0.0) { o = mix(o, vec3(1.0, 1.0, 1.0), p0.z / 100.0); } else { o *= 1.0 + p0.z / 100.0; }
+                    return vec4(o, c.a); }"""
+            case "posterize":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec3 n = max(vec3(p0.x, p0.y, p0.z) - 1.0, vec3(1.0, 1.0, 1.0));
+                    return vec4(floor(c.rgb * n + 0.5) / n, c.a); }"""
+            case "curves":
+                return """float cr(float x)
+                    {
+                        float y0 = 0.0; float y1 = 0.25 + p0.x * 0.0025; float y2 = 0.5 + p0.y * 0.005; float y3 = 0.75 + p0.z * 0.0025; float y4 = 1.0;
+                        float s = x * 4.0; float k = min(floor(s), 3.0); float u = s - k;
+                        float a = k < 0.5 ? y0 : (k < 1.5 ? y0 : (k < 2.5 ? y1 : y2));
+                        float b = k < 0.5 ? y0 : (k < 1.5 ? y1 : (k < 2.5 ? y2 : y3));
+                        float c = k < 0.5 ? y1 : (k < 1.5 ? y2 : (k < 2.5 ? y3 : y4));
+                        float d = k < 0.5 ? y2 : (k < 1.5 ? y3 : (k < 2.5 ? y4 : y4));
+                        return 0.5 * (2.0 * b + (-a + c) * u + (2.0 * a - 5.0 * b + 4.0 * c - d) * u * u + (-a + 3.0 * b - 3.0 * c + d) * u * u * u);
+                    }
+                    vec4 effect(vec2 p) { vec4 c = at(p); return vec4(cr(c.r), cr(c.g), cr(c.b), c.a); }"""
+            case "shadows_highlights":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec3 x = c.rgb;
+                    vec3 lift = p0.x / 100.0 * (1.0 - x) * (1.0 - x) * x * 2.0;
+                    vec3 drop = p0.y / 100.0 * x * x * (1.0 - x) * 2.0;
+                    return vec4(x + lift - drop, c.a); }"""
+            case "temperature":
+                return """vec4 effect(vec2 p) { vec4 c = at(p);
+                    return vec4(c.r + p0.x * 0.0016, c.g - p0.y * 0.0016, c.b - p0.x * 0.0016, c.a); }"""
+            case "exposure":
+                return """vec4 effect(vec2 p) { vec4 c = at(p);
+                    vec3 lin = pow(c.rgb, vec3(2.2, 2.2, 2.2)) * pow(2.0, p0.x);
+                    return vec4(pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2)), c.a); }"""
+            case "vignette":
+                return """vec4 effect(vec2 p) { vec4 c = at(p);
+                    vec2 o = size.xy * (0.5 + vec2(p0.z, p0.w) * 0.5);
+                    float reach = max(length(size.xy) * 0.5 * p0.x / 100.0, 1.0);
+                    float t = clamp(length(p - o) / reach, 0.0, 1.0);
+                    float f = 1.0 - p0.y / 100.0 * t * t * (3.0 - 2.0 * t);
+                    return vec4(c.rgb * f, c.a); }"""
+            case "gaussian_blur", "unfocus":
+                return "vec4 effect(vec2 p) { return aux_at(p); }"
+            case "glow":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec4 b = aux_at(p);
+                    vec3 g = clamp((b.rgb - 0.5) * (1.0 + p0.z / 100.0) + 0.5 + p0.y / 200.0, 0.0, 1.0);
+                    return vec4(1.0 - (1.0 - c.rgb) * (1.0 - g), c.a); }"""
+            case "sharpen":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec4 b = aux_at(p);
+                    return vec4(c.rgb * 2.0 - b.rgb, c.a); }"""
+            case "soften_portrait":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec4 b = aux_at(p);
+                    vec3 o = mix(c.rgb, b.rgb, clamp(p0.x / 10.0, 0.0, 1.0) * 0.7) + p0.y / 128.0;
+                    o.r += p0.z / 255.0; o.b -= p0.z / 255.0;
+                    return vec4(o, c.a); }"""
+            case "pencil_sketch":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec4 b = aux_at(p);
+                    float g = luma(c.rgb); float inv = 1.0 - luma(b.rgb);
+                    float v = inv >= 1.0 ? 1.0 : min(1.0, g / (1.0 - inv));
+                    v = clamp(pow(v, 3.0) + p0.y / 100.0 * 0.15, 0.0, 1.0);
+                    return vec4(v, v, v, c.a); }"""
+            case "drop_shadow":
+                return """vec4 effect(vec2 p) { vec4 c = at(p); vec4 b = aux_at(p - vec2(p0.x, p0.y));
+                    vec4 sh = vec4(c0.rgb, b.a * p0.w / 100.0);
+                    float oa = c.a + sh.a * (1.0 - c.a);
+                    if (oa <= 0.0) { return vec4(0.0, 0.0, 0.0, 0.0); }
+                    return vec4((c.rgb * c.a + sh.rgb * sh.a * (1.0 - c.a)) / oa, oa); }"""
+            case "motion_blur":
+                return """vec4 effect(vec2 p) {
+                    float a = radians(p0.x); vec2 d = vec2(cos(a), -sin(a)) * p0.y;
+                    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+                    for (int i = 0; i < 64; i++) { float t = float(i) / 63.0; if (p0.z > 0.5) { t -= 0.5; } acc += premul(at(p + d * t)); }
+                    return avg(acc, 64.0); }"""
+            case "radial_blur":
+                return """vec4 effect(vec2 p) {
+                    vec2 o = centre(); vec2 d = p - o; float span = radians(p1.x);
+                    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+                    for (int i = 0; i < 48; i++) { float t = (float(i) / 47.0 - 0.5) * span; float ct = cos(t); float st = sin(t);
+                        acc += premul(at(o + vec2(d.x * ct - d.y * st, d.x * st + d.y * ct))); }
+                    return avg(acc, 48.0); }"""
+            case "zoom_blur":
+                return """vec4 effect(vec2 p) {
+                    vec2 o = centre(); vec2 d = p - o; float k = p1.x / 100.0 * 0.5;
+                    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+                    for (int i = 0; i < 48; i++) { float t = 1.0 - k * float(i) / 48.0; acc += premul(at(o + d * t)); }
+                    return avg(acc, 48.0); }"""
+            case "fragment":
+                return """vec4 effect(vec2 p) {
+                    float n = clamp(floor(p0.x), 2.0, 50.0);
+                    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+                    for (int i = 0; i < 50; i++) { if (float(i) >= n) { break; }
+                        float a = radians(p0.z + 360.0 * float(i) / n);
+                        acc += premul(at(p + vec2(cos(a), sin(a)) * p0.y)); }
+                    return avg(acc, n); }"""
+            case "surface_blur":
+                return """vec4 effect(vec2 p) {
+                    vec4 c = at(p); float r = p0.x; float tol = max(p0.y / 100.0, 0.004);
+                    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0); float ws = 0.0;
+                    for (int j = 0; j < 9; j++) { for (int i = 0; i < 9; i++) {
+                        vec2 o = (vec2(float(i), float(j)) / 8.0 - 0.5) * 2.0 * r;
+                        vec4 s = at(p + o); float d = length(s.rgb - c.rgb) / 1.732;
+                        float w = clamp(1.0 - d / tol, 0.0, 1.0); acc += premul(s) * w; ws += w; } }
+                    return ws > 0.0 ? avg(acc, ws) : c; }"""
+            case "bulge":
+                return """vec4 effect(vec2 p) {
+                    vec2 o = centre(); vec2 d = p - o; float rad = min(size.x, size.y) * 0.5;
+                    float dist = length(d) / rad;
+                    if (dist >= 1.0) { return at(p); }
+                    float k = 1.0 - p0.x / 100.0 * (1.0 - dist) * (1.0 - dist) * 0.9;
+                    return at(o + d * k); }"""
+            case "twist":
+                return """vec4 effect(vec2 p) {
+                    vec2 o = centre(); vec2 d = p - o; float rad = min(size.x, size.y) * 0.5;
+                    float dist = length(d) / rad;
+                    if (dist >= 1.0) { return at(p); }
+                    float a = p0.x / 100.0 * 6.2831853 * (1.0 - dist) * (1.0 - dist);
+                    return at(o + vec2(d.x * cos(a) - d.y * sin(a), d.x * sin(a) + d.y * cos(a))); }"""
+            case "polar_inversion":
+                return """vec4 effect(vec2 p) {
+                    vec2 o = centre(); vec2 d = p - o; float rad = min(size.x, size.y) * 0.5;
+                    float d2 = max(dot(d, d), 0.0001);
+                    float k = mix(1.0, rad * rad / d2, clamp(p0.x / 4.0, 0.0, 1.0));
+                    return at(o + d * k); }"""
+            case "tile_reflection":
+                return """vec4 effect(vec2 p) {
+                    float s = max(p0.x, 2.0); vec2 t = fract(p / s) * 2.0 - 1.0; float k = p0.y / 10.0;
+                    return at(p - t * s * 0.25 * k * (1.0 - abs(t.yx))); }"""
+            case "dents":
+                return """vec4 effect(vec2 p) {
+                    float s = max(p0.x, 2.0); float k = p0.y / 10.0;
+                    vec2 o = vec2(sin(p.y / s) + 0.5 * sin(p.x / (s * 1.7)), cos(p.x / s) + 0.5 * cos(p.y / (s * 1.3))) * s * 0.3 * k;
+                    return at(p + o); }"""
+            case "frosted_glass":
+                return """vec4 effect(vec2 p) {
+                    vec2 o = vec2(hash(p), hash(p + 17.31)) * 2.0 - 1.0;
+                    return at(p + o * p0.x); }"""
+            case "pixelate":
+                return """vec4 effect(vec2 p) {
+                    float s = max(floor(p0.x), 1.0); vec2 cell = floor((p - 0.5) / s) * s;
+                    vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+                    for (int j = 0; j < 8; j++) { for (int i = 0; i < 8; i++) {
+                        acc += premul(at(cell + (vec2(float(i), float(j)) + 0.5) / 8.0 * s)); } }
+                    return avg(acc, 64.0); }"""
+            case "outline_object":
+                return """vec4 effect(vec2 p) {
+                    vec4 c = at(p); float r = p0.x; float best = 0.0;
+                    for (int j = 0; j < 13; j++) { for (int i = 0; i < 13; i++) {
+                        vec2 o = (vec2(float(i), float(j)) / 12.0 - 0.5) * 2.0 * r;
+                        float d = length(o); if (d > r + 0.5) { continue; }
+                        best = max(best, at(p + o).a * clamp(r + 0.5 - d, 0.0, 1.0)); } }
+                    vec4 under = vec4(c0.rgb, best);
+                    float oa = c.a + under.a * (1.0 - c.a);
+                    if (oa <= 0.0) { return vec4(0.0, 0.0, 0.0, 0.0); }
+                    return vec4((c.rgb * c.a + under.rgb * under.a * (1.0 - c.a)) / oa, oa); }"""
+            case "emboss", "relief", "edge_detect":
+                kind = "0.0"
+                if id == "relief":
+                    kind = "1.0"
+                elif id == "edge_detect":
+                    kind = "2.0"
+                return """float slope(vec2 p) {
+                        float a = radians(p0.x); float ca = cos(a); float sa = sin(a); float s = 0.0;
+                        for (int j = -1; j <= 1; j++) { for (int i = -1; i <= 1; i++) {
+                            s += luma(at(p + vec2(float(i), float(j))).rgb) * (float(i) * ca - float(j) * sa); } }
+                        return s; }
+                    vec4 effect(vec2 p) { vec4 c = at(p); float s = slope(p); float kind = """ + kind + """;
+                        if (kind < 0.5) { float v = 0.5 + s; return vec4(v, v, v, c.a); }
+                        if (kind < 1.5) { return vec4(c.rgb + s, c.a); }
+                        return vec4(vec3(0.5, 0.5, 0.5) + s + (c.rgb - 0.5) / 6.0, c.a); }"""
+            case "outline":
+                return """vec4 effect(vec2 p) {
+                    vec4 c = at(p); float r = p0.x; float lo = 1.0; float hi = 0.0;
+                    for (int j = 0; j < 9; j++) { for (int i = 0; i < 9; i++) {
+                        float l = luma(at(p + (vec2(float(i), float(j)) / 8.0 - 0.5) * 2.0 * r).rgb);
+                        lo = min(lo, l); hi = max(hi, l); } }
+                    return vec4(c.rgb - (hi - lo) * p0.y / 100.0, c.a); }"""
+            case "oil_painting":
+                return """vec4 effect(vec2 p) {
+                    float levels = clamp(floor(p0.y / 4.0) + 2.0, 2.0, 16.0); float r = p0.x;
+                    float best = -1.0; vec4 pick = at(p);
+                    for (int b = 0; b < 16; b++) { if (float(b) >= levels) { break; }
+                        float cnt = 0.0; vec3 sum = vec3(0.0, 0.0, 0.0);
+                        for (int j = 0; j < 7; j++) { for (int i = 0; i < 7; i++) {
+                            vec4 s = at(p + (vec2(float(i), float(j)) / 6.0 - 0.5) * 2.0 * r);
+                            float lv = floor(luma(s.rgb) * (levels - 1.0) + 0.5);
+                            if (abs(lv - float(b)) < 0.5) { cnt += 1.0; sum += s.rgb; } } }
+                        if (cnt > best) { best = cnt; pick = vec4(sum / max(cnt, 1.0), at(p).a); } }
+                    return pick; }"""
+            case "ink_sketch":
+                return """vec4 effect(vec2 p) {
+                    vec4 c = at(p); float gx = 0.0; float gy = 0.0;
+                    for (int j = -1; j <= 1; j++) { for (int i = -1; i <= 1; i++) {
+                        float l = luma(at(p + vec2(float(i), float(j))).rgb);
+                        gx += l * float(i); gy += l * float(j); } }
+                    float edge = clamp((abs(gx) + abs(gy)) * p0.x / 50.0, 0.0, 1.0);
+                    float l = luma(c.rgb);
+                    vec3 o = mix(vec3(l, l, l), c.rgb, p0.y / 100.0) - edge;
+                    return vec4(o, c.a); }"""
+            case "add_noise":
+                return """vec4 effect(vec2 p) {
+                    vec4 c = at(p);
+                    if (hash(p + 3.7) > p0.z / 100.0) { return c; }
+                    float amp = p0.x / 100.0 * 0.5;
+                    float g = (hash(p) + hash(p + 1.3) - 1.0) * amp;
+                    vec3 own = vec3(hash(p + 5.1) + hash(p + 7.7) - 1.0, hash(p + 9.3) + hash(p + 2.9) - 1.0, hash(p + 4.4) + hash(p + 8.8) - 1.0) * amp;
+                    return vec4(c.rgb + mix(vec3(g, g, g), own, clamp(p0.y / 400.0, 0.0, 1.0)), c.a); }"""
+            case "median", "reduce_noise":
+                # the percentile of 25 samples over the radius, per channel,
+                # found by halving the range eight times
+                pct = "p0.y / 100.0"
+                mix_back = "0.0"
+                if id == "reduce_noise":
+                    pct = "0.5"
+                    mix_back = "1.0"
+                return """float below(vec2 p, float r, float v, int ch) {
+                        float n = 0.0;
+                        for (int j = 0; j < 5; j++) { for (int i = 0; i < 5; i++) {
+                            vec4 s = at(p + (vec2(float(i), float(j)) / 4.0 - 0.5) * 2.0 * r);
+                            float x = ch == 0 ? s.r : (ch == 1 ? s.g : (ch == 2 ? s.b : s.a));
+                            if (x < v) { n += 1.0; } } }
+                        return n; }
+                    float pick(vec2 p, float r, float want, int ch) {
+                        float lo = 0.0; float hi = 1.0;
+                        for (int k = 0; k < 8; k++) { float mid = (lo + hi) * 0.5;
+                            if (below(p, r, mid, ch) <= want) { lo = mid; } else { hi = mid; } }
+                        return lo; }
+                    vec4 effect(vec2 p) {
+                        float r = p0.x; float want = floor(24.0 * """ + pct + """);
+                        vec4 m = vec4(pick(p, r, want, 0), pick(p, r, want, 1), pick(p, r, want, 2), pick(p, r, want, 3));
+                        if (""" + mix_back + """ > 0.5) { return mix(at(p), m, clamp(p0.y, 0.0, 1.0)); }
+                        return m; }"""
+            case "clouds":
+                return """float vnoise(vec2 x) { vec2 i = floor(x); vec2 f = fract(x); vec2 u = f * f * (3.0 - 2.0 * f);
+                        float a = hash(i + p0.z); float b = hash(i + vec2(1.0, 0.0) + p0.z); float c = hash(i + vec2(0.0, 1.0) + p0.z); float d = hash(i + vec2(1.0, 1.0) + p0.z);
+                        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y); }
+                    vec4 effect(vec2 p) {
+                        float v = 0.0; float amp = 1.0; float total = 0.0; float freq = 1.0 / max(p0.x, 2.0); float rough = clamp(p0.y / 100.0, 0.0, 1.0);
+                        for (int o = 0; o < 8; o++) { v += vnoise(p * freq + float(o) * 31.7) * amp; total += amp; amp *= rough; freq *= 2.0; }
+                        vec4 col = mix(c0, c1, v / total);
+                        return over(col, at(p), p0.w); }"""
+            case "julia", "mandelbrot":
+                jul = "1.0" if id == "julia" else "0.0"
+                return """vec4 effect(vec2 p) {
+                        float julia = """ + jul + """;
+                        float a = radians(p0.w); float ca = cos(a); float sa = sin(a);
+                        float q = clamp(floor(p0.z), 1.0, 5.0);
+                        float scale = 3.0 / (min(size.x, size.y) * (1.0 + p0.y / (julia > 0.5 ? 5.0 : 10.0)));
+                        vec4 acc = vec4(0.0, 0.0, 0.0, 0.0);
+                        float limit = 64.0 * max(p0.x, 1.0);
+                        for (int sy = 0; sy < 5; sy++) { for (int sx = 0; sx < 5; sx++) {
+                            if (float(sx) >= q || float(sy) >= q) { continue; }
+                            vec2 o = (p - 0.5 + (vec2(float(sx), float(sy)) + 0.5) / q - size.xy * 0.5) * scale;
+                            vec2 u = vec2(o.x * ca - o.y * sa, o.x * sa + o.y * ca);
+                            vec2 z = julia > 0.5 ? u : vec2(0.0, 0.0);
+                            vec2 cc = julia > 0.5 ? vec2(-0.7, 0.27015) : u - vec2(0.6, 0.0);
+                            float n = 0.0;
+                            for (int k = 0; k < 640; k++) { if (n >= limit || dot(z, z) >= 4.0) { break; }
+                                z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + cc; n += 1.0; }
+                            if (n < limit) { float k = n / limit; acc += vec4(hsv2rgb(vec3(fract(k * 3.0), 0.8, 1.0)), clamp(k * 8.0, 0.0, 1.0)); } } }
+                        acc /= q * q;
+                        return over(acc, at(p), 0.0); }"""
+            case _:
+                return "vec4 effect(vec2 p) { return at(p); }"

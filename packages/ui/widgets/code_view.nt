@@ -1,0 +1,912 @@
+# widgets/code_view — an editable view onto a TextEditor, as natiny's
+# editor's text edit: the gutter of line numbers, the line the caret is
+# on, the selection, the text coloured by the editor's language, the
+# caret blinking.  Only the lines in sight are drawn.  Typing, the caret
+# keys, the mouse (a press places the caret, a drag selects, a double
+# press selects a word, a press in the gutter a line), the wheel.  Tabs
+# are drawn to the next stop.  Undo and redo are the owner's commands;
+# what the clipboard holds goes through graphics.
+#
+# What an analysis of the code knows the view asks for (asked_*) and is
+# answered at once (show_*): the list of completion under the caret - its
+# keys Up, Down, Page Up, Page Down, Enter or Tab to take, Escape to shut;
+# a box at the pointer resting on a name, with the problems marked there;
+# the call's parameters over the caret, the one being written lit.
+
+from ui import CodeChoice, CodeGlyph, CodeView, ScrollBar
+from graphics import Align
+from window import Button, Cursor, Key
+from text import Pos, TokenKind
+from view import Layout
+import widgets.code_find
+
+extend CodeView:
+    scroll_x = 0.0
+    scroll_y = 0.0
+    # a drag from a press in the text or the gutter
+    dragging = false
+    by_line = false
+    line_anchor = 0
+    # when the caret last moved: it shows steadily for a while after
+    moved = 0.0
+    # the text the caret was at, last frame: a change shows it again
+    last_caret = Pos(-1, 0)
+    last_revision = -1
+    # the bars, as VS Code's: down the right edge (the caret's line marked
+    # on it), along the bottom under the text; the widest line in columns,
+    # counted again when the text changes
+    bar_y = &ScrollBar
+    bar_x = &ScrollBar
+    widest = 0
+    widest_revision = -1
+    # completion: the list open, its choices, the one chosen and the first
+    # in sight, where the word it completes starts; where it was drawn
+    choosing = false
+    choices = [CodeChoice]
+    chosen = 0
+    choice_top = 0
+    choice_line = 0
+    choice_start = 0
+    list_x = 0.0
+    list_y = 0.0
+    list_w = 0.0
+    list_h = 0.0
+    # the pointer resting: where, since when; the place asked about and
+    # what it is
+    rest_x = -1.0
+    rest_y = -1.0
+    rest_since = 0.0
+    hover_at = Pos(-1, 0)
+    hover_text = ""
+    # the glyphs left of the numbers, their column kept or not; the hover
+    # box saying a glyph's tip (not code)
+    glyph_column = false
+    glyphs = [CodeGlyph]
+    hover_plain = false
+    # the call being written: its label, the parameter at the caret
+    sig_text = ""
+    sig_a = 0
+    sig_b = 0
+
+    init(ui = &Ui, parent = &View, editor = &TextEditor):
+        self.ui = ui
+        self.editor = editor
+        self.bar_y = &ScrollBar(ui, true)
+        self.bar_x = &ScrollBar(ui, false)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_clip(true)
+        on self.view.draw():
+            self.draw()
+        on self.view.mouse_down():
+            self.press()
+        on self.view.double_click():
+            px, py = self.ui.pointer()
+            if self.finding and self.find_part_at(px, py) >= 0:
+                return
+            if not self.in_gutter():
+                self.editor.select_word(self.pos_at_pointer())
+                self.dragging = false
+
+    focus():
+        self.ui.views.set_focus(self.view)
+
+    # ─── What an analysis answers ───
+
+    show_completion(choices = [CodeChoice], start = 0):
+        if len(choices) == 0:
+            self.choosing = false
+            return
+        self.choices = choices
+        self.chosen = 0
+        self.choice_top = 0
+        self.choice_line = self.editor.caret.line
+        self.choice_start = start
+        self.choosing = true
+
+    show_hover(text = ""):
+        self.hover_text = text
+
+    show_signature(text = "", a = 0, b = 0):
+        self.sig_text = text
+        self.sig_a = a
+        self.sig_b = b
+
+    go_to(line = 0, col = 0):
+        self.editor.set_caret(self.editor.buffer.clamp(Pos(line, col)))
+        self.choosing = false
+        self.sig_text = ""
+        _, _, w, h = self.ui.rect(self.view)
+        # the place a third down the view (a view not laid out yet: as if
+        # it were a screen high), its start in sight
+        if h <= 0.0:
+            h = 900.0
+        self.scroll_y = max(0.0, float(line) * self.line_height() - h / 3.0)
+        cw = self.char_width()
+        x = float(self.display_col(self.editor.buffer.get_line(line), col)) * cw
+        self.scroll_x = 0.0 if w <= 0.0 or x < w * 0.6 else x - w * 0.3
+        self.clamp_scroll()
+
+    ask_completion(explicit = false):
+        c = self.editor.caret
+        emit asked_completion(c.line, c.col, explicit)
+
+    ask_signature():
+        c = self.editor.caret
+        emit asked_signature(c.line, c.col)
+
+    # the choice taken: in place of the word typed so far
+    accept():
+        if not self.choosing or self.chosen >= len(self.choices):
+            return
+        e = self.editor
+        c = self.choices[self.chosen]
+        caret = e.caret
+        self.choosing = false
+        if caret.line != self.choice_line or caret.col < self.choice_start:
+            return
+        e.set_caret(Pos(self.choice_line, self.choice_start))
+        e.set_caret(caret, true)
+        e.type(c.insert if c.insert != "" else c.label)
+
+    # the list's keys; true for one it took
+    choice_keys() -> bool:
+        w = self.ui.window
+        n = len(self.choices)
+        if n == 0:
+            self.choosing = false
+            return false
+        if w.input_get_key_pressed(Key.escape):
+            self.choosing = false
+            return true
+        if w.input_get_key_repeated(Key.down):
+            self.chosen = (self.chosen + 1) % n
+            return true
+        if w.input_get_key_repeated(Key.up):
+            self.chosen = (self.chosen + n - 1) % n
+            return true
+        if w.input_get_key_repeated(Key.page_down):
+            self.chosen = min(self.chosen + 8, n - 1)
+            return true
+        if w.input_get_key_repeated(Key.page_up):
+            self.chosen = max(self.chosen - 8, 0)
+            return true
+        if w.input_get_key_pressed(Key.enter) or w.input_get_key_pressed(Key.tab):
+            self.accept()
+            return true
+        return false
+
+    # ─── Measures ───
+
+    size() -> float:
+        return self.ui.theme.code_size
+
+    line_height() -> float:
+        return float(int(self.size() * self.ui.theme.code_line + 0.5))
+
+    char_width() -> float:
+        return self.ui.mono.measure_text(self.size(), "0").width
+
+    # how far the text goes down: the last line may scroll to the top
+    content_y() -> float:
+        _, _, _, h = self.ui.rect(self.view)
+        return float(self.editor.buffer.get_line_count() - 1) * self.line_height() + h
+
+    # how far it goes across: the widest line and room for the caret
+    content_x() -> float:
+        b = self.editor.buffer
+        if b.revision != self.widest_revision:
+            self.widest_revision = b.revision
+            self.widest = 0
+            for l in range(b.get_line_count()):
+                line = b.get_line(l)
+                self.widest = max(self.widest, self.display_col(line, len(line)))
+        return float(self.widest + 4) * self.char_width() + self.ui.theme.text_pad * 2.0
+
+    gutter_width() -> float:
+        digits = max(3, len(str(self.editor.buffer.get_line_count())))
+        return self.glyph_width() + float(digits) * self.char_width() + self.ui.theme.gutter_pad * 2.0
+
+    # the column of glyphs left of the numbers, 0 when off
+    glyph_width() -> float:
+        return 20.0 if self.glyph_column else 0.0
+
+    set_glyph_column(on = true):
+        self.glyph_column = on
+
+    set_glyphs(glyphs = [CodeGlyph]):
+        self.glyphs = glyphs
+
+    # the glyph on a line, none for none
+    glyph_at(line = 0) -> none(CodeGlyph):
+        for g in self.glyphs:
+            if g.line == line:
+                return g
+        return none
+
+    # the line under the pointer, -1 past the text
+    line_under_pointer() -> int:
+        _, py = self.view.get_pointer()
+        line = int((py + self.scroll_y - self.ui.theme.text_pad) / self.line_height() + 1000000.0) - 1000000
+        if line < 0 or line >= self.editor.buffer.get_line_count():
+            return -1
+        return line
+
+    # the pointer over the column of glyphs
+    in_glyphs() -> bool:
+        px, _ = self.view.get_pointer()
+        return self.glyph_column and px >= 0.0 and px < self.glyph_width()
+
+    # the column a character is drawn at: a tab goes to the next stop
+    display_col(line = "", col = 0) -> int:
+        if not ("\t" in line):
+            return col
+        d = 0
+        tab = self.editor.tab
+        for i, c in line.chars().enumerate():
+            if i >= col:
+                break
+            if c == char("\t"):
+                d = (d / tab + 1) * tab
+            else:
+                d += 1
+        return d
+
+    # the character column nearest a drawn column
+    col_of_display(line = "", target = 0) -> int:
+        d = 0
+        tab = self.editor.tab
+        for i, c in line.chars().enumerate():
+            next = (d / tab + 1) * tab if c == char("\t") else d + 1
+            if target < (d + next + 1) / 2:
+                return i
+            d = next
+        return len(line)
+
+    # ─── Input ───
+
+    update():
+        ui = self.ui
+        e = self.editor
+        x, y, w, h = ui.rect(self.view)
+        gutter = self.gutter_width()
+        self.scroll_y = self.bar_y.update(x, y, w, h, self.content_y(), h, self.scroll_y)
+        self.scroll_x = self.bar_x.update(x + gutter, y, w - gutter, h, self.content_x(), w - gutter, self.scroll_x)
+        # the wheel where the pointer is
+        if self.view.get_hovered():
+            wheel = self.ui.window.input_get_wheel_y()
+            if wheel != 0.0:
+                if self.ui.window.input_get_key_down(Key.shift):
+                    self.scroll_x -= wheel * self.char_width() * 8.0
+                    self.bar_x.wake()
+                else:
+                    self.scroll_y -= wheel * self.line_height() * ui.theme.wheel_lines
+                    self.bar_y.wake()
+                self.clamp_scroll()
+        # a drag selects
+        if self.dragging:
+            if not self.ui.window.input_get_mouse_button_down(Button.left):
+                self.dragging = false
+            else:
+                self.drag()
+        if self.view.get_focused():
+            was = self.finding
+            if self.finding and self.find_focus:
+                self.find_keys()
+            elif not self.find_text_keys(self.choosing or self.sig_text != "" or self.hover_text != ""):
+                self.keys()
+            # opened: the boxes over the text shut
+            if self.finding and not was:
+                self.choosing = false
+                self.sig_text = ""
+        if self.finding:
+            self.refresh_found(false)
+        else:
+            self.refresh_same()
+        if self.find_moved:
+            self.find_moved = false
+            self.reveal()
+        self.rest()
+        if e.buffer.revision != self.last_revision or not e.caret.same(self.last_caret):
+            if self.last_revision >= 0 or e.buffer.revision != self.last_revision:
+                self.moved = ui.time
+            self.last_revision = e.buffer.revision
+            self.last_caret = e.caret
+        self.clamp_scroll()
+
+    keys():
+        e = self.editor
+        ctrl = self.ui.window.input_get_key_down(Key.control)
+        shift = self.ui.window.input_get_key_down(Key.shift)
+        alt = self.ui.window.input_get_key_down(Key.alt)
+        if self.choosing and self.choice_keys():
+            self.reveal()
+            return
+        acted = false
+        before = e.caret
+        revision = e.buffer.revision
+        typed = ""
+        text = self.ui.window.input_get_text()
+        # AltGr is Ctrl+Alt: what it types is text
+        if text != "" and (not ctrl or alt):
+            e.type(text)
+            typed = text
+            acted = true
+        page = max(1, int(self.view_height() / self.line_height()) - 1)
+        if self.ui.window.input_get_key_repeated(Key.left):
+            e.move_left(ctrl, shift)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.right):
+            e.move_right(ctrl, shift)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.up):
+            if alt:
+                e.move_lines(-1)
+            else:
+                e.move_up(1, shift)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.down):
+            if alt:
+                e.move_lines(1)
+            else:
+                e.move_down(1, shift)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.page_up):
+            e.move_up(page, shift)
+            self.scroll_y -= float(page) * self.line_height()
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.page_down):
+            e.move_down(page, shift)
+            self.scroll_y += float(page) * self.line_height()
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.home):
+            if ctrl:
+                e.move_start(shift)
+            else:
+                e.move_home(shift)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.end):
+            if ctrl:
+                e.move_finish(shift)
+            else:
+                e.move_end(shift)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.backspace):
+            e.backspace(ctrl)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.delete):
+            if shift and not e.has_selection():
+                e.select_line(e.caret.line)
+                e.delete()
+            else:
+                e.delete(ctrl)
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.enter):
+            e.newline()
+            acted = true
+        if self.ui.window.input_get_key_repeated(Key.tab):
+            if shift:
+                e.outdent()
+            else:
+                e.indent()
+            acted = true
+        if ctrl:
+            if self.ui.window.input_get_key_pressed(Key.a):
+                e.select_all()
+                acted = true
+            if self.ui.window.input_get_key_pressed(Key.c):
+                self.ui.window.clipboard_set_text(e.copy())
+            if self.ui.window.input_get_key_pressed(Key.x):
+                self.ui.window.clipboard_set_text(e.cut())
+                acted = true
+            if self.ui.window.input_get_key_repeated(Key.v):
+                e.paste(self.ui.window.clipboard_get_text())
+                acted = true
+            if self.ui.window.input_get_key_repeated(Key.d):
+                e.duplicate_lines()
+                acted = true
+            if self.ui.window.input_get_key_pressed(Key.slash):
+                e.toggle_comment()
+                acted = true
+            if self.ui.window.input_get_key_pressed(Key.space):
+                if shift:
+                    self.ask_signature()
+                else:
+                    self.ask_completion(true)
+        if self.ui.window.input_get_key_pressed(Key.f12):
+            c = e.caret
+            emit asked_definition(c.line, c.col)
+        if self.ui.window.input_get_key_pressed(Key.escape):
+            self.choosing = false
+            self.sig_text = ""
+            self.hover_text = ""
+        if acted:
+            self.reveal()
+            self.after_edit(typed, before, revision)
+
+    # what follows an edit: completion as a name or a dot is typed - and a
+    # space or a comma, which the one answering may take as a place for a
+    # list (an import's names) - the call's parameters as its parentheses
+    # and commas are; a move shuts the list
+    after_edit(typed = "", before = Pos(), revision = 0):
+        e = self.editor
+        if typed != "":
+            cs = typed.chars()
+            last = cs[len(cs) - 1]
+            if last == char(".") or last == char("_") or last == char(" ") or last == char(",") or (last >= char("a") and last <= char("z")) or (last >= char("A") and last <= char("Z")) or (last >= char("0") and last <= char("9") and self.choosing):
+                self.ask_completion(false)
+            else:
+                self.choosing = false
+            if last == char("(") or last == char(",") or self.sig_text != "":
+                self.ask_signature()
+            return
+        if e.buffer.revision != revision:
+            # a deletion: the list follows the word, or shuts
+            if self.choosing:
+                if e.caret.line == self.choice_line and e.caret.col > self.choice_start:
+                    self.ask_completion(false)
+                else:
+                    self.choosing = false
+            if self.sig_text != "":
+                self.ask_signature()
+            return
+        if not e.caret.same(before):
+            self.choosing = false
+            if self.sig_text != "":
+                self.ask_signature()
+
+    # the pointer resting on a name: what it is, asked once
+    rest():
+        ui = self.ui
+        px, py = ui.pointer()
+        if px != self.rest_x or py != self.rest_y:
+            self.rest_x = px
+            self.rest_y = py
+            self.rest_since = ui.time
+            self.hover_at = Pos(-1, 0)
+            self.hover_text = ""
+            return
+        if self.hover_at.line >= 0 or self.dragging or ui.time - self.rest_since < 0.5:
+            return
+        # a glyph: what it says
+        if self.view.get_hovered() and self.in_glyphs():
+            line = self.line_under_pointer()
+            if g := self.glyph_at(line):
+                self.hover_at = Pos(line, 0)
+                self.hover_text = g.tip
+                self.hover_plain = true
+            return
+        if not self.view.get_hovered() or self.in_gutter():
+            return
+        at = self.place_under_pointer()
+        if at.line < 0:
+            return
+        self.hover_at = at
+        self.hover_text = ""
+        self.hover_plain = false
+        emit asked_hover(at.line, at.col)
+        marks = self.editor.marks_at(at)
+        if marks != "":
+            self.hover_text = marks if self.hover_text == "" else marks + "\n\n" + self.hover_text
+
+    # the character under the pointer (not the gap nearest it); line -1
+    # past a line's end
+    place_under_pointer() -> Pos:
+        px, py = self.view.get_pointer()
+        b = self.editor.buffer
+        line = int((py + self.scroll_y - self.ui.theme.text_pad) / self.line_height() + 1000000.0) - 1000000
+        if line < 0 or line >= b.get_line_count():
+            return Pos(-1, 0)
+        x = px - self.gutter_width() - self.ui.theme.text_pad + self.scroll_x
+        if x < 0.0:
+            return Pos(-1, 0)
+        target = int(x / self.char_width())
+        text = b.get_line(line)
+        col = self.col_of_display(text, target)
+        if col >= len(text.chars()):
+            return Pos(-1, 0)
+        return Pos(line, col)
+
+    press():
+        e = self.editor
+        self.ui.views.set_focus(self.view)
+        px0, py0 = self.ui.pointer()
+        # the find panel's, over the text; a press off it gives the keys
+        # back to the text
+        if self.find_press(px0, py0, self.size()):
+            if self.find_moved:
+                self.find_moved = false
+                self.reveal()
+            return
+        self.find_focus = false
+        # a choice of the list taken by a press
+        if self.choosing and px0 >= self.list_x and px0 < self.list_x + self.list_w and py0 >= self.list_y and py0 < self.list_y + self.list_h:
+            row = self.choice_top + int((py0 - self.list_y - 3.0) / self.line_height())
+            if row >= 0 and row < len(self.choices):
+                self.chosen = row
+                self.accept()
+            return
+        self.choosing = false
+        self.sig_text = ""
+        # the bars'
+        x, y, w, h = self.ui.rect(self.view)
+        px, py = self.ui.pointer()
+        gutter = self.gutter_width()
+        if self.bar_y.hit(px, py, x, y, w, h, self.content_y(), h) or self.bar_x.hit(px, py, x + gutter, y, w - gutter, h, self.content_x(), w - gutter):
+            return
+        if self.in_glyphs():
+            line = self.line_under_pointer()
+            if self.glyph_at(line) != none:
+                self.hover_text = ""
+                emit glyph_pressed(line)
+                return
+        if self.in_gutter():
+            line = self.pos_at_pointer().line
+            self.by_line = true
+            self.line_anchor = line
+            e.select_line(line)
+        else:
+            self.by_line = false
+            e.set_caret(self.pos_at_pointer(), self.ui.window.input_get_key_down(Key.shift))
+            # Ctrl+click: where the name was declared
+            if self.ui.window.input_get_key_down(Key.control):
+                at = self.place_under_pointer()
+                if at.line >= 0:
+                    emit asked_definition(at.line, at.col)
+                    return
+        self.dragging = true
+
+    drag():
+        e = self.editor
+        _, py = self.view.get_pointer()
+        lh = self.line_height()
+        # held past an edge: it scrolls toward the pointer
+        if py < 0.0:
+            self.scroll_y -= lh * 0.5
+        elif py > self.view_height():
+            self.scroll_y += lh * 0.5
+        self.clamp_scroll()
+        at = self.pos_at_pointer()
+        if self.by_line:
+            n = e.buffer.get_line_count()
+            if at.line >= self.line_anchor:
+                end = Pos(at.line + 1, 0) if at.line + 1 < n else Pos(at.line, e.buffer.get_length(at.line))
+                e.set_caret(Pos(self.line_anchor, 0))
+                e.set_caret(end, true)
+            else:
+                e.set_caret(Pos(self.line_anchor + 1, 0) if self.line_anchor + 1 < n else Pos(self.line_anchor, e.buffer.get_length(self.line_anchor)))
+                e.set_caret(Pos(at.line, 0), true)
+        else:
+            e.set_caret(at, true)
+
+    # ─── Inside ───
+
+    in_gutter() -> bool:
+        px, _ = self.view.get_pointer()
+        return px < self.gutter_width()
+
+    view_height() -> float:
+        _, _, _, h = self.ui.rect(self.view)
+        return h
+
+    pos_at_pointer() -> Pos:
+        px, py = self.view.get_pointer()
+        b = self.editor.buffer
+        line = int((py + self.scroll_y - self.ui.theme.text_pad) / self.line_height() + 1000000.0) - 1000000
+        if line < 0:
+            return Pos(0, 0)
+        if line >= b.get_line_count():
+            last = b.get_line_count() - 1
+            return Pos(last, b.get_length(last))
+        x = px - self.gutter_width() - self.ui.theme.text_pad + self.scroll_x
+        target = int(x / self.char_width() + 0.5)
+        return Pos(line, self.col_of_display(b.get_line(line), max(0, target)))
+
+    clamp_scroll():
+        lh = self.line_height()
+        most_y = max(0.0, float(self.editor.buffer.get_line_count() - 1) * lh)
+        self.scroll_y = clamp(self.scroll_y, 0.0, most_y)
+        self.scroll_x = max(0.0, self.scroll_x)
+
+    # the caret in sight
+    reveal():
+        _, _, w, h = self.ui.rect(self.view)
+        t = self.ui.theme
+        e = self.editor
+        lh = self.line_height()
+        top = float(e.caret.line) * lh
+        if top < self.scroll_y:
+            self.scroll_y = top
+        elif top + lh + t.text_pad * 2.0 > self.scroll_y + h:
+            self.scroll_y = top + lh + t.text_pad * 2.0 - h
+        cw = self.char_width()
+        x = float(self.display_col(e.buffer.get_line(e.caret.line), e.caret.col)) * cw
+        room = w - self.gutter_width() - t.text_pad * 2.0
+        if x < self.scroll_x:
+            self.scroll_x = max(0.0, x - cw * 4.0)
+        elif x > self.scroll_x + room:
+            self.scroll_x = x - room + cw * 4.0
+        self.clamp_scroll()
+
+    color_of(kind = TokenKind.plain) -> int:
+        t = self.ui.theme
+        match kind:
+            case TokenKind.keyword:
+                return t.code_keyword
+            case TokenKind.type:
+                return t.code_type
+            case TokenKind.function:
+                return t.code_function
+            case TokenKind.number:
+                return t.code_number
+            case TokenKind.string:
+                return t.code_string
+            case TokenKind.comment:
+                return t.code_comment
+            case TokenKind.directive:
+                return t.code_directive
+            case TokenKind.punctuation:
+                return t.code_punctuation
+            case TokenKind.property:
+                return t.code_property
+            case TokenKind.invalid:
+                return t.code_invalid
+            case TokenKind.variable:
+                return t.code_variable
+            case TokenKind.parameter:
+                return t.code_parameter
+            case TokenKind.method:
+                return t.code_method
+            case TokenKind.member:
+                return t.code_member
+            case TokenKind.module:
+                return t.code_module
+            case TokenKind.constant:
+                return t.code_constant
+            case TokenKind.interface_:
+                return t.code_interface
+            case TokenKind.enum_:
+                return t.code_enum
+            case _:
+                return t.ink
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        g = ui.graphics
+        e = self.editor
+        b = e.buffer
+        x, y, w, h = ui.rect(self.view)
+        lh = self.line_height()
+        cw = self.char_width()
+        size = self.size()
+        gutter = self.gutter_width()
+        ui.fill(x, y, w, h, t.editor)
+        if self.view.get_hovered() or self.dragging:
+            ui.want_cursor(Cursor.text)
+        text_x = x + gutter + t.text_pad - self.scroll_x
+        top = y + t.text_pad - self.scroll_y
+        first = max(0, int(self.scroll_y / lh) - 1)
+        last = min(b.get_line_count(), int((self.scroll_y + h) / lh) + 2)
+        sa, sb = e.get_selection()
+        selecting = e.has_selection()
+        focused = self.view.get_focused()
+        # the line the caret is on
+        if not selecting:
+            ui.fill(x, top + float(e.caret.line) * lh, w, lh, t.current_line)
+        dy = (lh - size) * 0.5
+        for l in range(first, last):
+            line = b.get_line(l)
+            ly = top + float(l) * lh
+            # the selection over this line
+            if selecting and l >= sa.line and l <= sb.line:
+                c0 = self.display_col(line, sa.col) if l == sa.line else 0
+                c1 = self.display_col(line, sb.col) if l == sb.line else self.display_col(line, len(line)) + 1
+                if c1 > c0:
+                    ui.fill(text_x + float(c0) * cw, ly, float(c1 - c0) * cw, lh, t.selection)
+            # what is found, or what holds the selected text
+            self.draw_found(l, line, text_x, ly, cw, lh)
+            # the text, run by run
+            shown = line
+            if "	" in line:
+                shown = self.expand(line)
+            for s in e.highlight.spans(b, l):
+                d0 = self.display_col(line, s.start)
+                d1 = self.display_col(line, s.end)
+                sx = text_x + float(d0) * cw
+                if sx > x + w or sx + float(d1 - d0) * cw < x + gutter:
+                    continue
+                g.render_set_color(ui.color(self.color_of(s.kind)))
+                g.render_text(self.ui.mono, size, sx, ly + dy, shown.slice(d0, d1))
+        # the problems, a wave under each
+        for m in e.marks:
+            if m.line < first or m.line >= last:
+                continue
+            line = b.get_line(m.line)
+            d0 = self.display_col(line, m.start)
+            d1 = max(self.display_col(line, m.end), d0 + 1)
+            self.wave(text_x + float(d0) * cw, top + float(m.line + 1) * lh - 3.0, float(d1 - d0) * cw, t.error if m.error else t.warning)
+        # the caret, steady while it moves, blinking after
+        if focused:
+            since = ui.time - self.moved
+            if since < t.blink or int(since / t.blink) % 2 == 0:
+                line = b.get_line(e.caret.line)
+                cx = text_x + float(self.display_col(line, e.caret.col)) * cw
+                if cx >= x + gutter - 1.0:
+                    ui.fill(cx - 1.0, top + float(e.caret.line) * lh + 1.0, t.caret_width, lh - 2.0, t.caret)
+        # the gutter over what scrolled under it
+        ui.fill(x, y, gutter, h, t.editor)
+        for l in range(first, last):
+            ink = t.ink_soft if l == e.caret.line else t.ink_faint
+            ui.text(x, top + float(l) * lh, gutter - t.gutter_pad, lh, str(l + 1), ink, Align.right + Align.middle, size * 0.82)
+        # a line with a problem: a dot in the gutter, after the glyphs
+        gw = self.glyph_width()
+        for m in e.marks:
+            if m.line >= first and m.line < last:
+                ui.circle(x + gw + 6.0, top + float(m.line) * lh + lh * 0.5, 3.0, t.error if m.error else t.warning)
+        for gl in self.glyphs:
+            if gl.line >= first and gl.line < last:
+                gy = top + float(gl.line) * lh
+                over = self.in_glyphs() and self.view.get_hovered() and self.line_under_pointer() == gl.line
+                if over:
+                    ui.want_cursor(Cursor.hand)
+                ui.icon(gl.icon, x + 3.0, gy + (lh - 14.0) * 0.5, 14.0, t.ink if over else t.ink_muted)
+        self.bar_y.draw(x, y, w, h, self.content_y(), h, self.scroll_y, float(e.caret.line) * lh)
+        self.bar_x.draw(x + gutter, y, w - gutter, h, self.content_x(), w - gutter, self.scroll_x)
+        # the find panel at the text's top right (clear of the scroll bar),
+        # then the boxes over it all
+        fw, _ = self.find_size()
+        self.draw_find(max(x + gutter + 8.0, x + w - fw - 22.0), y + 6.0, size)
+        if self.sig_text != "":
+            self.draw_signature(text_x, top, x, y, w)
+        if self.choosing:
+            self.draw_choices(text_x, top, x, y, w, h)
+        if self.hover_text != "" and not self.choosing:
+            self.draw_hover(x, y, w, h)
+
+    # a wavy line under a problem
+    wave(x = 0.0, y = 0.0, w = 0.0, rgb = 0):
+        step = 3.0
+        at = 0.0
+        up = true
+        while at < w:
+            seg = min(step, w - at)
+            self.ui.line(x + at, y + (0.0 if up else 2.0), x + at + seg, y + (2.0 if up else 0.0), rgb, 1.0)
+            at += step
+            up = not up
+
+    # the list of completion under the word, or over it when there is no
+    # room below; the doc of the one chosen beside it
+    draw_choices(text_x = 0.0, top = 0.0, x = 0.0, y = 0.0, w = 0.0, h = 0.0):
+        ui = self.ui
+        t = ui.theme
+        g = ui.graphics
+        e = self.editor
+        lh = self.line_height()
+        cw = self.char_width()
+        size = self.size()
+        rows = min(len(self.choices), 10)
+        if self.chosen < self.choice_top:
+            self.choice_top = self.chosen
+        if self.chosen >= self.choice_top + rows:
+            self.choice_top = self.chosen - rows + 1
+        widest = 12
+        for c in self.choices:
+            widest = max(widest, len(c.label.chars()) + len(c.detail.chars()) / 2 + 6)
+        bw = min(float(widest) * cw + 24.0, max(w * 0.6, 260.0))
+        bh = float(rows) * lh + 6.0
+        line = e.buffer.get_line(self.choice_line)
+        bx = text_x + float(self.display_col(line, self.choice_start)) * cw - 22.0
+        by = top + float(self.choice_line + 1) * lh
+        if by + bh > y + h and top + float(self.choice_line) * lh - bh > y:
+            by = top + float(self.choice_line) * lh - bh
+        bx = clamp(bx, x + 2.0, max(x + 2.0, x + w - bw - 2.0))
+        self.list_x = bx
+        self.list_y = by
+        self.list_w = bw
+        self.list_h = bh
+        ui.fill_round(bx, by, bw, bh, 4.0, t.popup)
+        ui.outline_round(bx, by, bw, bh, 4.0, t.popup_edge, 1.0)
+        dy = (lh - size) * 0.5
+        for r in range(rows):
+            i = self.choice_top + r
+            if i >= len(self.choices):
+                break
+            c = self.choices[i]
+            ry = by + 3.0 + float(r) * lh
+            if i == self.chosen:
+                ui.fill(bx + 2.0, ry, bw - 4.0, lh, t.popup_on)
+            ui.fill_round(bx + 8.0, ry + lh * 0.5 - 4.0, 8.0, 8.0, 2.0, self.color_of(c.kind))
+            g.render_set_color(ui.color(t.ink))
+            g.render_text(ui.mono, size, bx + 22.0, ry + dy, c.label)
+            if c.detail != "":
+                lw = float(len(c.label.chars()) + 2) * cw
+                ui.text(bx + 22.0 + lw, ry, bw - 30.0 - lw, lh, c.detail, t.ink_faint, Align.right + Align.middle, t.small)
+        # the doc of the one chosen
+        if self.chosen < len(self.choices):
+            c = self.choices[self.chosen]
+            if c.doc.strip() != "" or len(c.detail.chars()) > 30:
+                text = c.detail + "\n" + c.doc.strip() if c.detail != "" else c.doc.strip()
+                self.draw_box(text, bx + bw + 4.0, by, x, y, w, h, false)
+
+    # the call's label over the caret's line, its parameter lit
+    draw_signature(text_x = 0.0, top = 0.0, x = 0.0, y = 0.0, w = 0.0):
+        ui = self.ui
+        t = ui.theme
+        g = ui.graphics
+        e = self.editor
+        lh = self.line_height()
+        cw = self.char_width()
+        size = self.size()
+        cs = self.sig_text.chars()
+        bw = float(len(cs)) * cw + 16.0
+        bh = lh + 6.0
+        line = e.buffer.get_line(e.caret.line)
+        bx = clamp(text_x + float(self.display_col(line, e.caret.col)) * cw - 16.0, x + 2.0, max(x + 2.0, x + w - bw - 2.0))
+        by = top + float(e.caret.line) * lh - bh - 2.0
+        if by < y:
+            by = top + float(e.caret.line + 1) * lh + 2.0
+        ui.fill_round(bx, by, bw, bh, 4.0, t.popup)
+        ui.outline_round(bx, by, bw, bh, 4.0, t.popup_edge, 1.0)
+        dy = 3.0 + (lh - size) * 0.5
+        a = clamp(self.sig_a, 0, len(cs))
+        b = clamp(self.sig_b, a, len(cs))
+        g.render_set_color(ui.color(t.ink_soft))
+        g.render_text(ui.mono, size, bx + 8.0, by + dy, self.sig_text.slice(0, a))
+        g.render_set_color(ui.color(t.accent))
+        g.render_text(ui.mono, size, bx + 8.0 + float(a) * cw, by + dy, self.sig_text.slice(a, b))
+        g.render_set_color(ui.color(t.ink_soft))
+        g.render_text(ui.mono, size, bx + 8.0 + float(b) * cw, by + dy, self.sig_text.slice(b, len(cs)))
+
+    # what the name rested on is, under the pointer
+    draw_hover(x = 0.0, y = 0.0, w = 0.0, h = 0.0):
+        px, py = self.ui.pointer()
+        self.draw_box(self.hover_text, px + 4.0, py + 18.0, x, y, w, h, not self.hover_plain)
+
+    # a box of lines at bx, by, kept in the view; the first line as code
+    draw_box(text = "", bx = 0.0, by = 0.0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, code_first = true):
+        ui = self.ui
+        t = ui.theme
+        g = ui.graphics
+        lines = text.split("\n")
+        lh = t.small * 1.5
+        cw = self.char_width()
+        bw = 40.0
+        for i, l in lines.enumerate():
+            width = float(len(l.chars())) * cw if i == 0 and code_first else ui.measure(l, t.small)
+            bw = max(bw, width + 20.0)
+        bw = min(bw, max(w - 8.0, 120.0))
+        bh = float(len(lines)) * lh + 10.0
+        if code_first:
+            bh += 4.0
+        left = clamp(bx, x + 2.0, max(x + 2.0, x + w - bw - 2.0))
+        up = by
+        if up + bh > y + h:
+            up = max(y + 2.0, by - bh - 24.0)
+        ui.fill_round(left, up, bw, bh, 4.0, t.popup)
+        ui.outline_round(left, up, bw, bh, 4.0, t.popup_edge, 1.0)
+        at = up + 5.0
+        for i, l in lines.enumerate():
+            if i == 0 and code_first:
+                g.render_set_color(ui.color(t.ink))
+                g.render_text(ui.mono, self.size() * 0.9, left + 10.0, at + 2.0, l)
+                at += lh + 4.0
+            else:
+                ui.text(left + 10.0, at, bw - 20.0, lh, l, t.ink_soft, Align.left + Align.middle, t.small)
+                at += lh
+
+    # a line with its tabs as spaces to the next stop
+    expand(line = "") -> str:
+        out = ""
+        d = 0
+        tab = self.editor.tab
+        for c in line.chars():
+            if c == char("\t"):
+                n = (d / tab + 1) * tab - d
+                for _ in range(n):
+                    out = out + " "
+                d += n
+            else:
+                out = out + str(c)
+                d += 1
+        return out

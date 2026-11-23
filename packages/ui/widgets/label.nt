@@ -1,0 +1,24 @@
+# widgets/label — a line of text, as tall as a row, as wide as the text.
+
+from ui import Label
+from graphics import Align
+from view import Layout
+
+extend Label:
+    init(ui = &Ui, parent = &View, text = "", rgb = -1, size = 0.0, align = 0):
+        self.ui = ui
+        self.rgb = rgb if rgb >= 0 else ui.theme.ink
+        self.size = size
+        self.align = align
+        self.view = ui.create(Layout.free, parent)
+        self.set_text(text)
+        on self.view.draw():
+            x, y, w, h = self.ui.rect(self.view)
+            self.ui.text(x, y, w, h, self.text, self.rgb, self.align + Align.middle, self.size)
+
+    set_text(text = ""):
+        self.text = text
+        self.view.set_min_size(self.ui.measure(text, self.size), self.ui.theme.row)
+
+    set_color(rgb = 0):
+        self.rgb = rgb

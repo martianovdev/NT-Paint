@@ -1,0 +1,64 @@
+# document/layer — a layer: its pixels on the GPU (a surface the size of
+# the picture), its name, whether it shows, its opacity and blend mode.
+
+from graphics import Surface
+from imaging import BlendMode
+
+Layer:
+    name = ""
+    visible = true
+    opacity = 255
+    mode = BlendMode.normal
+    pdn_background = false
+    pdn_metadata = [(str, str)]
+    surface = &Surface
+
+    init(surface = &Surface, name = "", visible = true, opacity = 255, mode = BlendMode.normal, background = false, metadata = [(str, str)]):
+        self.name = name
+        self.surface = surface
+        self.visible = visible
+        self.opacity = opacity
+        self.mode = mode
+        self.pdn_background = background
+        self.pdn_metadata = metadata
+
+    set_name(name = ""):
+        self.name = name
+
+    set_visible(visible = true):
+        self.visible = visible
+
+    set_opacity(opacity = 255):
+        self.opacity = clamp(opacity, 0, 255)
+
+    set_mode(mode = BlendMode.normal):
+        self.mode = mode
+
+    set_surface(surface = &Surface):
+        self.surface = surface
+
+    state() -> LayerState:
+        return LayerState(self.name, self.surface, self.visible, self.opacity, self.mode, self.pdn_background, self.pdn_metadata)
+
+    with_surface(surface = &Surface) -> &Layer:
+        return &Layer(surface, self.name, self.visible, self.opacity, self.mode, self.pdn_background, self.pdn_metadata)
+
+# what a layer was at a step of history: its surface is shared, not copied
+# (pixel steps keep what they change themselves)
+LayerState:
+    name = ""
+    surface = none(&Surface)
+    visible = true
+    opacity = 255
+    mode = BlendMode.normal
+    pdn_background = false
+    pdn_metadata = [(str, str)]
+
+    init(name = "", surface = none(&Surface), visible = true, opacity = 255, mode = BlendMode.normal, background = false, metadata = [(str, str)]):
+        self.name = name
+        self.surface = surface
+        self.visible = visible
+        self.opacity = opacity
+        self.mode = mode
+        self.pdn_background = background
+        self.pdn_metadata = metadata

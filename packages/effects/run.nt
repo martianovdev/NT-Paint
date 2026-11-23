@@ -1,0 +1,136 @@
+# run — an effect carried out: the blur some effects start from made in
+# two passes (across, then down, into premultiplied surfaces kept between
+# calls), then the effect's own pass from src into dst through the
+# selection.
+
+from effects import Effects
+from shaders import FxShaders
+from imaging import Gpu
+from graphics import Filter, Surface, Texture, Wrap
+
+extend Effects:
+    apply(gpu = &Gpu, dst = &Surface, src = &Surface, id = "", values = [float], r = Rect(), sel = none(&Texture), primary = 0, secondary = 0):
+        v = [float]
+        if info := Effects.find(id):
+            for i, p in info.params.enumerate():
+                v.push(values[i] if i < len(values) else p.value)
+        for _ in range(8):
+            v.push(0.0)
+        box = r.clip(src.get_width(), src.get_height())
+        if box.empty():
+            return
+        p0 = [v[0], v[1], v[2], v[3]]
+        p1 = [v[4], v[5], v[6], v[7]]
+        c0 = Colors4.of(primary)
+        c1 = Colors4.of(secondary)
+        aux = none(&Texture)
+        match id:
+            case "gaussian_blur":
+                aux = Blurs.make(gpu, src, v[0])
+            case "unfocus":
+                aux = Blurs.make(gpu, src, v[0] * 1.2)
+            case "glow":
+                aux = Blurs.make(gpu, src, v[0])
+            case "sharpen":
+                aux = Blurs.make(gpu, src, v[0] * 0.5)
+            case "soften_portrait":
+                aux = Blurs.make(gpu, src, v[0] * 1.5)
+            case "pencil_sketch":
+                aux = Blurs.make(gpu, src, v[0] * 2.0)
+            case "drop_shadow":
+                aux = Blurs.make(gpu, src, v[2])
+            case "radial_blur", "zoom_blur":
+                # the angle (amount) behind the centre in p0.yz
+                p1 = [v[0], 0.0, 0.0, 0.0]
+                p0 = [0.0, v[1], v[2], 0.0]
+            case "levels":
+                p0 = [v[0], v[1], v[0], v[1]]
+                p1 = [v[0], v[1], v[2], 0.0]
+                c1 = [v[3], v[4], 0.0, 0.0]
+            case "auto_level":
+                # its six numbers come in values (Effects.levels_of)
+                p0 = [v[0], v[1], v[2], v[3]]
+                p1 = [v[4], v[5], 1.0, 0.0]
+                c1 = [0.0, 255.0, 0.0, 0.0]
+                if len(values) < 6:
+                    p0 = [0.0, 255.0, 0.0, 255.0]
+                    p1 = [0.0, 255.0, 1.0, 0.0]
+            case _:
+                pass
+        m = gpu.material("fx_" + id, FxShaders.common() + FxShaders.body(id) + FxShaders.main(), true, true)
+        m.set_texture("src", src.get_texture(), Filter.nearest, Filter.nearest)
+        m.set_wrap("src", Wrap.clamp)
+        smooth = Filter.linear
+        m.set_texture("aux", aux.or(src.get_texture()), smooth, smooth)
+        m.set_wrap("aux", Wrap.clamp)
+        m.set_texture("sel", sel.or(gpu.everything()), Filter.nearest, Filter.nearest)
+        m.set_constant("p0", p0[0], p0[1], p0[2], p0[3])
+        m.set_constant("p1", p1[0], p1[1], p1[2], p1[3])
+        m.set_constant("c0", c0[0], c0[1], c0[2], c0[3])
+        m.set_constant("c1", c1[0], c1[1], c1[2], c1[3])
+        gpu.run(dst, m, float(box.x), float(box.y), float(box.w), float(box.h))
+
+    levels_of(b = Bitmap(), r = Rect()) -> [float]:
+        c = r.clip(b.width, b.height)
+        hist = [int]
+        for _ in range(256 * 3):
+            hist.push(0)
+        px = b.pixels
+        total = 0
+        for y in range(c.y, c.y + c.h):
+            i = (y * b.width + c.x) * 4
+            for _ in range(c.w):
+                if px[i + 3] != u8(0):
+                    hist[int(px[i])] += 1
+                    hist[256 + int(px[i + 1])] += 1
+                    hist[512 + int(px[i + 2])] += 1
+                    total += 1
+                i += 4
+        out = [float]
+        cut = total / 1000
+        for ch in range(3):
+            lo = 0
+            s = 0
+            while lo < 255 and s + hist[ch * 256 + lo] <= cut:
+                s += hist[ch * 256 + lo]
+                lo += 1
+            hi = 255
+            s = 0
+            while hi > 0 and s + hist[ch * 256 + hi] <= cut:
+                s += hist[ch * 256 + hi]
+                hi -= 1
+            if hi <= lo:
+                lo = 0
+                hi = 255
+            out.push(float(lo))
+            out.push(float(hi))
+        return out
+
+# a colour's four channels 0…1
+Colors4:
+    of(c = 0) -> [float]:
+        return [float((c >> 16) & 255) / 255.0, float((c >> 8) & 255) / 255.0, float(c & 255) / 255.0, float((c >> 24) & 255) / 255.0]
+
+# a gaussian of src in two passes, premultiplied; the surfaces kept for
+# the next time (a dialog's preview blurs on every change)
+Blurs:
+    make(gpu = &Gpu, src = &Surface, radius = 0.0) -> none(&Texture):
+        w = src.get_width()
+        h = src.get_height()
+        across = gpu.surface(w, h)
+        down = gpu.surface(w, h)
+        m = gpu.material("fx_blur", FxShaders.blur())
+        sigma = max(radius / 3.0 * 1.5, 0.3)
+        step = max(1.0, sigma * 3.0 / 48.0)
+        m.set_texture("src", src.get_texture(), Filter.linear, Filter.linear)
+        m.set_wrap("src", Wrap.clamp)
+        m.set_constant("dir", 1.0, 0.0, sigma, step)
+        m.set_constant("opt", 1.0, 0.0)
+        gpu.run(across, m, 0.0, 0.0, float(w), float(h))
+        m2 = gpu.material("fx_blur2", FxShaders.blur())
+        m2.set_texture("src", across.get_texture(), Filter.linear, Filter.linear)
+        m2.set_wrap("src", Wrap.clamp)
+        m2.set_constant("dir", 0.0, 1.0, sigma, step)
+        m2.set_constant("opt", 0.0, 0.0)
+        gpu.run(down, m2, 0.0, 0.0, float(w), float(h))
+        return down.get_texture()

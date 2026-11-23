@@ -1,0 +1,54 @@
+# widgets/tool_button — a toolbar's square: its command's icon, held when
+# on, dim when the command cannot run; a click runs the command.
+
+from ui import Icon, ToolButton
+from window import Cursor
+from view import Layout
+
+extend ToolButton:
+    seen = -1
+    init(ui = &Ui, parent = &View, command = &Command):
+        self.ui = ui
+        self.command = command
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_min_size(26.0, 24.0)
+        self.view.set_max_size(26.0, 24.0)
+        on self.view.draw():
+            self.draw()
+        on self.view.click():
+            self.command.trigger()
+
+    set_on(on = true):
+        if self.on != on:
+            self.on = on
+            self.view.render_once()
+
+    feedback():
+        c = self.command
+        if self.seen != c.revision:
+            self.seen = c.revision
+            self.view.render_once()
+        if self.view.get_hovered():
+            self.ui.tip(c.get_hint())
+            if c.enabled:
+                self.ui.want_cursor(Cursor.hand)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        if self.on:
+            ui.fill_round(x, y, w, h, t.radius, t.row_on)
+        elif self.command.enabled and self.view.get_hovered():
+            ui.fill_round(x, y, w, h, t.radius, t.hover)
+        tint = t.ink_soft
+        if self.command.icon >= Icon.tool_rect_select:
+            # paint.net's own colours; dim when it cannot run
+            tint = -1 if self.command.enabled else 0x5A5A5A
+        elif self.on:
+            tint = t.accent
+        elif not self.command.enabled:
+            tint = t.ink_faint
+        if self.on:
+            ui.outline_round(x, y, w, h, t.radius, t.field_edge)
+        ui.icon(self.command.icon, x + (w - 16.0) * 0.5, y + (h - 16.0) * 0.5, 16.0, tint)

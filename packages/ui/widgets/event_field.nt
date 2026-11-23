@@ -1,0 +1,55 @@
+# widgets/event_field — a name typed in a field with a button after it,
+# as natiny's editor drew a signal's row: the method an event calls, and
+# the button that adds it (a plus) or goes to it (open).
+
+from ui import EventField, Icon, TextField
+from window import Cursor
+from view import Layout, View
+
+extend EventField:
+    field = &TextField
+    button = &View
+    icon = Icon.plus
+    icon_size = 16.0
+
+    init(ui = &Ui, parent = &View, name = ""):
+        self.ui = ui
+        t = ui.theme
+        self.view = ui.create(Layout.horizontal, parent)
+        self.view.set_expand(true)
+        self.view.set_gap(2.0, 0.0)
+        self.field = &TextField(ui, self.view, name)
+        self.button = ui.create(Layout.free, self.view)
+        on self.field.committed(text = ""):
+            emit committed(text)
+        self.button.set_min_size(t.field_height, t.field_height)
+        on self.button.draw():
+            self.draw_button()
+        on self.button.click():
+            emit pressed()
+
+    set_text(text = ""):
+        self.field.set_text(text)
+
+    set_icon(icon = Icon.plus, size = 16.0):
+        self.icon = icon
+        self.icon_size = size
+
+    get_editing() -> bool:
+        return self.field.get_editing()
+
+    update():
+        self.field.update()
+
+    # ─── Inside ───
+
+    draw_button():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.button)
+        hot = self.button.get_hovered()
+        ui.fill_round(x, y, w, h, t.radius, t.button_hot if hot else t.button)
+        if hot:
+            ui.want_cursor(Cursor.hand)
+        s = self.icon_size
+        ui.icon(self.icon, x + (w - s) * 0.5, y + (h - s) * 0.5, s, t.ink if hot else t.ink_muted)

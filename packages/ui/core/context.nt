@@ -1,0 +1,269 @@
+# core/context — the Ui: the root of the window's views and the drawing
+# every widget does through it.
+
+from ui import Ui
+from graphics import Align, Color, Colors, Material
+from window import Button, Cursor
+from view import Layout, RenderMode, Views
+
+extend Ui:
+    # the colour gradients' materials, made the first time one is drawn
+    gradients = [&Material]
+    # frames run, and the last frame a field typed into holds the keys
+    frames = 0
+    held_until = -1
+    cursor_held = false
+    wheel_taken = false
+    # the tooltip: asked for this frame, the one the pointer rests on and
+    # since when (a press hides it until the pointer moves to another)
+    tip_now = ""
+    tip_key = ""
+    tip_since = 0.0
+    tip_pressed = false
+    init(graphics = &Graphics, window = &Window, font = &Font, mono = &Font):
+        self.mono = mono
+        self.graphics = graphics
+        self.window = window
+        self.views = &Views(graphics, window)
+        self.font = font
+        v = self.views
+        self.root = v.create(Layout.free)
+        self.content = v.create(Layout.vertical)
+        self.layer = v.create(Layout.free)
+        self.content.set_expand(true)
+        self.layer.set_expand(true)
+        # the layer lets the pointer through to the content: only what
+        # opens in it catches it
+        self.layer.set_pickable(false)
+        self.content.set_parent(self.root)
+        self.layer.set_parent(self.root)
+
+    create(layout = Layout.free, parent = none(&View)) -> &View:
+        made = self.views.create(layout)
+        if p := parent:
+            made.set_parent(p)
+        return made
+
+    cache(view = &View):
+        view.set_surface(true)
+        view.set_render_mode(RenderMode.events)
+
+    frame(dt = 0.0, w = 0.0, h = 0.0):
+        self.time += dt
+        self.frames += 1
+        self.cursor = Cursor.arrow
+        self.cursor_held = false
+        self.wheel_taken = false
+        self.views.update(self.root, 0.0, 0.0, w, h)
+
+    render(w = 0.0, h = 0.0):
+        self.views.render(self.root, 0.0, 0.0, w, h)
+        self.draw_tip(w, h)
+        self.window.cursor_set(self.cursor)
+
+    tip(text = ""):
+        self.tip_now = text
+
+    # over everything, under the pointer to its right
+    draw_tip(w = 0.0, h = 0.0):
+        now = self.tip_now
+        self.tip_now = ""
+        win = self.window
+        if now != self.tip_key:
+            self.tip_key = now
+            self.tip_since = self.time
+            self.tip_pressed = false
+        if win.input_get_mouse_button_down(Button.left) or win.input_get_mouse_button_down(Button.right):
+            self.tip_pressed = true
+        if now == "" or self.tip_pressed or self.time - self.tip_since < 0.5:
+            return
+        t = self.theme
+        px, py = self.pointer()
+        tw = self.measure(now, t.small) + 16.0
+        th = 24.0
+        x = clamp(px + 12.0, 2.0, max(w - tw - 2.0, 2.0))
+        y = py + 22.0
+        if y + th > h - 2.0:
+            y = py - th - 6.0
+        self.fill_round(x + 1.0, y + 2.0, tw, th, 5.0, 0x000000, 0.35)
+        self.fill_round(x, y, tw, th, 5.0, t.popup)
+        self.outline_round(x, y, tw, th, 5.0, t.popup_edge)
+        self.text(x + 8.0, y, tw - 12.0, th, now, t.ink, Align.left + Align.middle, t.small)
+
+    gradient(mode = 0, x = 0.0, y = 0.0, w = 0.0, h = 0.0, hue = 0.0, tint = Color(), radius = 0.0):
+        g = self.graphics
+        if len(self.gradients) == 0:
+            shader = g.shader_load(Gradients.source())
+            for _ in range(5):
+                self.gradients.push(g.material_create(shader))
+        m = self.gradients[clamp(mode, 0, 4)]
+        m.set_constant("params", float(mode), hue, 0.0, 0.0)
+        m.set_constant("tint", tint.r, tint.g, tint.b, tint.a)
+        g.material_bind(m)
+        g.render_set_color(Color(1.0, 1.0, 1.0, 1.0))
+        if radius > 0.0:
+            g.render_rounded_rectangle(x, y, w, h, radius, radius, radius, radius)
+        else:
+            g.render_rectangle(x, y, w, h)
+        g.material_unbind()
+
+    set_code_size(size = 0.0):
+        self.theme.set_code_size(size)
+
+    hold_keys():
+        self.held_until = self.frames + 1
+
+    get_keys_held() -> bool:
+        return self.frames <= self.held_until
+
+    want_cursor(cursor = Cursor.arrow, held = false):
+        if held or not self.cursor_held:
+            self.cursor = cursor
+            self.cursor_held = held
+
+    take_wheel() -> float:
+        if self.wheel_taken:
+            return 0.0
+        wheel = self.window.input_get_wheel_y()
+        self.wheel_taken = wheel != 0.0
+        return wheel
+
+    wheel_steps() -> int:
+        wheel = self.take_wheel()
+        if wheel > 0.0:
+            return max(1, int(wheel))
+        if wheel < 0.0:
+            return min(-1, int(wheel))
+        return 0
+
+    rect(view = &View) -> (float, float, float, float):
+        return view.get_rect()
+
+    pointer() -> (float, float):
+        return float(self.window.input_get_mouse_x()), float(self.window.input_get_mouse_y())
+
+    over(view = &View) -> bool:
+        px, py = self.pointer()
+        x, y, w, h = self.rect(view)
+        return px >= x and px < x + w and py >= y and py < y + h
+
+    # ─── Drawing ───
+
+    color(rgb = 0, a = 1.0) -> Color:
+        return Colors.hex(rgb, a)
+
+    fill(x = 0.0, y = 0.0, w = 0.0, h = 0.0, rgb = 0, a = 1.0):
+        self.graphics.render_set_color(Colors.hex(rgb, a))
+        self.graphics.render_rectangle(x, y, w, h)
+
+    fill_round(x = 0.0, y = 0.0, w = 0.0, h = 0.0, radius = 4.0, rgb = 0, a = 1.0):
+        self.graphics.render_set_color(Colors.hex(rgb, a))
+        self.graphics.render_rounded_rectangle(x, y, w, h, radius, radius, radius, radius)
+
+    fill_top_round(x = 0.0, y = 0.0, w = 0.0, h = 0.0, radius = 4.0, rgb = 0):
+        self.graphics.render_set_color(Colors.hex(rgb))
+        self.graphics.render_rounded_rectangle(x, y, w, h, radius, radius, 0.0, 0.0)
+
+    outline(x = 0.0, y = 0.0, w = 0.0, h = 0.0, rgb = 0, thickness = 1.0, a = 1.0):
+        self.graphics.render_set_color(Colors.hex(rgb, a))
+        self.graphics.render_rectangle_outline(x, y, w, h, thickness)
+
+    outline_round(x = 0.0, y = 0.0, w = 0.0, h = 0.0, radius = 4.0, rgb = 0, thickness = 1.0):
+        self.graphics.render_set_color(Colors.hex(rgb))
+        self.graphics.render_rounded_rectangle_outline(x, y, w, h, radius, radius, radius, radius, thickness)
+
+    line(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, rgb = 0, thickness = 1.0, a = 1.0):
+        self.graphics.render_set_color(Colors.hex(rgb, a))
+        self.graphics.render_line(x0, y0, x1, y1, thickness)
+
+    circle(cx = 0.0, cy = 0.0, radius = 1.0, rgb = 0, a = 1.0):
+        self.graphics.render_set_color(Colors.hex(rgb, a))
+        self.graphics.render_circle(cx, cy, radius)
+
+    text(x = 0.0, y = 0.0, w = 0.0, h = 0.0, text = "", rgb = 0, align = 0, size = 0.0):
+        s = size if size > 0.0 else self.theme.size
+        shown = self.fit(text, w, s)
+        if shown == "":
+            return
+        self.graphics.render_set_color(Colors.hex(rgb))
+        self.graphics.render_text_box(self.font, s, x, y, w, h, shown, align)
+
+    text_wrapped(x = 0.0, y = 0.0, w = 0.0, h = 0.0, text = "", rgb = 0, align = 0, size = 0.0):
+        self.graphics.render_set_color(Colors.hex(rgb))
+        self.graphics.render_text_box(self.font, size if size > 0.0 else self.theme.size, x, y, w, h, text, align)
+
+    # the most of text from its start that fits in w on one line: all of
+    # it, or cut where the next character would pass the edge
+    fit(text = "", w = 0.0, size = 0.0) -> str:
+        if w <= 0.0 or text == "":
+            return ""
+        if self.font.measure_text(size, text).width <= w:
+            return text
+        lo = 0
+        hi = len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) / 2
+            if self.font.measure_text(size, text.slice(0, mid)).width <= w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text.slice(0, lo)
+
+    measure(text = "", size = 0.0) -> float:
+        return self.font.measure_text(size if size > 0.0 else self.theme.size, text).width
+
+# natiny's colour gradients, one shader: params.x the mode (0 the square at
+# hue params.y, 1 the hue strip, 2 the alpha strip, 3 a swatch, 4 the
+# colour wheel at value params.y), tint the
+# colour; the checker in 6-pixel cells of the window.  The vertex colour's
+# alpha is kept: a rounded box's smoothed edge fades as the 2D batch's do
+Gradients:
+    source() -> str:
+        return """
+attribute vec3 position;
+attribute vec2 texcoord0;
+attribute vec4 color0;
+varying vec2 uv;
+varying vec4 edge;
+uniform mat4 mtx_worldviewproj;
+uniform vec4 params;
+uniform vec4 tint;
+
+vec3 hsv(float h, float s, float v)
+{
+    vec3 k = abs(fract(vec3(h, h, h) + vec3(1.0, 0.6666667, 0.3333333)) * 6.0 - 3.0);
+    return v * mix(vec3(1.0, 1.0, 1.0), clamp(k - 1.0, 0.0, 1.0), s);
+}
+
+void vertex()
+{
+    uv = texcoord0;
+    edge = color0;
+    POSITION = mtx_worldviewproj * vec4(position, 1.0);
+}
+
+void fragment()
+{
+    vec3 rgb;
+    if (params.x > 3.5) {
+        vec2 d = uv * 2.0 - 1.0;
+        float r = length(d);
+        float h = atan(d.y, d.x) / 6.2831853;
+        rgb = hsv(fract(h + 1.0), min(r, 1.0), params.y);
+        float inside = 1.0 - smoothstep(0.985, 1.0, r);
+        COLOR = vec4(rgb, edge.a * inside);
+        return;
+    }
+    if (params.x < 0.5) {
+        rgb = hsv(params.y, uv.x, 1.0 - uv.y);
+    } else if (params.x < 1.5) {
+        rgb = hsv(uv.x, 1.0, 1.0);
+    } else {
+        float cell = floor(FRAGCOORD.x / 6.0) + floor(FRAGCOORD.y / 6.0);
+        float dark = step(0.5, fract(cell * 0.5));
+        vec3 back = mix(vec3(0.816, 0.816, 0.816), vec3(0.604, 0.604, 0.604), dark);
+        rgb = mix(back, tint.rgb, params.x < 2.5 ? uv.x : tint.a);
+    }
+    COLOR = vec4(rgb, edge.a);
+}
+"""

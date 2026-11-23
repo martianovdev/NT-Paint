@@ -1,0 +1,106 @@
+# widgets/menu_bar — the titles on the backdrop, drawn by one view; a
+# press opens or closes the menu under it, and the pointer over another
+# title while one is open moves the opening there.  The open title takes
+# the panel's colour, as its menu hangs from it.
+
+from ui import MenuBar
+from graphics import Align
+from view import Layout
+
+extend MenuBar:
+    shown = -1
+    init(ui = &Ui, parent = &View):
+        self.ui = ui
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_min_size(0.0, ui.theme.menu_bar)
+        ui.cache(self.view)
+        on self.view.draw():
+            self.draw()
+        on self.view.mouse_down():
+            at = self.title_at()
+            if at >= 0:
+                if self.menus[at].get_open():
+                    self.menus[at].close()
+                else:
+                    self.open(at)
+
+    add(menu = &Menu):
+        self.menus.push(menu)
+        self.view.render_once()
+
+    update():
+        for m in self.menus:
+            m.update()
+        opened = self.open_index()
+        if opened >= 0:
+            at = self.title_at()
+            if at >= 0 and at != opened:
+                self.open(at)
+                opened = at
+        if self.shown != opened:
+            self.shown = opened
+            self.view.render_once()
+
+    get_open() -> bool:
+        return self.open_index() >= 0
+
+    # ─── Inside ───
+
+    widths() -> [float]:
+        t = self.ui.theme
+        out = [float]
+        for m in self.menus:
+            out.push(self.ui.measure(m.title, t.size) + t.menu_pad * 2.0)
+        return out
+
+    # the title under the pointer, -1 for none
+    title_at() -> int:
+        t = self.ui.theme
+        px, py = self.view.get_pointer()
+        _, _, _, h = self.ui.rect(self.view)
+        if py < 0.0 or py >= h:
+            return -1
+        x = t.edge
+        for i, w in self.widths().enumerate():
+            if px >= x and px < x + w:
+                return i
+            x += w
+        return -1
+
+    open_index() -> int:
+        for i, m in self.menus.enumerate():
+            if m.get_open():
+                return i
+        return -1
+
+    open(at = 0):
+        t = self.ui.theme
+        for i, m in self.menus.enumerate():
+            if i != at:
+                m.close()
+        x, y, _, h = self.ui.rect(self.view)
+        left = x + t.edge
+        for i, w in self.widths().enumerate():
+            if i == at:
+                break
+            left += w
+        self.menus[at].open(left, y + h - t.menu_bar_pad + 1.0)
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        ui.fill(x, y, w, h, t.backdrop)
+        hovered = self.view.get_hovered()
+        under = self.title_at() if hovered else -1
+        left = x + t.edge
+        top = y + t.menu_bar_pad
+        th = h - t.menu_bar_pad * 2.0
+        for i, tw in self.widths().enumerate():
+            m = self.menus[i]
+            if m.get_open():
+                ui.fill_round(left, top, tw, th, t.radius, t.menu_hot)
+            elif i == under:
+                ui.fill_round(left, top, tw, th, t.radius, t.hover)
+            ui.text(left, top, tw, th, m.title, t.ink if m.get_open() or i == under else t.ink_soft, Align.center + Align.middle, t.size)
+            left += tw

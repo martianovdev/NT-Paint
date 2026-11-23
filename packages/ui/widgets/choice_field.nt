@@ -1,0 +1,77 @@
+# widgets/choice_field — one of a few words, as natiny's editor shows a
+# choice: a dark field with the word and a small down triangle at its
+# right; a press opens the list of them right under the field, the
+# current one lit, and the one picked is told.
+
+from ui import ChoiceField, Icon, Picker
+from graphics import Align
+from window import Button, Cursor, Key
+from view import Layout
+
+extend ChoiceField:
+    picker = &Picker
+    current = 0
+
+    init(ui = &Ui, parent = &View, choices = [str]):
+        self.ui = ui
+        self.choices = choices
+        self.picker = &Picker(ui)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_min_size(40.0, ui.theme.field_height)
+        self.view.set_clip(true)
+        self.view.set_focusable(true)
+        on self.view.draw():
+            self.draw()
+        on self.picker.chosen(index = 0):
+            self.choose(index)
+        on self.picker.closed():
+            self.view.render_once()
+
+    choose(index = 0):
+        if index != self.current:
+            self.set_current(index)
+            emit chosen(index)
+
+    set_current(index = 0):
+        if self.current != index:
+            self.current = index
+            self.view.render_once()
+
+    get_current() -> int:
+        return self.current
+
+    update():
+        ui = self.ui
+        win = ui.window
+        self.picker.update()
+        if self.picker.get_open() or len(self.choices) == 0:
+            return
+        over = self.view.get_hovered()
+        if over:
+            ui.want_cursor(Cursor.hand)
+        wheel = ui.wheel_steps() if over else 0
+        if wheel != 0:
+            self.choose(clamp(self.current - wheel, 0, len(self.choices) - 1))
+        focus = self.view.get_focused()
+        if focus and win.input_get_key_repeated(Key.up):
+            ui.hold_keys()
+            self.choose(max(0, self.current - 1))
+        elif focus and win.input_get_key_repeated(Key.down):
+            ui.hold_keys()
+            self.choose(min(len(self.choices) - 1, self.current + 1))
+        if (win.input_get_mouse_button_pressed(Button.left) and over) or (focus and win.input_get_key_pressed(Key.space)):
+            x, y, w, h = ui.rect(self.view)
+            self.picker.open_list(x, y + h, self.choices, self.current, w)
+            self.view.render_once()
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.view)
+        hot = self.view.get_hovered() or self.picker.get_open()
+        ui.fill_round(x, y, w, h, t.radius, t.field_hot if hot else t.field)
+        ui.outline_round(x, y, w, h, t.radius, t.field_edge if hot else t.line)
+        word = self.choices[self.current] if self.current >= 0 and self.current < len(self.choices) else ""
+        ui.text(x + t.text_pad, y, w - t.text_pad - 22.0, h, word, t.ink, Align.left + Align.middle, t.size)
+        ui.icon(Icon.twisty_open, x + w - 22.0 + 4.0, y + (h - 14.0) * 0.5, 14.0, t.ink_muted)

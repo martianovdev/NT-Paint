@@ -1,0 +1,261 @@
+# widgets/menu — a menu opens as two views in the ui's layer: a backdrop
+# over the whole window that closes it on a press, and the panel itself,
+# one view drawing every row and finding the row under a click.  A row:
+# the command's icon, its title, its shortcut on the right - or a chevron
+# for a row that opens a submenu beside it while the pointer is over it.
+# A submenu has no backdrop of its own (its menu's closes both); choosing
+# in it closes the menus it opened from.
+
+from ui import Icon, Menu, MenuItem
+from graphics import Align
+from window import Key
+from view import Layout, View
+
+extend Menu:
+    backdrop = &View
+    list = &View
+    is_open = false
+    painted = (-1, -1)
+    # the menu this one opened from; the submenu open from this one
+    owner = @Menu
+    child = @Menu
+    # the submenus its rows open (their owner keeps them)
+    subs = [@Menu]
+
+    init(ui = &Ui, title = ""):
+        self.ui = ui
+        self.title = title
+        self.backdrop = ui.create(Layout.free)
+        self.list = ui.create(Layout.free)
+        self.backdrop.set_expand(true)
+        on self.backdrop.mouse_down():
+            self.close()
+        on self.list.draw():
+            self.draw()
+        on self.list.click():
+            self.choose()
+
+    add(command = &Command):
+        self.items.push(MenuItem(command))
+        self.list.render_once()
+
+    add_submenu(command = &Command, menu = &Menu):
+        self.subs.push(menu)
+        self.items.push(MenuItem(command, len(self.subs) - 1))
+        self.list.render_once()
+
+    add_separator():
+        self.items.push(MenuItem())
+        self.list.render_once()
+
+    open(x = 0.0, y = 0.0):
+        self.owner = @Menu
+        self.show(x, y, true)
+
+    # shown at x, y; with its backdrop, or (a submenu) without
+    # at x, y; a submenu (beside > 0) beside its owner's row, whose plate
+    # spans x - beside to x: to its right, or to its left when the window
+    # has no room there - never over it
+    show(x = 0.0, y = 0.0, backdrop = true, beside = 0.0):
+        ui = self.ui
+        t = ui.theme
+        width = t.menu_min_width
+        height = 8.0
+        for item in self.items:
+            if c := item.command:
+                shortcut = c.get_shortcut()
+                extra = ui.measure(shortcut, t.size) + t.menu_gap if shortcut != "" else 0.0
+                width = max(width, 30.0 + ui.measure(c.title, t.size) + extra + 14.0)
+                height += t.menu_item
+            else:
+                height += t.menu_separator
+        # kept inside the window
+        _, _, lw, lh = ui.rect(ui.layer)
+        left = max(0.0, min(x, lw - width))
+        if beside > 0.0:
+            left = x + 2.0 if x + 2.0 + width <= lw else max(0.0, x - beside - 2.0 - width)
+        top = max(0.0, min(y, lh - height))
+        self.list.set_min_size(width, height)
+        self.list.set_max_size(width, height)
+        self.list.set_offset(left, top)
+        if backdrop:
+            self.backdrop.set_parent(ui.layer)
+        self.list.set_parent(ui.layer)
+        ui.cache(self.list)
+        self.list.render_once()
+        self.is_open = true
+
+    close():
+        if not self.is_open:
+            return
+        self.close_child()
+        self.shut()
+
+    get_open() -> bool:
+        return self.is_open
+
+    update():
+        if not self.is_open:
+            return
+        if self.ui.window.input_get_key_pressed(Key.escape):
+            self.close()
+            return
+        entry = none(&Menu)
+        entry = &self
+        while m := entry:
+            m.update_list()
+            entry = none
+            if next := m.child:
+                entry = next
+
+    update_list():
+        under = self.row_at() if self.list.get_hovered() else -1
+        stamp = 0
+        for item in self.items:
+            if c := item.command:
+                stamp += c.revision
+        if self.painted != (under, stamp):
+            self.painted = (under, stamp)
+            self.list.render_once()
+        if under < 0:
+            return
+        if self.items[under].sub < 0:
+            self.close_child()
+            return
+        x, y, w, _ = self.ui.rect(self.list)
+        t = self.ui.theme
+        top = y
+        for i in range(under):
+            top += t.menu_item if self.items[i].command != none else t.menu_separator
+        self.open_child(under, x + w, top, w)
+
+    # ─── Inside ───
+
+    # the submenus open from this one shut, the deepest first
+    close_child():
+        chain = [&Menu]
+        at = self.child
+        while true:
+            if c := at:
+                chain.push(c)
+                at = c.child
+            else:
+                break
+        if len(chain) == 0:
+            return
+        i = len(chain) - 1
+        while i >= 0:
+            chain[i].shut()
+            i -= 1
+        self.child = @Menu
+        self.list.render_once()
+
+    set_owner(menu = &Menu):
+        self.owner = menu
+
+    # off the screen, its submenus left to whoever shuts them
+    shut():
+        if not self.is_open:
+            return
+        self.list.set_parent(none)
+        self.list.set_surface(false)
+        self.backdrop.set_parent(none)
+        self.is_open = false
+        self.child = @Menu
+        emit closed()
+
+    # the submenu of the row at opened beside it (others shut)
+    open_child(at = 0, x = 0.0, y = 0.0, beside = 0.0):
+        k = self.items[at].sub
+        if k < 0:
+            return
+        if sub := self.subs[k]:
+            if c := self.child:
+                if c == sub:
+                    return
+            self.close_child()
+            enabled = true
+            if c := self.items[at].command:
+                enabled = c.enabled
+            if not enabled:
+                return
+            sub.set_owner(&self)
+            sub.show(x, y, false, beside)
+            self.child = sub
+            self.list.render_once()
+
+    # the row under the pointer, -1 for none or a separator
+    row_at() -> int:
+        t = self.ui.theme
+        px, py = self.list.get_pointer()
+        _, _, w, _ = self.ui.rect(self.list)
+        if px < 0.0 or px >= w:
+            return -1
+        y = 4.0
+        for i, item in self.items.enumerate():
+            h = t.menu_item if item.command != none else t.menu_separator
+            if py >= y and py < y + h:
+                return i if item.command != none else -1
+            y += h
+        return -1
+
+    choose():
+        at = self.row_at()
+        if at < 0:
+            return
+        if self.items[at].sub >= 0:
+            return
+        if c := self.items[at].command:
+            if not c.enabled:
+                return
+            # every menu it opened from closes too
+            top = none(&Menu)
+            top = &self
+            while true:
+                if t := top:
+                    if o := t.owner:
+                        top = o
+                    else:
+                        t.close()
+                        break
+                else:
+                    break
+            c.trigger()
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.list)
+        ui.fill_round(x, y, w, h, t.radius, t.menu_panel)
+        ui.outline_round(x, y, w, h, t.radius, t.menu_edge)
+        hovered = self.list.get_hovered()
+        under = self.row_at() if hovered else -1
+        size = t.size
+        ry = y + 4.0
+        for i, item in self.items.enumerate():
+            if c := item.command:
+                open_sub = false
+                if item.sub >= 0:
+                    if s := self.subs[item.sub]:
+                        if o := self.child:
+                            open_sub = o == s
+                if (i == under or open_sub) and c.enabled:
+                    ui.fill_round(x + 3.0, ry, w - 6.0, t.menu_item, t.row_radius, t.menu_hot)
+                if c.checked:
+                    ui.fill_round(x + 6.0, ry + 2.0, 20.0, t.menu_item - 4.0, 3.0, t.row_on)
+                    if c.icon == Icon.none:
+                        ui.icon(Icon.check, x + 9.0, ry + (t.menu_item - 14.0) * 0.5, 14.0, t.ink)
+                if c.icon != Icon.none:
+                    ui.icon(c.icon, x + 10.0, ry + (t.menu_item - 14.0) * 0.5, 14.0, -1 if c.enabled else t.ink_faint)
+                ink = t.ink if c.enabled else t.ink_faint
+                ui.text(x + 30.0, ry, w - 44.0, t.menu_item, c.title, ink, Align.left + Align.middle, size)
+                shortcut = c.get_shortcut()
+                if item.sub >= 0:
+                    ui.icon(Icon.chevron, x + w - 24.0, ry + (t.menu_item - 14.0) * 0.5, 14.0, t.ink_muted if c.enabled else t.ink_faint)
+                elif shortcut != "":
+                    ui.text(x + 30.0, ry, w - 44.0, t.menu_item, shortcut, t.ink_muted if c.enabled else t.ink_faint, Align.right + Align.middle, size)
+                ry += t.menu_item
+            else:
+                mid = ry + t.menu_separator * 0.5
+                ui.line(x + 30.0, mid, x + w - 6.0, mid, t.menu_edge)
+                ry += t.menu_separator

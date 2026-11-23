@@ -1,0 +1,106 @@
+# widgets/split — two panes and a grip.  The fixed pane is held at the
+# size shown by its least and most size on the split's axis; the other
+# expands.  The drag is measured from where it began, so a pointer that
+# outruns the frames leaves no gap.
+
+from ui import Split
+from window import Cursor
+from view import Layout, View
+
+extend Split:
+    # the size the fixed pane has now: size, or less while there is no room
+    shown = -1.0
+    dragging = false
+    grab_pointer = 0.0
+    grab_size = 0.0
+    fixed_visible = true
+
+    init(ui = &Ui, parent = &View, vertical = false, fixed_second = false, size = 240.0, min = 80.0, max = 4000.0):
+        self.ui = ui
+        self.vertical = vertical
+        self.fixed_second = fixed_second
+        self.min = min
+        self.max = max
+        self.size = clamp(size, min, max)
+        self.root = ui.create(Layout.vertical if vertical else Layout.horizontal, parent)
+        self.first = ui.create(Layout.vertical, self.root)
+        self.grip = ui.create(Layout.free, self.root)
+        self.second = ui.create(Layout.vertical, self.root)
+        self.root.set_expand(true)
+        (self.second if not fixed_second else self.first).set_expand(true)
+        self.first.set_clip(true)
+        self.second.set_clip(true)
+        g = ui.theme.divider
+        if vertical:
+            self.grip.set_min_size(0.0, g)
+            self.grip.set_max_size(0.0, g)
+        else:
+            self.grip.set_min_size(g, 0.0)
+            self.grip.set_max_size(g, 0.0)
+        self.show(self.size)
+        on self.grip.draw():
+            self.draw_grip()
+        # the grip takes the press: without a listener it would go to the
+        # split's parent
+        on self.grip.mouse_down():
+            pass
+
+    update():
+        if not self.fixed_visible:
+            return
+        _, _, w, h = self.ui.rect(self.root)
+        px, py = self.root.get_pointer()
+        total = h if self.vertical else w
+        p = py if self.vertical else px
+        if self.grip.get_pressed():
+            if not self.dragging:
+                self.dragging = true
+                self.grab_pointer = p
+                self.grab_size = self.shown
+            delta = p - self.grab_pointer
+            if self.fixed_second:
+                delta = -delta
+            self.size = clamp(self.grab_size + delta, self.min, self.max)
+        else:
+            self.dragging = false
+        # the other pane keeps its least size while the window has room
+        room = total - self.ui.theme.divider - self.min
+        self.show(max(0.0, min(self.size, room)) if total > 0.0 else self.size)
+
+    set_fixed_visible(visible = true):
+        self.fixed_visible = visible
+        self.fixed().set_visible(visible)
+        self.grip.set_visible(visible)
+
+    get_fixed_visible() -> bool:
+        return self.fixed_visible
+
+    set_size(size = 0.0):
+        self.size = clamp(size, self.min, self.max)
+
+    # ─── Inside ───
+
+    fixed() -> &View:
+        return self.second if self.fixed_second else self.first
+
+    show(size = 0.0):
+        if size == self.shown:
+            return
+        self.shown = size
+        if self.vertical:
+            self.fixed().set_min_size(0.0, size)
+            self.fixed().set_max_size(0.0, size)
+        else:
+            self.fixed().set_min_size(size, 0.0)
+            self.fixed().set_max_size(size, 0.0)
+
+    # the divider is the backdrop between two panels; held, it shows
+    draw_grip():
+        ui = self.ui
+        t = ui.theme
+        x, y, w, h = ui.rect(self.grip)
+        ui.fill(x, y, w, h, t.backdrop)
+        if self.grip.get_hovered() or self.dragging:
+            ui.want_cursor(Cursor.resize_ns if self.vertical else Cursor.resize_ew)
+        if self.grip.get_pressed():
+            ui.fill(x, y, w, h, t.line)

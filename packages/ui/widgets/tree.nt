@@ -1,0 +1,600 @@
+# widgets/tree — a tree list is one view: the rows are records the owner
+# hands over already flattened, and only those in sight are drawn.  A
+# press finds its row by arithmetic; the arrow of a row with children
+# toggles, a row's action button (at its right end) acts, the rest of the
+# row selects.  A row: its arrow, its icon, its text, its note dimmer
+# after it; the chosen ones on a lighter plate.
+#
+# Chosen rows are dragged once the pointer moves drag_start away (never
+# from a press with Shift or Ctrl).  With drops on, they drop into a row
+# with children; ordered, they drop between rows too, as natiny's editor
+# does - over a row that can hold them its top quarter is before it, its
+# middle into it, its bottom quarter after it; over one that cannot, its
+# halves; below the rows, at the end of the top.  A row holds what its
+# takes has the kind of.  A line with a dot shows where between rows, a
+# plate where into; the label of what is dragged follows the pointer; the
+# list scrolls when the pointer is near its top or bottom edge.  Let go of
+# outside the list, a drag is the owner's to take (dropped_out).
+
+from ui import Icon, LineEdit, ScrollBar, TreeList, TreePlace, TreeRow
+from graphics import Align
+from window import Button, Cursor, Key
+from view import Layout, View
+
+extend TreeList:
+    rows = [TreeRow]
+    selected_key = -1
+    # the rows chosen with it (Ctrl, Shift), by key
+    chosen = [int: bool]
+    # the row Shift picks a run from
+    anchor = -1
+    scroll = 0.0
+    bar = &ScrollBar
+    empty = ""
+    drops = false
+    ordered = false
+    # a press on a row that may become a drag; whether it may (no Shift or
+    # Ctrl held), whether the press was on a row of several chosen
+    press_key = -1
+    press_x = 0.0
+    press_y = 0.0
+    may_drag = false
+    kept_several = false
+    dragging = false
+    last_time = -1.0
+    # what is dragged, named by the pointer over everything
+    ghost = &View
+    # the row being edited, -1 for none
+    editing = -1
+    edit = none(&LineEdit)
+
+    init(ui = &Ui, parent = &View, empty = ""):
+        self.ui = ui
+        self.empty = empty
+        self.bar = &ScrollBar(ui, true)
+        self.bar.set_beside(true)
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_expand(true)
+        self.view.set_clip(true)
+        self.ghost = ui.create(Layout.free)
+        self.ghost.set_expand(true)
+        self.ghost.set_pickable(false)
+        on self.view.draw():
+            self.draw()
+        on self.view.mouse_down():
+            self.press()
+        on self.view.double_click():
+            at = self.row_at()
+            # the second press of two quick ones on the arrow or the action
+            # button is that one's again, not the row's double click
+            if at >= 0 and not self.on_controls(at):
+                emit activated(self.rows[at].key)
+        on self.ghost.draw():
+            self.draw_ghost()
+
+    set_rows(rows = [TreeRow]):
+        self.rows = rows
+        self.clamp_scroll()
+
+    set_empty(text = ""):
+        self.empty = text
+
+    set_selected(key = -1):
+        self.selected_key = key
+        self.chosen.clear()
+        if key >= 0:
+            self.chosen[key] = true
+
+    # the rows of keys chosen, primary the one selected
+    set_chosen(keys = [int], primary = -1):
+        self.chosen.clear()
+        for k in keys:
+            self.chosen[k] = true
+        self.selected_key = primary
+
+    get_selected() -> int:
+        return self.selected_key
+
+    get_chosen() -> [int]:
+        out = [int]
+        for r in self.rows:
+            if self.chosen.get(r.key) != none:
+                out.push(r.key)
+        return out
+
+    add_chosen(key = 0):
+        self.chosen[key] = true
+
+    set_drops(on = true):
+        self.drops = on
+
+    set_ordered(on = true):
+        self.ordered = on
+
+    get_dragging() -> bool:
+        return self.dragging
+
+    # a drag is over the list no more: what it carries is for the owner
+    get_dragging_out() -> bool:
+        return self.dragging and not self.ui.over(self.view)
+
+    begin_edit(key = 0, text = "", start = 0, end = -1):
+        if self.edit == none:
+            self.edit = &LineEdit(self.ui)
+        if e := self.edit:
+            e.begin(text, start, end)
+        self.editing = key
+        self.ui.views.set_focus(self.view)
+        # the row in sight
+        for i, r in self.rows.enumerate():
+            if r.key == key:
+                self.reveal(i)
+
+    show(key = 0):
+        self.set_selected(key)
+        self.ui.views.set_focus(self.view)
+        for i, r in self.rows.enumerate():
+            if r.key == key:
+                self.reveal(i)
+
+    get_editing() -> bool:
+        return self.editing >= 0
+
+    update():
+        ui = self.ui
+        views = ui.views
+        win = ui.window
+        dt = 0.0 if self.last_time < 0.0 else clamp(ui.time - self.last_time, 0.0, 0.1)
+        self.last_time = ui.time
+        x, y, w, h = ui.rect(self.view)
+        self.scroll = self.bar.update(x, y, w, h, self.content(), h, self.scroll)
+        # the keys that end an edit (Enter, Esc) are the edit's, not the rows'
+        was_editing = self.editing >= 0
+        if self.editing >= 0:
+            if e := self.edit:
+                if not self.view.get_focused():
+                    self.finish_edit(true)
+                else:
+                    done = e.update()
+                    if done != 0:
+                        self.finish_edit(done == 1)
+        if self.press_key >= 0:
+            if not win.input_get_mouse_button_down(Button.left):
+                if self.dragging:
+                    self.ghost.set_parent(none)
+                    self.drop()
+                elif self.kept_several:
+                    # a press on one of several, let go of without a drag: it alone
+                    self.set_selected(self.press_key)
+                    emit selected(self.press_key)
+                self.press_key = -1
+                self.dragging = false
+            elif (self.drops or self.ordered) and self.may_drag and not self.dragging:
+                px, py = self.view.get_pointer()
+                if abs(px - self.press_x) + abs(py - self.press_y) > ui.theme.drag_start:
+                    self.dragging = true
+                    self.ghost.set_parent(ui.layer)
+            if self.dragging:
+                self.edge_scroll(dt)
+        if self.view.get_focused() and not was_editing and not self.dragging:
+            self.keys()
+        if not self.view.get_hovered():
+            return
+        wheel = win.input_get_wheel_y()
+        if wheel != 0.0:
+            self.scroll -= wheel * ui.theme.row * ui.theme.wheel_lines
+            self.clamp_scroll()
+            self.bar.wake()
+        if win.input_get_mouse_button_pressed(Button.right):
+            views.set_focus(self.view)
+            at = self.row_at()
+            key = -1
+            if at >= 0:
+                key = self.rows[at].key
+                # a row not among the chosen: it alone
+                if self.chosen.get(key) == none:
+                    self.set_selected(key)
+                    self.anchor = at
+                    emit selected(key)
+                elif key != self.selected_key:
+                    self.selected_key = key
+                    emit selected(key)
+            x, y = ui.pointer()
+            emit context(key, x, y)
+
+    # ─── Inside ───
+
+    pad() -> float:
+        return self.ui.theme.panel_pad
+
+    # the rows' width: the view's, the bar's column off it in place of the
+    # padding (the rows end 2 from the bar)
+    width() -> float:
+        _, _, w, h = self.ui.rect(self.view)
+        room = self.bar.room(self.content(), h)
+        return w if room == 0.0 else w - room - 2.0 + self.pad()
+
+    # the rows' height, their padding with them
+    content() -> float:
+        return float(len(self.rows)) * self.ui.theme.row + self.pad() * 2.0
+
+    clamp_scroll():
+        _, _, _, h = self.ui.rect(self.view)
+        self.scroll = clamp(self.scroll, 0.0, max(0.0, self.content() - h))
+
+    # the row under the pointer, -1 for none
+    row_at() -> int:
+        px, py = self.view.get_pointer()
+        _, _, _, h = self.ui.rect(self.view)
+        if px < 0.0 or py < 0.0 or px >= self.width() or py >= h:
+            return -1
+        inside = py + self.scroll - self.pad()
+        if inside < 0.0:
+            return -1
+        at = int(inside / self.ui.theme.row)
+        if at >= len(self.rows):
+            return -1
+        return at
+
+    index_of(key = 0) -> int:
+        for i, r in self.rows.enumerate():
+            if r.key == key:
+                return i
+        return -1
+
+    # the row's action button: its left from the list's left, its side
+    action_place() -> (float, float):
+        t = self.ui.theme
+        side = t.row - 4.0
+        return self.width() - self.pad() - side - 8.0, side
+
+    press():
+        x, y, w, h = self.ui.rect(self.view)
+        px, py = self.ui.pointer()
+        # the scroll bar's
+        if self.bar.hit(px, py, x, y, w, h, self.content(), h):
+            return
+        if self.editing >= 0:
+            self.finish_edit(true)
+        at = self.row_at()
+        win = self.ui.window
+        if at < 0:
+            if self.selected_key != -1 or len(self.chosen) > 0:
+                self.set_selected(-1)
+                emit selected(-1)
+            return
+        r = self.rows[at]
+        px, py = self.view.get_pointer()
+        if self.on_arrow(at):
+            emit toggled(r.key)
+            return
+        if self.on_action(at):
+            emit action(r.key)
+            return
+        shift = win.input_get_key_down(Key.shift)
+        ctrl = win.input_get_key_down(Key.control)
+        self.kept_several = false
+        if shift and self.anchor >= 0 and self.anchor < len(self.rows):
+            # a run from the anchor
+            if not ctrl:
+                self.chosen.clear()
+            lo = min(self.anchor, at)
+            hi = max(self.anchor, at)
+            for i in range(lo, hi + 1):
+                self.chosen[self.rows[i].key] = true
+        elif ctrl:
+            if self.chosen.get(r.key) != none:
+                self.chosen.remove(r.key)
+                # the primary is one still chosen
+                kept = self.get_chosen()
+                self.selected_key = kept[len(kept) - 1] if len(kept) > 0 else -1
+                self.anchor = at
+                emit selected(self.selected_key)
+                return
+            self.chosen[r.key] = true
+            self.anchor = at
+        else:
+            # a press on one of several chosen keeps them for a drag
+            if self.chosen.get(r.key) == none or len(self.chosen) < 2:
+                self.chosen.clear()
+                self.chosen[r.key] = true
+            else:
+                self.kept_several = true
+            self.anchor = at
+        self.press_key = r.key
+        self.press_x = px
+        self.press_y = py
+        self.may_drag = not shift and not ctrl
+        self.selected_key = r.key
+        emit selected(r.key)
+
+    # whether the pointer is on row at's arrow (a row with children)
+    on_arrow(at = 0) -> bool:
+        r = self.rows[at]
+        px, _ = self.view.get_pointer()
+        arrow = self.pad() + 2.0 + float(r.depth) * self.ui.theme.indent
+        return r.parent and px >= arrow - 2.0 and px < arrow + 12.0
+
+    # whether the pointer is on row at's action button
+    on_action(at = 0) -> bool:
+        if self.rows[at].action == Icon.none:
+            return false
+        px, _ = self.view.get_pointer()
+        ax, side = self.action_place()
+        return px >= ax and px < ax + side
+
+    on_controls(at = 0) -> bool:
+        return self.on_arrow(at) or self.on_action(at)
+
+    # Up and Down: the row above or below alone; Right opens, Left shuts or
+    # goes to the parent; Enter acts on the row
+    keys():
+        win = self.ui.window
+        at = self.index_of(self.selected_key)
+        if at < 0 or len(self.rows) == 0:
+            return
+        r = self.rows[at]
+        to = -1
+        if win.input_get_key_repeated(Key.up):
+            to = max(0, at - 1)
+        elif win.input_get_key_repeated(Key.down):
+            to = min(len(self.rows) - 1, at + 1)
+        elif win.input_get_key_pressed(Key.right):
+            if r.parent and not r.open:
+                emit toggled(r.key)
+        elif win.input_get_key_pressed(Key.left):
+            if r.parent and r.open:
+                emit toggled(r.key)
+            else:
+                i = at - 1
+                while i >= 0:
+                    if self.rows[i].depth < r.depth:
+                        to = i
+                        break
+                    i -= 1
+        elif win.input_get_key_pressed(Key.enter):
+            emit activated(r.key)
+        if to >= 0 and to != at:
+            key = self.rows[to].key
+            self.set_selected(key)
+            self.anchor = to
+            self.reveal(to)
+            emit selected(key)
+
+    # what is dragged: the rows chosen, as kinds
+    dragged_kinds() -> [int]:
+        out = [int]
+        for r in self.rows:
+            if self.chosen.get(r.key) != none:
+                out.push(r.kind)
+        return out
+
+    # a row's takes holds every kind dragged
+    holds(takes = 0) -> bool:
+        for k in self.dragged_kinds():
+            if (takes & k) == 0:
+                return false
+        return true
+
+    # the row is chosen or under a chosen row
+    in_drag(at = 0) -> bool:
+        depth = self.rows[at].depth
+        i = at
+        while i >= 0:
+            r = self.rows[i]
+            if r.depth <= depth:
+                if self.chosen.get(r.key) != none:
+                    return true
+                depth = r.depth - 1
+                if depth < 0:
+                    break
+            i -= 1
+        return false
+
+    # what the row's parent takes (the top takes everything)
+    parent_takes(at = 0) -> int:
+        depth = self.rows[at].depth
+        i = at - 1
+        while i >= 0:
+            if self.rows[i].depth < depth:
+                return self.rows[i].takes
+            i -= 1
+        return -1
+
+    # Where a drag would drop: a row's key and how - before it, into it,
+    # after it (and all under it), at the end of the top - or nowhere
+    drop_place() -> (int, TreePlace):
+        if not self.ui.over(self.view):
+            return -1, TreePlace.nowhere
+        at = self.row_at()
+        if at < 0:
+            if self.ordered:
+                return -1, TreePlace.end
+            return -1, (TreePlace.into if self.drops else TreePlace.nowhere)
+        r = self.rows[at]
+        if self.in_drag(at):
+            return -1, TreePlace.nowhere
+        if not self.ordered:
+            if r.parent:
+                return r.key, TreePlace.into
+            return -1, TreePlace.nowhere
+        t = self.ui.theme
+        _, py = self.view.get_pointer()
+        within = (py + self.scroll - self.pad() - float(at) * t.row) / t.row
+        holder = self.holds(r.takes)
+        place = TreePlace.before
+        if holder:
+            if within < 0.25:
+                place = TreePlace.before
+            elif within > 0.75:
+                place = TreePlace.after
+            else:
+                place = TreePlace.into
+        else:
+            place = TreePlace.before if within < 0.5 else TreePlace.after
+        if place == TreePlace.into:
+            return r.key, place
+        # an open row's bottom: before its first child, inside it
+        if place == TreePlace.after and r.open and at + 1 < len(self.rows) and self.rows[at + 1].depth > r.depth:
+            if not holder or self.in_drag(at + 1):
+                return -1, TreePlace.nowhere
+            return self.rows[at + 1].key, TreePlace.before
+        if not self.holds(self.parent_takes(at)):
+            return -1, TreePlace.nowhere
+        return r.key, place
+
+    # a drag let go of
+    drop():
+        if not self.ui.over(self.view):
+            x, y = self.ui.pointer()
+            emit dropped_out(x, y)
+            return
+        key, place = self.drop_place()
+        if place == TreePlace.nowhere:
+            return
+        if self.ordered:
+            emit placed(key, place)
+        else:
+            emit dropped(key)
+
+    # near the top or bottom edge while dragging: the rows scroll, faster
+    # the nearer
+    edge_scroll(dt = 0.0):
+        _, py = self.view.get_pointer()
+        _, _, _, h = self.ui.rect(self.view)
+        edge = 24.0
+        if py < edge:
+            self.scroll -= 600.0 * dt * clamp((edge - py) / edge, 0.0, 1.0)
+        elif py > h - edge:
+            self.scroll += 600.0 * dt * clamp((py - h + edge) / edge, 0.0, 1.0)
+        self.clamp_scroll()
+
+    finish_edit(keep = true):
+        key = self.editing
+        self.editing = -1
+        if e := self.edit:
+            text = e.get_text()
+            e.close()
+            if keep:
+                emit edited(key, text)
+
+    # the row at in sight
+    reveal(at = 0):
+        _, _, _, h = self.ui.rect(self.view)
+        t = self.ui.theme
+        top = self.pad() + float(at) * t.row
+        if top < self.scroll:
+            self.scroll = top
+        elif top + t.row > self.scroll + h - self.pad():
+            self.scroll = top + t.row - h + self.pad()
+        self.clamp_scroll()
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        x, y, full_w, h = ui.rect(self.view)
+        w = self.width()
+        if len(self.rows) == 0:
+            ui.text_wrapped(x, y, w, h, self.empty, t.ink_faint, Align.center + Align.middle, t.size)
+            return
+        pad = self.pad()
+        hovered = self.view.get_hovered()
+        under = self.row_at() if hovered else -1
+        first = max(0, int((self.scroll - pad) / t.row))
+        last = min(len(self.rows), int((self.scroll + h) / t.row) + 1)
+        size = t.size
+        target = -1
+        place = TreePlace.nowhere
+        if self.dragging:
+            target, place = self.drop_place()
+            # out of the tree the owner says what a drop there would do
+            if ui.over(self.view):
+                ui.want_cursor(Cursor.move if place != TreePlace.nowhere else Cursor.forbidden)
+        elif under >= 0 and under < len(self.rows):
+            ui.want_cursor(Cursor.hand)
+        px, py = ui.pointer()
+        ax, side = self.action_place()
+        for i in range(first, last):
+            r = self.rows[i]
+            ry = y + pad + float(i) * t.row - self.scroll
+            on = r.key == self.selected_key or self.chosen.get(r.key) != none
+            if place == TreePlace.into and r.key == target:
+                ui.fill_round(x + pad, ry, w - pad * 2.0, t.row, t.row_radius, t.row_hot)
+                ui.outline_round(x + pad, ry, w - pad * 2.0, t.row, t.row_radius, t.accent)
+            elif on:
+                ui.fill_round(x + pad, ry, w - pad * 2.0, t.row, t.row_radius, t.row_on)
+            elif i == under and not self.dragging:
+                ui.fill_round(x + pad, ry, w - pad * 2.0, t.row, t.row_radius, t.row_hot)
+            left = x + pad + 2.0 + float(r.depth) * t.indent
+            if r.parent:
+                ui.icon(Icon.twisty_open if r.open else Icon.twisty_shut, left + (t.indent - 14.0) * 0.5 - 2.0, ry + (t.row - 14.0) * 0.5, 14.0, t.ink_muted)
+            left += 14.0
+            if r.icon != Icon.none:
+                ui.icon(r.icon, left, ry + (t.row - 16.0) * 0.5, 16.0, r.icon_rgb)
+                left += 22.0
+            ink = t.ink if on else t.ink_soft
+            if self.dragging and self.in_drag(i):
+                ink = t.ink_faint
+            if r.key == self.editing:
+                if e := self.edit:
+                    e.draw(left - 4.0, ry + 1.0, w - (left - x) - pad - 2.0, t.row - 2.0, size)
+                continue
+            room = w - (left - x) - (side + 16.0 if r.action != Icon.none else 0.0)
+            ui.text(left, ry, room, t.row, r.text, ink, Align.left + Align.middle, size)
+            if r.note != "":
+                tw = ui.measure(r.text, size)
+                ui.text(left + tw + 8.0, ry, room - tw - 8.0, t.row, r.note, r.note_rgb if r.note_rgb >= 0 else t.ink_faint, Align.left + Align.middle, size)
+            if r.action != Icon.none:
+                bx = x + ax
+                by = ry + 2.0
+                over = hovered and not self.dragging and px >= bx and px < bx + side and py >= by and py < by + side
+                if over:
+                    ui.fill_round(bx, by, side, side, t.radius, t.button_hot)
+                    ui.want_cursor(Cursor.hand)
+                ui.icon(r.action, bx + (side - 14.0) * 0.5, by + (side - 14.0) * 0.5, 14.0, t.ink if over else t.ink_muted)
+        if self.dragging and hovered:
+            self.draw_drop(target, place)
+        self.bar.draw(x, y, full_w, h, self.content(), h, self.scroll)
+
+    # the label of what is dragged by the pointer, the row's or "N items"
+    draw_ghost():
+        if not self.dragging:
+            return
+        ui = self.ui
+        t = ui.theme
+        px, py = ui.pointer()
+        chosen = self.get_chosen()
+        label = ""
+        if len(chosen) == 1:
+            label = self.rows[self.index_of(chosen[0])].text
+        elif len(chosen) > 1:
+            label = f"{len(chosen)} items"
+        ui.text(px + 14.0, py - t.row, 400.0, t.row, label, t.ink, Align.left + Align.middle, t.size)
+
+    # where a drag would drop: a line with a dot between rows, the whole
+    # list outlined for the end of the top
+    draw_drop(target = -1, place = TreePlace.nowhere):
+        ui = self.ui
+        t = ui.theme
+        x, y, _, h = ui.rect(self.view)
+        w = self.width()
+        pad = self.pad()
+        if place == TreePlace.end:
+            ui.outline_round(x + 1.0, y + 1.0, w - 2.0, h - 2.0, t.radius, t.accent)
+            return
+        if place != TreePlace.before and place != TreePlace.after:
+            return
+        at = self.index_of(target)
+        if at < 0:
+            return
+        depth = self.rows[at].depth
+        line = at
+        if place == TreePlace.after:
+            # below all that is under the row
+            line = at + 1
+            while line < len(self.rows) and self.rows[line].depth > depth:
+                line += 1
+        ly = y + pad + float(line) * t.row - self.scroll
+        lx = x + pad + float(depth) * t.indent + 7.0
+        ui.fill_round(lx - 3.0, ly - 3.0, 6.0, 6.0, 3.0, t.accent)
+        ui.fill(lx, ly - 1.0, x + w - 6.0 - lx, 2.0, t.accent)

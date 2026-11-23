@@ -1,0 +1,180 @@
+# widgets/tool_strip — one view 36 high that draws every command and
+# finds the one under a press itself, laid out each frame: from 8 in,
+# 2 apart in a group, 14 between groups with a line in the gap, the end
+# command 8 from the right.  A command is 24 high: 9, its 14 wide icon, 6,
+# its title, 9 - or 32 wide, its icon alone, when the titles would run
+# into the end command.
+
+from ui import Command, ToolStrip, Ui
+from graphics import Align
+from window import Cursor
+from view import Layout
+
+# a command on the strip: whether a gap comes before it, whether it is on
+Tool:
+    command = &Command
+    group = false
+    on = false
+    init(command = &Command, group = false):
+        self.command = command
+        self.group = group
+
+    set_on(on = true):
+        self.on = on
+
+extend ToolStrip:
+    tools = [Tool]
+    end = none(&Command)
+    end_on = false
+    plates = [(int, int)]
+    note = ""
+    note_error = false
+
+    init(ui = &Ui, parent = &View):
+        self.ui = ui
+        self.view = ui.create(Layout.free, parent)
+        self.view.set_min_size(0.0, 36.0)
+        on self.view.draw():
+            self.draw()
+        on self.view.click():
+            at = self.tool_at()
+            if at >= 0:
+                self.tools[at].command.trigger()
+            elif at == -2:
+                if e := self.end:
+                    e.trigger()
+
+    add(command = &Command, group = false):
+        self.tools.push(Tool(command, group))
+
+    add_end(command = &Command):
+        self.end = command
+
+    add_plate(first = 0, last = 0):
+        self.plates.push((first, last))
+
+    set_on(command = &Command, on = true):
+        for i, t in self.tools.enumerate():
+            if t.command == command:
+                self.tools[i].set_on(on)
+        if e := self.end:
+            if e == command:
+                self.end_on = on
+
+    set_note(note = "", error = false):
+        self.note = note
+        self.note_error = error
+
+    # ─── Inside ───
+
+    # each command's left and width, from the strip's left; the end
+    # command's last; compact when the titles do not fit
+    layout() -> ([(float, float)], bool):
+        ui = self.ui
+        size = ui.theme.size - 2.0
+        _, _, w, _ = ui.rect(self.view)
+        end_w = 0.0
+        if e := self.end:
+            end_w = Tools.width(ui, e, size, true)
+        out = [(float, float)]
+        compacted = false
+        for compact in [false, true]:
+            compacted = compact
+            out.clear()
+            x = 8.0
+            for i, t in self.tools.enumerate():
+                if i > 0:
+                    x += 14.0 if t.group else 2.0
+                tw = Tools.width(ui, t.command, size, compact)
+                out.push((x, tw))
+                x += tw
+            if x + 16.0 <= w - 8.0 - end_w or compact:
+                break
+        out.push((w - 8.0 - end_w, end_w))
+        return out, compacted
+
+    # the command under the pointer: its index, -2 for the end one, -1 for
+    # none
+    tool_at() -> int:
+        px, py = self.view.get_pointer()
+        if py < 6.0 or py >= 30.0:
+            return -1
+        places, _ = self.layout()
+        for i, p in places.enumerate():
+            left, width = p
+            if px >= left and px < left + width:
+                if i == len(self.tools):
+                    return -2 if self.end != none else -1
+                return i
+        return -1
+
+    draw():
+        ui = self.ui
+        t = ui.theme
+        size = t.size - 2.0
+        x, y, w, h = ui.rect(self.view)
+        ui.fill(x, y, w, h, t.chrome)
+        ui.fill(x, y + h - 1.0, w, 1.0, t.line)
+        places, compact = self.layout()
+        for p in self.plates:
+            first, last = p
+            if last < len(self.tools):
+                a, _ = places[first]
+                b, bw = places[last]
+                ui.fill_round(x + a - 2.0, y + 4.0, b + bw - a + 4.0, 28.0, t.radius + 2.0, t.field)
+        hovered = self.view.get_hovered()
+        over = self.tool_at() if hovered else -1
+        right_of = 0.0
+        for i, tool in self.tools.enumerate():
+            left, width = places[i]
+            if tool.group and i > 0:
+                ui.fill(x + left - 7.5, y + 9.0, 1.0, 18.0, t.line)
+            self.draw_tool(tool.command, tool.on, x + left, y + 6.0, width, over == i, compact)
+            right_of = left + width
+        if e := self.end:
+            left, width = places[len(places) - 1]
+            self.draw_tool(e, self.end_on, x + left, y + 6.0, width, over == -2, true)
+            # the hint of what is under the pointer, else the note
+            text = self.note
+            if over >= 0:
+                text = self.tools[over].command.get_hint()
+            elif over == -2:
+                text = e.get_hint()
+            tw = ui.measure(text, size)
+            if text != "" and right_of + 16.0 + tw < left - 12.0:
+                ui.text(x + left - 12.0 - tw, y, tw, h, text, t.ink_faint, Align.left + Align.middle, size)
+        else:
+            # no end command: the hint, else the note, after the commands
+            text = self.note
+            ink = t.error if self.note_error else t.ink_muted
+            if over >= 0:
+                text = self.tools[over].command.get_hint()
+                ink = t.ink_faint
+            if text != "":
+                ui.text(x + right_of + 16.0, y, w - right_of - 24.0, h, text, ink, Align.left + Align.middle, size)
+
+    draw_tool(c = &Command, on = false, x = 0.0, y = 0.0, w = 0.0, hot = false, compact = false):
+        ui = self.ui
+        t = ui.theme
+        if on:
+            ui.fill_round(x, y, w, 24.0, t.radius, t.row_on)
+        elif hot and c.enabled:
+            ui.fill_round(x, y, w, 24.0, t.radius, t.hover)
+        if hot and c.enabled:
+            ui.want_cursor(Cursor.hand)
+        ink = t.ink_muted
+        if not c.enabled:
+            ink = t.ink_faint
+        elif on or hot:
+            ink = t.ink
+        icon_x = x + (w - 16.0) * 0.5 if compact or c.title == "" else x + 8.0
+        ui.icon(c.icon, icon_x, y + 4.0, 16.0, t.accent if on and c.enabled else ink)
+        if not compact and c.title != "":
+            ui.text(x + 29.0, y, w - 29.0, 24.0, c.title, ink, Align.left + Align.middle, t.size - 2.0)
+
+Tools:
+    # how wide a command is on the strip
+    width(ui = &Ui, c = &Command, size = 0.0, compact = false) -> float:
+        if compact or c.title == "":
+            return 32.0
+        return 9.0 + 14.0 + 6.0 + ui.measure(c.title, size) + 9.0

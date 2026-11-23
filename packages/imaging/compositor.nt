@@ -1,0 +1,69 @@
+# compositor — the layers blended on the GPU: two surfaces taken in turn,
+# each layer laid over what the ones under it made (its blend mode and
+# opacity), the first over see-through; the whole picture each time.
+
+from imaging import Compositor
+from graphics import Filter, Surface
+from raster import Rect
+
+extend Compositor:
+    a = none(&Surface)
+    b = none(&Surface)
+    last = none(&Surface)
+
+    init(gpu = &Gpu):
+        self.gpu = gpu
+
+    compose(layers = [LayerInput], w = 0, h = 0) -> &Texture:
+        g = self.gpu
+        same = false
+        if s := self.a:
+            same = s.get_width() == w and s.get_height() == h
+        if not same:
+            self.a = g.surface(w, h)
+            self.b = g.surface(w, h)
+            self.last = none
+        # all of it each time: a pass a layer is little for the GPU
+        box = Rect(0, 0, w, h)
+        src = self.a.expect("a")
+        dst = self.b.expect("b")
+        # the box cleared, then each visible layer over it
+        g.fill(src, box, 0)
+        m = g.material("compose", CompositeShaders.layer(), false, true)
+        for l in layers:
+            if not l.visible or l.opacity <= 0:
+                continue
+            if t := l.texture:
+                m.set_texture("under", src.get_texture(), Filter.nearest, Filter.nearest)
+                m.set_texture("top", t, Filter.nearest, Filter.nearest)
+                m.set_constant("how", float(l.mode), float(l.opacity) / 255.0, 0.0, 0.0)
+                g.run(dst, m, float(box.x), float(box.y), float(box.w), float(box.h))
+                held = src
+                src = dst
+                dst = held
+        self.last = src
+        return src.get_texture()
+
+    get_texture() -> none(&Texture):
+        if l := self.last:
+            return l.get_texture()
+        return none
+
+    get_surface() -> none(&Surface):
+        return self.last
+
+CompositeShaders:
+    # how.x the mode, how.y the opacity
+    layer() -> str:
+        return """
+uniform sampler2D under;
+uniform sampler2D top;
+uniform vec4 how;
+void fragment()
+{
+    vec2 t = tuv(px());
+    vec4 u = texture(under, t);
+    vec4 s = texture(top, t);
+    COLOR = over(vec4(s.rgb, s.a * how.y), u, how.x);
+}
+"""
