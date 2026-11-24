@@ -740,8 +740,8 @@ Editor:
             elif lower.ends_with(".bmp"):
                 filters = [bmp, pdn, png]
             _, pattern = filters[0]
-            extension = FileDialog.first_extension(pattern)
-            if p := FileDialog.save(self.tr.t("cmd.save_as"), filters, Files.stem(self.doc_name(d)) + "." + extension):
+            suffix = pattern.slice(1, len(pattern))
+            if p := FileDialog.save(self.tr.t("cmd.save_as"), filters, Files.stem(self.doc_name(d)) + suffix):
                 path = p
             else:
                 return

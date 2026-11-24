@@ -3,7 +3,7 @@
 # graphics backend (--gl for OpenGL, --d3d12 for Direct3D 12), the fonts
 # and the editor; the pictures given as arguments open in it.
 
-from graphics import App, Backend, Colors, Font, Graphics
+from graphics import App, Backend, Colors, Font, Graphics, ScaleMode
 from window import Window
 from ui import Ui
 from i18n import Tr
@@ -65,5 +65,6 @@ Main:
                 backend = Backend.d3d12
         window = &Window(Tr.app_name(), 1500, 900)
         graphics = &Graphics(window, backend)
+        graphics.window_set_scale_mode(window, ScaleMode.hidpi)
         graphics.backend_loop(&Paint(graphics, window, args))
         graphics.backend_shutdown()
